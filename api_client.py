@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 from urllib.parse import urljoin
 
+from client_settings import get_effective_settings
+
 
 class WhisperApiClient:
     def __init__(self, base_url=None, api_key=None):
@@ -17,6 +19,14 @@ class WhisperApiClient:
         if self.api_key:
             return {"x-api-key": self.api_key}
         return {}
+
+    def _download_settings_payload(self):
+        settings = get_effective_settings()
+        return {
+            "download_mode": settings.get("download_mode", "video"),
+            "download_quality": settings.get("download_quality", "best"),
+            "keep_video": settings.get("keep_downloaded_video", "true") == "true",
+        }
 
     def health_check(self):
         try:
@@ -41,6 +51,7 @@ class WhisperApiClient:
             "language": language or "auto",
             "service": service,
         }
+        payload.update(self._download_settings_payload())
         if api_key:
             payload["api_key"] = api_key
         try:
@@ -82,6 +93,7 @@ class WhisperApiClient:
             "language": language or "auto",
             "service": service,
         }
+        payload.update(self._download_settings_payload())
         if api_key:
             payload["api_key"] = api_key
         try:
