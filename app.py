@@ -5,13 +5,11 @@ import sys
 import os
 import subprocess
 import time
-from pathlib import Path
 
-# Add whisper server to path so we can optionally use it directly
-WHISPER_SERVER = Path(os.environ.get(
-    "WHISPER_SERVER_DIR",
-    str(Path(__file__).parent.parent / "youtube-live-subtitles" / "whisper-server"),
-))
+from whisper_config import WHISPER_SERVER
+
+# Add the bundled/custom whisper server to path so we can optionally use it directly.
+# Default location: ./whisper-server. Override with WHISPER_SERVER_DIR when needed.
 if WHISPER_SERVER.exists():
     sys.path.insert(0, str(WHISPER_SERVER))
 
@@ -21,41 +19,47 @@ from main_window import MainWindow, apply_theme
 
 
 def _ensure_whisper_server():
-    """Kill old server, start fresh server in background."""
+    """Start the bundled/custom Whisper server in background when available."""
     import urllib.request
 
-    # Kill any existing process on port 8765 to force fresh code
-    try:
-        out = subprocess.check_output(
-            'netstat -ano | findstr :8765',
-            shell=True, text=True, timeout=5,
-        )
-        for line in out.strip().splitlines():
-            parts = line.split()
-            if len(parts) >= 5 and parts[1].endswith(":8765") and "LISTENING" in line:
-                pid = parts[-1]
-                subprocess.run(['taskkill', '/F', '/PID', pid],
-                               capture_output=True, timeout=5)
-                time.sleep(0.5)
-    except Exception:
-        pass
+    # Kill any existing Windows process on port 8765 to force fresh code.
+    if os.name == "nt":
+        try:
+            out = subprocess.check_output(
+                'netstat -ano | findstr :8765',
+                shell=True, text=True, timeout=5,
+            )
+            for line in out.strip().splitlines():
+                parts = line.split()
+                if len(parts) >= 5 and parts[1].endswith(":8765") and "LISTENING" in line:
+                    pid = parts[-1]
+                    subprocess.run(['taskkill', '/F', '/PID', pid],
+                                   capture_output=True, timeout=5)
+                    time.sleep(0.5)
+        except Exception:
+            pass
 
     if not WHISPER_SERVER.exists():
         return
 
-    venv_python = WHISPER_SERVER / "venv" / "Scripts" / "python.exe"
+    if os.name == "nt":
+        venv_python = WHISPER_SERVER / "venv" / "Scripts" / "python.exe"
+    else:
+        venv_python = WHISPER_SERVER / "venv" / "bin" / "python"
     server_script = WHISPER_SERVER / "server.py"
     if not venv_python.exists() or not server_script.exists():
         return
 
     try:
-        subprocess.Popen(
-            [str(venv_python), str(server_script)],
-            cwd=str(WHISPER_SERVER),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
+        popen_kwargs = {
+            "cwd": str(WHISPER_SERVER),
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+        }
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+        subprocess.Popen([str(venv_python), str(server_script)], **popen_kwargs)
         for _ in range(20):
             time.sleep(0.5)
             try:
@@ -83,7 +87,7 @@ def main():
     # Apply dark theme
     apply_theme(app)
 
-    # Auto-start whisper server in background
+    # Auto-start bundled/custom whisper server in background when present.
     _ensure_whisper_server()
 
     window = MainWindow()
