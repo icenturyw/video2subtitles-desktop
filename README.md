@@ -58,7 +58,7 @@ pip install -r requirements.txt
 
 1. 启动客户端：`python app.py` 或双击 `start.bat`。
 2. 如果右上角显示「⚠ 需要安装模型」，点击「⚙」打开设置。
-3. 在「Whisper 模型」里选择模型大小，通常先用 `base` 或 `small`。
+3. 在「Whisper 模型」里选择模型大小，通常先用 `base`、`small` 或速度更快的 `large-v3-turbo`。
 4. 点击「安装/检查模型」，等待状态显示「模型已就绪」。
 5. 添加本地视频并点击「开始处理」。
 
@@ -85,7 +85,7 @@ Windows 下也可双击：
 客户端也可以直接设置模型位置：
 
 1. 点击右上角「⚙」打开设置。
-2. 在「Whisper 模型」里选择「模型大小」。
+2. 在「Whisper 模型」里选择「模型大小」，支持 `tiny`、`base`、`small`、`medium`、`large-v2`、`large-v3`、`large-v3-turbo`。
 3. 设置「模型缓存目录」，用于保存或读取 `faster-whisper` 模型文件。
 4. 如需使用某个已经转换好的模型，设置「具体模型目录」；留空时按「模型大小」从缓存目录加载或下载。
 5. 点击「安装/检查模型」提前下载或验证模型。
@@ -99,7 +99,7 @@ Windows 下也可双击：
 | `WHISPER_SERVER_DIR` | 可选。自定义 Whisper Server 目录；未设置时默认使用项目内 `whisper-server/` |
 | `WHISPER_MODEL_DIR` | 可选。自定义模型缓存/存放目录；未设置时默认使用项目内 `models/` |
 | `WHISPER_MODEL_PATH` | 可选。指定某个已转换好的 `faster-whisper` / CTranslate2 模型目录；设置后优先于 `MODEL_SIZE` |
-| `MODEL_SIZE` | 可选。模型名称，如 `tiny`、`base`、`small`、`medium`、`large-v3`；默认 `base` |
+| `MODEL_SIZE` | 可选。模型名称，如 `tiny`、`base`、`small`、`medium`、`large-v3`、`large-v3-turbo`；默认 `base` |
 | `DEVICE` | 可选。推理设备，默认 `cpu` |
 | `COMPUTE_TYPE` | 可选。计算类型，默认 `int8` |
 

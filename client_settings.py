@@ -9,7 +9,7 @@ SETTINGS_DIR = APP_DIR / ".cache"
 SETTINGS_PATH = SETTINGS_DIR / "settings.json"
 DEFAULT_MODEL_DIR = APP_DIR / "models"
 SUPPORTED_MODEL_SIZES = [
-    "tiny", "base", "small", "medium", "large-v2", "large-v3",
+    "tiny", "base", "small", "medium", "large-v2", "large-v3", "large-v3-turbo",
 ]
 
 DEFAULT_SETTINGS = {
