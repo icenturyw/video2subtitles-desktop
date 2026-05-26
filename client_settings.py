@@ -3,6 +3,14 @@ import json
 import os
 from pathlib import Path
 
+from gpu_config import (
+    SUPPORTED_COMPUTE_TYPES,
+    SUPPORTED_DEVICES,
+    clean_compute_type,
+    clean_device,
+    resolve_device_and_compute,
+)
+
 
 APP_DIR = Path(__file__).resolve().parent
 SETTINGS_DIR = APP_DIR / ".cache"
@@ -18,6 +26,9 @@ DEFAULT_SETTINGS = {
     "whisper_model_dir": str(DEFAULT_MODEL_DIR),
     "whisper_model_path": "",
     "model_size": "base",
+    # Auto prefers CUDA + float16 when an NVIDIA GPU is visible, otherwise CPU + int8.
+    "device": "auto",
+    "compute_type": "auto",
     # Keep MP4 by default. This protects the ChatGPT package workflow and makes
     # the default behavior explicit instead of burying it in yt-dlp arguments.
     "download_mode": "video",
@@ -29,6 +40,8 @@ ENV_BY_KEY = {
     "whisper_model_dir": "WHISPER_MODEL_DIR",
     "whisper_model_path": "WHISPER_MODEL_PATH",
     "model_size": "MODEL_SIZE",
+    "device": "DEVICE",
+    "compute_type": "COMPUTE_TYPE",
     "download_mode": "V2S_DOWNLOAD_MODE",
     "download_quality": "V2S_DOWNLOAD_QUALITY",
     "keep_downloaded_video": "V2S_KEEP_DOWNLOADED_VIDEO",
@@ -57,6 +70,8 @@ def _clean_settings(data):
         settings["model_size"] = DEFAULT_SETTINGS["model_size"]
     if not settings["whisper_model_dir"]:
         settings["whisper_model_dir"] = DEFAULT_SETTINGS["whisper_model_dir"]
+    settings["device"] = clean_device(settings.get("device", "auto"))
+    settings["compute_type"] = clean_compute_type(settings.get("compute_type", "auto"))
     if settings["download_mode"] not in SUPPORTED_DOWNLOAD_MODES:
         settings["download_mode"] = DEFAULT_SETTINGS["download_mode"]
     if settings["download_quality"] not in SUPPORTED_DOWNLOAD_QUALITIES:
@@ -88,6 +103,19 @@ def get_effective_settings():
     return _clean_settings(settings)
 
 
+def get_runtime_settings(settings=None):
+    """Return settings with auto device/compute resolved for faster-whisper."""
+    cleaned = _clean_settings(settings or get_effective_settings())
+    resolved_device, resolved_compute = resolve_device_and_compute(
+        cleaned.get("device", "auto"),
+        cleaned.get("compute_type", "auto"),
+    )
+    runtime = cleaned.copy()
+    runtime["resolved_device"] = resolved_device
+    runtime["resolved_compute_type"] = resolved_compute
+    return runtime
+
+
 def save_settings(settings):
     """Persist client settings to .cache/settings.json."""
     current = load_settings()
@@ -105,13 +133,22 @@ def save_settings(settings):
 def apply_settings_to_env(settings, overwrite=True):
     """Apply settings to the current process environment."""
     cleaned = _clean_settings(settings)
+    runtime = get_runtime_settings(cleaned)
+    env_values = cleaned.copy()
+    env_values["device"] = runtime["resolved_device"]
+    env_values["compute_type"] = runtime["resolved_compute_type"]
+    env_values["V2S_DEVICE_SETTING"] = cleaned.get("device", "auto")
+    env_values["V2S_COMPUTE_TYPE_SETTING"] = cleaned.get("compute_type", "auto")
+
     for key, env_name in ENV_BY_KEY.items():
-        value = cleaned.get(key, "").strip()
+        value = env_values.get(key, "").strip()
         if value:
             if overwrite or not os.environ.get(env_name):
                 os.environ[env_name] = value
         elif overwrite:
             os.environ.pop(env_name, None)
+    os.environ["V2S_DEVICE_SETTING"] = cleaned.get("device", "auto")
+    os.environ["V2S_COMPUTE_TYPE_SETTING"] = cleaned.get("compute_type", "auto")
     return cleaned
 
 
