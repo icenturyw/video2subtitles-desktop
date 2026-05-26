@@ -2,11 +2,13 @@
 
 The checks here are intentionally lightweight and safe to run from the GUI.
 They do not download models or start long-running work; they only verify that
-required modules, helper binaries, paths, and the local service are reachable.
+required modules, helper binaries, paths, GPU visibility, and the local service
+are reachable.
 """
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import shutil
 import socket
@@ -15,7 +17,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List
 
-from client_settings import DEFAULT_MODEL_DIR, get_effective_settings
+from client_settings import DEFAULT_MODEL_DIR, get_effective_settings, get_runtime_settings
+from gpu_config import device_status
 from whisper_config import WHISPER_SERVER
 
 APP_DIR = Path(__file__).resolve().parent
@@ -58,6 +61,18 @@ def _check_command(name: str, hint: str = "") -> Dict[str, Any]:
     return _error(name, "未找到", hint or f"请安装 {name} 并加入 PATH")
 
 
+def _check_gpu(settings: Dict[str, Any]) -> Dict[str, Any]:
+    runtime = get_runtime_settings(settings)
+    status = device_status()
+    gpu_name = status.get("gpu_name") or "未检测到 NVIDIA GPU"
+    requested = f"{settings.get('device', 'auto')}/{settings.get('compute_type', 'auto')}"
+    resolved = f"{runtime.get('resolved_device')}/{runtime.get('resolved_compute_type')}"
+    detail = f"设置: {requested}；实际将使用: {resolved}；GPU: {gpu_name}"
+    if runtime.get("resolved_device") == "cuda":
+        return _ok("GPU 推理", "将使用 CUDA", detail)
+    return _warn("GPU 推理", "当前将使用 CPU", detail + "。如有 RTX 4070，请确认 NVIDIA 驱动、nvidia-smi 和 faster-whisper CUDA 依赖可用。")
+
+
 def _check_writable_dir(name: str, path: Path) -> Dict[str, Any]:
     try:
         path.mkdir(parents=True, exist_ok=True)
@@ -84,8 +99,16 @@ def _check_port(host: str = "127.0.0.1", port: int = 8765) -> Dict[str, Any]:
 def _check_service_health() -> Dict[str, Any]:
     try:
         with urllib.request.urlopen("http://127.0.0.1:8765/health", timeout=1.2) as resp:
+            body = resp.read().decode("utf-8", "replace")
+            detail = "http://127.0.0.1:8765/health"
+            try:
+                data = json.loads(body)
+                if data.get("device") or data.get("compute_type"):
+                    detail += f"；服务设备: {data.get('device')}/{data.get('compute_type')}"
+            except Exception:
+                pass
             if 200 <= resp.status < 300:
-                return _ok("本地 Whisper 服务", "已连接", "http://127.0.0.1:8765/health")
+                return _ok("本地 Whisper 服务", "已连接", detail)
             return _warn("本地 Whisper 服务", f"HTTP {resp.status}", "请查看服务日志")
     except Exception as exc:
         detail = f"未连接；日志位置: {SERVICE_LOG}"
@@ -106,6 +129,7 @@ def run_diagnostics() -> Dict[str, Any]:
         else _error("Python", "版本过低", "需要 Python 3.10+")
     )
     checks.extend(_check_import(label, module) for label, module in REQUIRED_MODULES)
+    checks.append(_check_gpu(settings))
     checks.append(_check_command("yt-dlp", "请运行: pip install -r requirements.txt"))
     checks.append(_check_command("ffmpeg", "请安装 ffmpeg 并加入 PATH，用于合并 MP4 和生成 ChatGPT 包"))
     checks.append(
