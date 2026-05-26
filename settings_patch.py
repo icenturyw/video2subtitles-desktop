@@ -118,6 +118,21 @@ def _set_label_style(label, color, bold=True):
     label.setStyleSheet(f"font-size: 12px; color: {color}; font-weight: {weight}; padding: 4px 12px;")
 
 
+def _service_status_text():
+    status = os.environ.get("V2S_WHISPER_SERVICE_STATUS", "").strip()
+    detail = os.environ.get("V2S_WHISPER_SERVICE_DETAIL", "").strip()
+    log_path = os.environ.get("V2S_WHISPER_SERVICE_LOG", "").strip()
+    return status, detail, log_path
+
+
+def _open_service_log():
+    _, _, log_path = _service_status_text()
+    if log_path and Path(log_path).exists():
+        _open_folder(Path(log_path).parent)
+        return True
+    return False
+
+
 class SettingsDialog(OriginalSettingsDialog):
     """Existing settings dialog plus model installation controls."""
 
@@ -359,27 +374,35 @@ def _patched_check_server(self):
         server_connected = False
 
     local_ready = _runtime_has_faster_whisper()
+    service_status, service_detail, service_log = _service_status_text()
 
     if server_connected and local_ready:
         self.server_status.setText("● 本地+在线就绪")
         _set_label_style(self.server_status, THEME["success"])
-        self.server_status.setToolTip("本地视频可直接转录；在线视频链接也可通过 Whisper Server 下载处理。")
+        self.server_status.setToolTip(service_detail or "本地视频可直接转录；在线视频链接也可通过 Whisper Server 下载处理。")
+        if hasattr(self, "status_label"):
+            self.status_label.setText("本地模型与在线链接服务均已就绪。")
     elif server_connected:
         self.server_status.setText("● 在线服务已连接")
         _set_label_style(self.server_status, THEME["success"])
-        self.server_status.setToolTip("Whisper Server 已连接；如需纯本地转录，请安装 faster-whisper。")
+        self.server_status.setToolTip(service_detail or "Whisper Server 已连接；如需纯本地转录，请安装 faster-whisper。")
+        if hasattr(self, "status_label"):
+            self.status_label.setText("在线链接服务已连接；本地模型未检测到或未安装。")
     elif local_ready:
         self.server_status.setText("● 本地模式就绪")
         _set_label_style(self.server_status, THEME["success"])
-        self.server_status.setToolTip("本地视频可直接转录；在线视频链接需要 Whisper Server。")
+        self.server_status.setToolTip(service_detail or "本地视频可直接转录；在线视频链接需要 Whisper Server。")
         if hasattr(self, "status_label"):
-            self.status_label.setText("本地模式就绪：可直接添加本地视频；在线视频链接需要启动 Whisper Server。")
+            if service_status in {"missing_dir", "missing_entry", "timeout", "error"}:
+                self.status_label.setText(f"本地模式就绪；在线服务未启动：{service_detail}")
+            else:
+                self.status_label.setText("本地模式就绪：可直接添加本地视频；在线视频链接需要启动 Whisper Server。")
     else:
-        self.server_status.setText("⚠ 需要安装模型")
+        self.server_status.setText("⚠ 需要安装模型/服务")
         _set_label_style(self.server_status, THEME["warning"])
-        self.server_status.setToolTip("打开设置，点击「安装/检查模型」；如缺少依赖，请先运行 pip install -r requirements.txt。")
+        self.server_status.setToolTip(service_detail or "打开设置，点击「安装/检查模型」；如缺少依赖，请先运行 pip install -r requirements.txt。")
         if hasattr(self, "status_label"):
-            self.status_label.setText("首次使用：请打开设置，选择模型后点击「安装/检查模型」。")
+            self.status_label.setText(service_detail or "首次使用：请打开设置，选择模型后点击「安装/检查模型」。")
 
 
 def _patched_show_settings(self):
