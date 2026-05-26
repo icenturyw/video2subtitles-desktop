@@ -20,11 +20,12 @@
 
 - **本地文件 & 在线视频** — 支持 mp4/avi/mov/mkv 等常见格式，以及 YouTube、Bilibili 等平台链接
 - **已内置 Whisper 服务** — 项目自带 `whisper-server/main.py`，启动客户端时会自动拉起本机 sidecar 服务
+- **GPU 自动加速** — 默认自动检测 NVIDIA GPU；检测到 RTX/4070 等显卡时优先使用 `cuda + float16`，否则回退 `cpu + int8`
 - **在线视频保留 MP4** — 在线链接默认优先下载并保存视频文件，字幕、原视频和 ChatGPT 分析包可以在同一输出目录中使用
 - **下载策略可配置** — 支持「保存 MP4 视频」「仅转写不保留视频」「仅音频转写」三种模式，并可限制最高质量
 - **自动多格式输出** — 任务完成后会自动保存 SRT、VTT、TXT，并生成 `manifest.json` 输出元数据
 - **历史记录增强** — 历史窗口可打开输出目录、加回任务列表、重新生成 ChatGPT 包、复制/打开来源
-- **一键环境检查** — 设置页可检查 Python、依赖、yt-dlp、ffmpeg、模型目录、输出目录、端口和服务健康状态
+- **一键环境检查** — 设置页可检查 Python、依赖、GPU、yt-dlp、ffmpeg、模型目录、输出目录、端口和服务健康状态
 - **统一模型目录** — 客户端模型安装目录 `models/` 同时供内置服务和本地 fallback 使用，下载一次，两边共用
 - **隐藏后台窗口** — Windows 下开始处理时，转写 helper、yt-dlp 等后台子进程不会再弹出空黑窗口
 - **可见的服务状态** — 客户端底部会显示本地服务启动结果，启动日志写入 `.cache/whisper-service.log`
@@ -49,6 +50,7 @@
 - `yt-dlp` — 在线视频下载
 - **可选依赖：**
   - `ffmpeg` — `yt-dlp` 合并在线视频音视频流，以及 ChatGPT 分析包的视频处理
+  - NVIDIA 驱动 / CUDA 运行环境 — 使用 RTX 4070 等 NVIDIA GPU 推理时需要
 
 ---
 
@@ -58,7 +60,7 @@
 pip install -r requirements.txt
 ```
 
-如果你只处理本地视频，安装完成即可使用。如果要处理 YouTube/Bilibili 等在线链接，请确保 `yt-dlp` 和 `ffmpeg` 可用。打开设置后也可以点击「一键检查环境」查看当前依赖和服务状态。
+如果你只处理本地视频，安装完成即可使用。如果要处理 YouTube/Bilibili 等在线链接，请确保 `yt-dlp` 和 `ffmpeg` 可用。打开设置后也可以点击「一键检查环境」查看当前依赖、GPU 和服务状态。
 
 ---
 
@@ -68,11 +70,12 @@ pip install -r requirements.txt
 
 1. 启动客户端：`python app.py` 或双击 `start.bat`。
 2. 如果右上角显示「⚠ 需要安装模型」，点击「⚙」打开设置。
-3. 点击「一键检查环境」，确认依赖、端口、模型目录和输出目录状态。
+3. 点击「一键检查环境」，确认依赖、GPU、端口、模型目录和输出目录状态。
 4. 在「Whisper 模型」里选择模型大小，通常先用 `base`、`small` 或速度更快的 `large-v3-turbo`。
-5. 按需要设置「在线视频下载模式」和「下载质量」，默认「保存 MP4 视频（推荐）」。
-6. 点击「安装/检查模型」，等待状态显示「模型已就绪」。
-7. 添加本地视频或在线视频链接并点击「开始处理」。
+5. 在「GPU / 推理设备」里保持默认「自动」，有 NVIDIA GPU 时会优先使用 CUDA。
+6. 按需要设置「在线视频下载模式」和「下载质量」，默认「保存 MP4 视频（推荐）」。
+7. 点击「安装/检查模型」，等待状态显示「模型已就绪」。
+8. 添加本地视频或在线视频链接并点击「开始处理」。
 
 > 现在项目已经内置 `whisper-server/`。客户端安装的模型会通过 `WHISPER_MODEL_DIR` 传给内置服务，因此在线链接和本地文件可以共用同一份模型缓存。
 
@@ -87,6 +90,38 @@ Windows 下也可双击：
 - `start.bat` — 生产模式启动，会自动尝试拉起 `whisper-server/main.py`，后台窗口默认隐藏
 - `start_debug.bat` — 调试模式启动（显示控制台），方便查看本地服务日志
 
+### GPU / RTX 4070 加速
+
+默认设置为：
+
+```text
+推理设备: auto
+计算类型: auto
+```
+
+自动模式会按下面规则解析：
+
+| 检测结果 | 实际使用 |
+|---|---|
+| 检测到 NVIDIA GPU，例如 RTX 4070 | `cuda + float16` |
+| 未检测到 NVIDIA GPU | `cpu + int8` |
+
+确认是否用上 4070：
+
+1. 打开「⚙ 设置」。
+2. 查看「GPU / 推理设备」区域，应该显示类似：`自动模式将使用 cuda/float16`。
+3. 点击「一键检查环境」，查看「GPU 推理」一项。
+4. 处理视频时也可以打开任务管理器或运行 `nvidia-smi` 观察显存和 GPU 占用。
+
+如果之前已经启动过旧版内置服务，它可能仍然以 CPU 模式常驻。修改 GPU 设置后，请关闭客户端并结束旧的 Python/Whisper 服务进程，或者直接重启电脑后再启动客户端，确保新的 `DEVICE=cuda` / `COMPUTE_TYPE=float16` 生效。
+
+如果自动模式没有识别 4070，请检查：
+
+- NVIDIA 驱动是否正常安装
+- 命令行运行 `nvidia-smi` 是否能看到 4070
+- faster-whisper / CTranslate2 是否具备 CUDA 支持
+- 设置页是否被手动改成了 `CPU`
+
 ### Whisper 服务与模型目录 / Whisper Service and Model Paths
 
 项目现在自带轻量本地服务：
@@ -100,7 +135,7 @@ Windows 下也可双击：
 http://127.0.0.1:8765
 ```
 
-桌面端自动拉起本地服务时会把 `WHISPER_MODEL_DIR`、`WHISPER_MODEL_PATH`、`MODEL_SIZE`、`DEVICE`、`COMPUTE_TYPE`、`V2S_DOWNLOAD_MODE`、`V2S_DOWNLOAD_QUALITY` 传入服务进程。也就是说，在设置窗口里下载/选择的模型和下载策略，对在线链接和本地文件都有效。
+桌面端自动拉起本地服务时会把 `WHISPER_MODEL_DIR`、`WHISPER_MODEL_PATH`、`MODEL_SIZE`、`DEVICE`、`COMPUTE_TYPE`、`V2S_DOWNLOAD_MODE`、`V2S_DOWNLOAD_QUALITY` 传入服务进程。也就是说，在设置窗口里下载/选择的模型、GPU 设备和下载策略，对在线链接和本地文件都有效。
 
 在线链接处理时，内置服务会优先使用 `yt-dlp` 下载视频并合并为 MP4；桌面端随后会把下载得到的视频、字幕、历史记录和 `manifest.json` 保存到同一个输出子目录。右键已完成任务，或在右侧字幕预览区点击「📦 生成 ChatGPT 包」，都可以生成 ChatGPT 分析包；分析包会使用该视频生成 480p 代理视频、关键帧和上传 zip。
 
@@ -147,8 +182,9 @@ chatgpt_package/      # 生成 ChatGPT 包后出现
 2. 在「Whisper 模型」里选择「模型大小」，支持 `tiny`、`base`、`small`、`medium`、`large-v2`、`large-v3`、`large-v3-turbo`。
 3. 设置「模型缓存目录」，用于保存或读取 `faster-whisper` 模型文件。
 4. 如需使用某个已经转换好的模型，设置「具体模型目录」；留空时按「模型大小」从缓存目录加载或下载。
-5. 点击「安装/检查模型」提前下载或验证模型。
-6. 点击「一键检查环境」可检查依赖、服务、端口和目录权限。
+5. 在「GPU / 推理设备」中选择 `自动`、`CUDA` 或 `CPU`，并选择计算类型。
+6. 点击「安装/检查模型」提前下载或验证模型。
+7. 点击「一键检查环境」可检查依赖、GPU、服务、端口和目录权限。
 
 设置会保存到 `.cache/settings.json`，下次启动自动生效。外部环境变量仍可覆盖客户端保存的值。
 
@@ -162,8 +198,8 @@ chatgpt_package/      # 生成 ChatGPT 包后出现
 | `WHISPER_MODEL_DIR` | 可选。自定义模型缓存/存放目录；未设置时默认使用项目内 `models/` |
 | `WHISPER_MODEL_PATH` | 可选。指定某个已转换好的 `faster-whisper` / CTranslate2 模型目录；设置后优先于 `MODEL_SIZE` |
 | `MODEL_SIZE` | 可选。模型名称，如 `tiny`、`base`、`small`、`medium`、`large-v3`、`large-v3-turbo`；默认 `base` |
-| `DEVICE` | 可选。推理设备，默认 `cpu` |
-| `COMPUTE_TYPE` | 可选。计算类型，默认 `int8` |
+| `DEVICE` | 可选。推理设备：`auto`、`cuda`、`cpu`；默认 `auto` |
+| `COMPUTE_TYPE` | 可选。计算类型：`auto`、`float16`、`int8_float16`、`int8`、`float32`；默认 `auto` |
 | `V2S_DOWNLOAD_MODE` | 可选。在线视频下载模式：`video`、`transcribe_only`、`audio`；默认 `video` |
 | `V2S_DOWNLOAD_QUALITY` | 可选。下载质量：`best`、`720p`、`480p`；默认 `best` |
 | `V2S_KEEP_DOWNLOADED_VIDEO` | 可选。是否保留下载视频：`true` / `false`；默认 `true` |
@@ -173,6 +209,14 @@ Windows 示例：
 ```bat
 set WHISPER_MODEL_DIR=D:\AI\whisper-models
 set MODEL_SIZE=small
+python app.py
+```
+
+强制使用 4070 / CUDA：
+
+```bat
+set DEVICE=cuda
+set COMPUTE_TYPE=float16
 python app.py
 ```
 
@@ -236,6 +280,8 @@ video_2_subtitles/
 ├── main_window.py      # 主窗口界面 / Main GUI window
 ├── api_client.py       # Whisper API 客户端 / API client
 ├── local_whisper.py    # 本地 Whisper 转录 / Local transcriber
+├── gpu_config.py       # GPU 自动检测和设备解析 / GPU config helpers
+├── gpu_patch.py        # GPU 设置界面补丁 / GPU settings patch
 ├── whisper_config.py   # Whisper 路径和模型配置 / Whisper path config
 ├── client_settings.py  # 客户端持久化设置 / Client settings
 ├── diagnostics.py      # 环境检查 / Runtime diagnostics
