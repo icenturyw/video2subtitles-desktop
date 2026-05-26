@@ -1,72 +1,97 @@
-# Video2Subtitles
+# 🎬 Video2Subtitles
 
-A desktop GUI tool for generating subtitles from video files and online video links (YouTube, Bilibili, etc.). Built with PyQt5.
+视频字幕生成桌面工具 — 支持本地视频和在线视频链接，一键生成字幕并导出多种格式。
 
-## Features
+> A desktop GUI tool for generating subtitles from video files and online video links (YouTube, Bilibili, etc.). Built with PyQt5.
 
-- **Local files & online videos** — Supports local video files and links from YouTube, Bilibili, Douyin, and more
-- **Local & API transcription** — Works with a local Whisper server or cloud APIs (Groq, OpenAI)
-- **Subtitle export** — Export to SRT, VTT, or TXT format
-- **ChatGPT analysis pack** — Generate a ready-to-upload zip with proxy video, key frames, and subtitles for ChatGPT analysis
-- **Dark theme** — Modern dark UI with a polished look
-- **Bilingual subtitles** — Supports translation alongside original text
+---
 
-## Prerequisites
+## 截图 / Screenshots
+
+| 主界面 / Main Window | 字幕预览 / Subtitle Preview |
+|---|---|
+| ![example](example.png) | ![example2](example2.png) |
+
+---
+
+## 功能特色 / Features
+
+- **本地文件 & 在线视频** — 支持 mp4/avi/mov/mkv 等常见格式，以及 YouTube、Bilibili 等平台链接
+- **本地 & API 转录** — 可配合 [Whisper Server](https://github.com/icenturyw/youtube-live-subtitles) 本地转录，或使用 Groq/OpenAI 云端 API
+- **多格式导出** — 导出 SRT、VTT、TXT 字幕格式
+- **ChatGPT 分析包** — 一键生成含代理视频、关键帧和字幕的上传包，方便 ChatGPT 分析
+- **双语字幕** — 支持原文+翻译同时显示
+- **深色主题** — 现代化暗色 UI 界面
+
+---
+
+## 环境要求 / Prerequisites
 
 - Python 3.10+
 - PyQt5 `>=5.15`
 - `requests`
-- [Whisper Server](https://github.com/icenturyw/youtube-live-subtitles) (optional, for local transcription and URL support)
-- `ffmpeg` (optional, for ChatGPT analysis pack feature)
-- `yt-dlp` (optional, for online video title fetching)
+- **可选依赖：**
+  - [Whisper Server](https://github.com/icenturyw/youtube-live-subtitles) — 本地转录和在线视频下载
+  - `ffmpeg` — ChatGPT 分析包的视频压缩和关键帧抽取
+  - `yt-dlp` — 在线视频标题获取
 
-## Installation
+---
+
+## 安装 / Installation
 
 ```bash
 pip install PyQt5 requests
 ```
 
-## Usage
+---
 
-### Start the application
+## 使用 / Usage
+
+### 启动 / Launch
 
 ```bash
 python app.py
 ```
 
-Or use the provided batch files on Windows:
+Windows 下也可双击：
 
-- `start.bat` — Launch in production mode
-- `start_debug.bat` — Launch with a visible console window
+- `start.bat` — 生产模式启动
+- `start_debug.bat` — 调试模式启动（显示控制台）
 
-### Environment variables
+### 环境变量 / Environment Variables
 
-| Variable | Description |
+| 变量 | 说明 |
 |---|---|
-| `WHISPER_SERVER_DIR` | Path to the [whisper-server](https://github.com/icenturyw/youtube-live-subtitles) directory |
+| `WHISPER_SERVER_DIR` | [Whisper Server](https://github.com/icenturyw/youtube-live-subtitles) 目录路径 |
 
-### Basic workflow
+### 基本流程 / Workflow
 
-1. **Add videos** — Click "添加视频" to select local files, or paste an online video URL
-2. **Start processing** — Click "开始处理" to transcribe
-3. **View subtitles** — Select a completed item to preview subtitles
-4. **Export** — Right-click to export as SRT/VTT/TXT or generate a ChatGPT analysis pack
+1. **添加视频** — 点击「添加视频」选择本地文件，或粘贴在线视频链接
+2. **开始处理** — 点击「开始处理」进行字幕转录
+3. **预览字幕** — 点击已完成的任务查看字幕内容
+4. **导出/打包** — 右键导出 SRT/VTT/TXT 或生成 ChatGPT 分析包
 
-## Project structure
+---
+
+## 项目结构 / Project Structure
 
 ```
 video_2_subtitles/
-├── app.py              # Application entry point
-├── main_window.py      # Main GUI window
-├── api_client.py       # Whisper API client
-├── local_whisper.py    # Local Whisper transcriber
-├── history.py          # History manager
-├── requirements.txt    # Python dependencies
-├── start.bat           # Production launcher (Windows)
-├── start_debug.bat     # Debug launcher (Windows)
-└── output/             # Generated subtitles & exports
+├── app.py              # 入口文件 / Entry point
+├── main_window.py      # 主窗口界面 / Main GUI window
+├── api_client.py       # Whisper API 客户端 / API client
+├── local_whisper.py    # 本地 Whisper 转录 / Local transcriber
+├── history.py          # 历史记录管理 / History manager
+├── requirements.txt    # Python 依赖 / Dependencies
+├── start.bat           # 生产启动（Win） / Production launcher
+├── start_debug.bat     # 调试启动（Win） / Debug launcher
+├── example.png         # 界面截图 / Screenshot
+├── example2.png        # 界面截图 / Screenshot
+└── output/             # 字幕输出目录 / Output directory
 ```
 
-## License
+---
+
+## 许可 / License
 
 MIT
