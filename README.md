@@ -11,6 +11,8 @@
 | 主界面 / Main Window | 字幕预览 / Subtitle Preview |
 |---|---|
 | ![example](example.png) | ![example2](example2.png) |
+| **运行截图 / Processing** | |
+| ![example3](example3.png) | |
 
 ---
 
@@ -87,6 +89,7 @@ video_2_subtitles/
 ├── start_debug.bat     # 调试启动（Win） / Debug launcher
 ├── example.png         # 界面截图 / Screenshot
 ├── example2.png        # 界面截图 / Screenshot
+├── example3.png        # 运行截图 / Processing screenshot
 └── output/             # 字幕输出目录 / Output directory
 ```
 
