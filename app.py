@@ -6,6 +6,11 @@ import os
 import subprocess
 import time
 
+from client_settings import apply_saved_settings_to_env
+
+# Apply persisted client settings before importing modules that read env vars.
+apply_saved_settings_to_env()
+
 from whisper_config import WHISPER_SERVER
 
 # Add the bundled/custom whisper server to path so we can optionally use it directly.
@@ -16,6 +21,9 @@ if WHISPER_SERVER.exists():
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QtGui import QFont
 from main_window import MainWindow, apply_theme
+import settings_patch
+
+settings_patch.install()
 
 
 def _ensure_whisper_server():

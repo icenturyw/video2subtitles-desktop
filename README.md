@@ -20,6 +20,7 @@
 
 - **本地文件 & 在线视频** — 支持 mp4/avi/mov/mkv 等常见格式，以及 YouTube、Bilibili 等平台链接
 - **内置 Whisper 路径** — 默认从项目内 `whisper-server/` 启动服务，不再要求用户理解外部仓库目录
+- **客户端模型设置** — 可在设置窗口指定模型缓存目录、具体模型目录和模型大小
 - **模型位置可配置** — 本地转录默认使用项目内 `models/` 作为模型目录，也支持指定自定义模型目录
 - **本地 & API 转录** — 可直接使用 `faster-whisper` 本地转录，或配合 Whisper Server / Groq / OpenAI 云端 API
 - **多格式导出** — 导出 SRT、VTT、TXT 字幕格式
@@ -70,6 +71,15 @@ Windows 下也可双击：
 - `whisper-server/`：可选的内置 Whisper Server 目录。存在 `server.py` 和 `venv/` 时，应用会自动尝试启动它；在线链接下载仍需要该服务。
 - `models/`：默认的 `faster-whisper` 模型缓存/存放目录。本地视频转录会优先使用这里，缺少模型时按 `faster-whisper` 逻辑下载到该目录。
 
+客户端也可以直接设置模型位置：
+
+1. 点击右上角「⚙」打开设置。
+2. 在「Whisper 模型」里选择「模型大小」。
+3. 设置「模型缓存目录」，用于保存或读取 `faster-whisper` 模型文件。
+4. 如需使用某个已经转换好的模型，设置「具体模型目录」；留空时按「模型大小」从缓存目录加载或下载。
+
+设置会保存到 `.cache/settings.json`，下次启动自动生效。外部环境变量仍可覆盖客户端保存的值。
+
 也可以通过环境变量覆盖默认路径：
 
 | 变量 | 说明 |
@@ -114,10 +124,13 @@ video_2_subtitles/
 ├── api_client.py       # Whisper API 客户端 / API client
 ├── local_whisper.py    # 本地 Whisper 转录 / Local transcriber
 ├── whisper_config.py   # Whisper 路径和模型配置 / Whisper path config
+├── client_settings.py  # 客户端持久化设置 / Client settings
+├── settings_patch.py   # 设置窗口扩展 / Settings dialog extension
 ├── history.py          # 历史记录管理 / History manager
 ├── requirements.txt    # Python 依赖 / Dependencies
 ├── whisper-server/     # 可选内置 Whisper Server / Optional bundled server
 ├── models/             # 默认模型目录 / Default model directory
+├── .cache/             # 本地设置和辅助脚本缓存 / Local cache
 ├── start.bat           # 生产启动（Win） / Production launcher
 ├── start_debug.bat     # 调试启动（Win） / Debug launcher
 ├── example.png         # 界面截图 / Screenshot

@@ -11,9 +11,12 @@ venv/
 .env/
 
 # Project specific
+.cache/
+models/
 output/
 *.log
 transcribe_local.py
+whisper-server/venv/
 
 # IDE
 .vscode/
