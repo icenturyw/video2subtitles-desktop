@@ -27,8 +27,10 @@ from PyQt5.QtWidgets import QApplication
 from PyQt5.QtGui import QFont
 from main_window import MainWindow, apply_theme
 import settings_patch
+import output_patch
 
 settings_patch.install()
+output_patch.install()
 
 
 def _set_service_status(status, detail=""):
