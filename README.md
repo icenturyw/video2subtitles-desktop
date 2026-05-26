@@ -26,6 +26,7 @@
 - **自动多格式输出** — 任务完成后会自动保存 SRT、VTT、TXT，并生成 `manifest.json` 输出元数据
 - **历史记录增强** — 历史窗口可打开输出目录、加回任务列表、重新生成 ChatGPT 包、复制/打开来源
 - **错误日志增强** — 生成失败时会突出显示错误、弹出可复制详情，并在右侧预览区保留完整错误日志和服务日志尾部
+- **标题获取增强** — 添加 YouTube 链接时会过滤 yt-dlp 的警告输出，避免把 `No supported JavaScript runtime...` 当成视频标题显示
 - **一键环境检查** — 设置页可检查 Python、依赖、GPU、yt-dlp、ffmpeg、模型目录、输出目录、端口和服务健康状态
 - **统一模型目录** — 客户端模型安装目录 `models/` 同时供内置服务和本地 fallback 使用，下载一次，两边共用
 - **隐藏后台窗口** — Windows 下开始处理时，转写 helper、yt-dlp 等后台子进程不会再弹出空黑窗口
@@ -165,6 +166,17 @@ chatgpt_package/      # 生成 ChatGPT 包后出现
 - 复制来源路径/链接
 - 打开来源文件夹或浏览器链接
 
+### 在线标题获取 / Online Title Fetching
+
+添加在线视频链接后，客户端会异步调用 `yt-dlp` 预取标题。标题预取只用于列表展示，不影响后续下载、转写和输出保存。
+
+为避免 YouTube 近期的 JavaScript runtime / 签名警告污染标题显示，标题预取现在会：
+
+- 分离 `yt-dlp` 的 stdout 和 stderr，只从 stdout 读取标题。
+- 使用 `--no-warnings` 并过滤 `WARNING:`、`ERROR:`、`No supported JavaScript runtime...` 等非标题行。
+- 复用设置中的代理 `V2S_PROXY`，并自动使用 `whisper-server/cookies.txt`。
+- 如果标题仍然获取失败，则保留原始链接显示，不再把报错文本当标题。
+
 ### 错误日志 / Error Logs
 
 生成过程中如果任务失败，客户端会：
@@ -213,6 +225,7 @@ chatgpt_package/      # 生成 ChatGPT 包后出现
 | `V2S_DOWNLOAD_MODE` | 可选。在线视频下载模式：`video`、`transcribe_only`、`audio`；默认 `video` |
 | `V2S_DOWNLOAD_QUALITY` | 可选。下载质量：`best`、`720p`、`480p`；默认 `best` |
 | `V2S_KEEP_DOWNLOADED_VIDEO` | 可选。是否保留下载视频：`true` / `false`；默认 `true` |
+| `V2S_PROXY` | 可选。在线视频标题预取和 yt-dlp 下载使用的代理地址；留空表示直连 |
 
 Windows 示例：
 
@@ -269,6 +282,7 @@ python app.py
 3. `yt-dlp` 和 `ffmpeg` 是否可用，尤其是在线链接下载失败时。
 4. 设置页点击「一键检查环境」。
 5. 打开 `.cache/whisper-service.log` 查看 Python 报错。
+6. YouTube 标题或下载异常时，优先更新 `yt-dlp`，必要时安装 Node.js/Deno 等 JavaScript runtime 或使用 cookies。
 
 需要直接看到服务窗口时，请使用 `start_debug.bat`。
 
@@ -299,6 +313,7 @@ video_2_subtitles/
 ├── output_manifest.py  # 输出元数据 / Output metadata
 ├── output_patch.py     # 输出流程和历史记录增强 / Output workflow patch
 ├── error_log_patch.py  # 错误日志展示和复制增强 / Error log UI patch
+├── title_fetch_patch.py # 在线标题获取增强 / Online title fetch patch
 ├── settings_patch.py   # 设置窗口和启动流程扩展 / Setup flow extension
 ├── history.py          # 历史记录管理 / History manager
 ├── requirements.txt    # Python 依赖 / Dependencies
