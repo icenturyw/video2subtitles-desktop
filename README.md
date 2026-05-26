@@ -19,9 +19,10 @@
 ## 功能特色 / Features
 
 - **本地文件 & 在线视频** — 支持 mp4/avi/mov/mkv 等常见格式，以及 YouTube、Bilibili 等平台链接
-- **内置 Whisper 路径** — 默认从项目内 `whisper-server/` 启动服务，不再要求用户理解外部仓库目录
+- **内置本地 Whisper 服务** — 默认从项目内 `whisper-server/` 自动拉起服务，不再要求用户手动启动外部 server
+- **兼容 youtube-live-subtitles 服务** — 支持 `whisper-server/main.py` 入口，同时兼容旧版 `server.py`
 - **客户端模型安装** — 设置窗口可选择模型大小、模型目录，并一键安装/检查模型
-- **本地优先流程** — 本地视频不再依赖服务器；服务器仅用于在线视频下载和服务模式转录
+- **本地优先流程** — 本地视频不再依赖服务器；在线链接由内置本地服务负责下载、分段、转录和缓存
 - **模型位置可配置** — 本地转录默认使用项目内 `models/` 作为模型目录，也支持指定自定义模型目录
 - **本地 & API 转录** — 可直接使用 `faster-whisper` 本地转录，或配合 Whisper Server / Groq / OpenAI 云端 API
 - **多格式导出** — 导出 SRT、VTT、TXT 字幕格式
@@ -39,8 +40,8 @@
 - `faster-whisper` — 本地视频转录
 - **可选依赖：**
   - 项目内 `whisper-server/` 或自定义 Whisper Server — 在线视频下载和服务模式转录
-  - `ffmpeg` — ChatGPT 分析包的视频压缩和关键帧抽取
-  - `yt-dlp` — 在线视频标题获取
+  - `ffmpeg` — ChatGPT 分析包的视频压缩、关键帧抽取，以及服务端音频处理
+  - `yt-dlp` — 在线视频标题获取和服务端在线链接下载
 
 ---
 
@@ -49,6 +50,8 @@
 ```bash
 pip install -r requirements.txt
 ```
+
+如需在线链接下载/转录，把 `youtube-live-subtitles` 仓库中的 `whisper-server/` 目录放到本项目根目录，或通过 `WHISPER_SERVER_DIR` 指向该目录。桌面端会优先启动其中的 `main.py`。
 
 ---
 
@@ -62,7 +65,7 @@ pip install -r requirements.txt
 4. 点击「安装/检查模型」，等待状态显示「模型已就绪」。
 5. 添加本地视频并点击「开始处理」。
 
-> 本地视频可以直接转录，不需要 Whisper Server。在线视频链接下载仍需要 Whisper Server，因此未连接服务器时，界面会显示「本地模式就绪」而不是错误。
+> 本地视频可以直接转录，不需要 Whisper Server。在线链接会优先使用项目内置/指定的本地 Whisper 服务；服务缺失时，界面会保持「本地模式就绪」，并只限制在线链接处理。
 
 ### 启动 / Launch
 
@@ -72,15 +75,17 @@ python app.py
 
 Windows 下也可双击：
 
-- `start.bat` — 生产模式启动
-- `start_debug.bat` — 调试模式启动（显示控制台）
+- `start.bat` — 生产模式启动，会自动尝试拉起 `whisper-server/main.py` 或 `server.py`
+- `start_debug.bat` — 调试模式启动（显示控制台），方便查看本地服务日志
 
-### Whisper 与模型目录 / Whisper and Model Paths
+### Whisper 服务与模型目录 / Whisper Service and Model Paths
 
 项目现在优先使用项目内目录，减少外部路径歧义：
 
-- `whisper-server/`：可选的内置 Whisper Server 目录。存在 `server.py` 和 `venv/` 时，应用会自动尝试启动它；在线链接下载仍需要该服务。
+- `whisper-server/`：可选的内置 Whisper 服务目录。存在 `main.py`（`youtube-live-subtitles`）或 `server.py` 且具备 `venv/` 时，应用会自动尝试启动它；在线链接下载和服务模式转录使用该服务。
 - `models/`：默认的 `faster-whisper` 模型缓存/存放目录。本地视频转录会优先使用这里，缺少模型时按 `faster-whisper` 逻辑下载到该目录。
+
+内置本地服务默认监听 `http://127.0.0.1:8765`。桌面端自动拉起本地服务时会把 `API_AUTH_KEY` 置空，避免本机调用被默认密钥拦截；如果你连接的是远程或手动启动的服务，可以通过环境变量 `API_AUTH_KEY` 设置客户端请求头 `x-api-key`。
 
 客户端也可以直接设置模型位置：
 
@@ -96,7 +101,9 @@ Windows 下也可双击：
 
 | 变量 | 说明 |
 |---|---|
-| `WHISPER_SERVER_DIR` | 可选。自定义 Whisper Server 目录；未设置时默认使用项目内 `whisper-server/` |
+| `WHISPER_SERVER_DIR` | 可选。自定义 Whisper 服务目录；未设置时默认使用项目内 `whisper-server/` |
+| `WHISPER_SERVER_URL` | 可选。自定义服务地址；默认 `http://127.0.0.1:8765` |
+| `API_AUTH_KEY` | 可选。远程或手动启动服务的 API Key；客户端会作为 `x-api-key` 发送 |
 | `WHISPER_MODEL_DIR` | 可选。自定义模型缓存/存放目录；未设置时默认使用项目内 `models/` |
 | `WHISPER_MODEL_PATH` | 可选。指定某个已转换好的 `faster-whisper` / CTranslate2 模型目录；设置后优先于 `MODEL_SIZE` |
 | `MODEL_SIZE` | 可选。模型名称，如 `tiny`、`base`、`small`、`medium`、`large-v3`、`large-v3-turbo`；默认 `base` |
@@ -115,6 +122,21 @@ python app.py
 
 ```bat
 set WHISPER_MODEL_PATH=D:\AI\whisper-models\models--Systran--faster-whisper-small\snapshots\xxxx
+python app.py
+```
+
+使用自定义服务目录：
+
+```bat
+set WHISPER_SERVER_DIR=D:\Projects\youtube-live-subtitles\whisper-server
+python app.py
+```
+
+连接已有远程服务：
+
+```bat
+set WHISPER_SERVER_URL=http://192.168.1.10:8765
+set API_AUTH_KEY=your-secret-key
 python app.py
 ```
 
@@ -140,7 +162,7 @@ video_2_subtitles/
 ├── settings_patch.py   # 设置窗口和启动流程扩展 / Setup flow extension
 ├── history.py          # 历史记录管理 / History manager
 ├── requirements.txt    # Python 依赖 / Dependencies
-├── whisper-server/     # 可选内置 Whisper Server / Optional bundled server
+├── whisper-server/     # 可选内置 Whisper 服务 / Optional bundled service
 ├── models/             # 默认模型目录 / Default model directory
 ├── .cache/             # 本地设置和辅助脚本缓存 / Local cache
 ├── start.bat           # 生产启动（Win） / Production launcher
