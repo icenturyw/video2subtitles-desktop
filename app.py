@@ -5,6 +5,7 @@ import sys
 import os
 import subprocess
 import time
+from pathlib import Path
 
 from client_settings import apply_saved_settings_to_env
 
@@ -12,6 +13,10 @@ from client_settings import apply_saved_settings_to_env
 apply_saved_settings_to_env()
 
 from whisper_config import WHISPER_SERVER, WHISPER_MODEL_DIR
+
+APP_DIR = Path(__file__).resolve().parent
+CACHE_DIR = APP_DIR / ".cache"
+SERVICE_LOG_PATH = CACHE_DIR / "whisper-service.log"
 
 # Add the bundled/custom whisper server to path so we can optionally use it directly.
 # Default location: ./whisper-server. Override with WHISPER_SERVER_DIR when needed.
@@ -24,6 +29,13 @@ from main_window import MainWindow, apply_theme
 import settings_patch
 
 settings_patch.install()
+
+
+def _set_service_status(status, detail=""):
+    """Expose sidecar startup details to the already-running UI process."""
+    os.environ["V2S_WHISPER_SERVICE_STATUS"] = status
+    os.environ["V2S_WHISPER_SERVICE_DETAIL"] = detail
+    os.environ["V2S_WHISPER_SERVICE_LOG"] = str(SERVICE_LOG_PATH)
 
 
 def _is_local_server_ready():
@@ -56,25 +68,21 @@ def _find_server_python():
         candidates = [
             WHISPER_SERVER / "venv" / "Scripts" / "python.exe",
             WHISPER_SERVER / ".venv" / "Scripts" / "python.exe",
-            os.path.dirname(sys.executable) and WHISPER_SERVER / "venv" / "Scripts" / "python.exe",
+            APP_DIR / ".venv" / "Scripts" / "python.exe",
+            APP_DIR / "venv" / "Scripts" / "python.exe",
         ]
     else:
         candidates = [
             WHISPER_SERVER / "venv" / "bin" / "python",
             WHISPER_SERVER / ".venv" / "bin" / "python",
+            APP_DIR / ".venv" / "bin" / "python",
+            APP_DIR / "venv" / "bin" / "python",
         ]
 
     for candidate in candidates:
-        if candidate and PathLike_exists(candidate):
+        if candidate.exists():
             return str(candidate)
     return sys.executable or "python"
-
-
-def PathLike_exists(path):
-    try:
-        return path.exists()
-    except Exception:
-        return False
 
 
 def _ensure_whisper_server():
@@ -84,15 +92,23 @@ def _ensure_whisper_server():
     service automatically, while local files can still fall back to faster-whisper
     when the service is absent.
     """
+    _set_service_status("checking", "正在检查 127.0.0.1:8765 本地 Whisper 服务...")
+
     if _is_local_server_ready():
-        return
+        _set_service_status("already_running", "本地 Whisper 服务已经在运行。")
+        return True
 
     if not WHISPER_SERVER.exists():
-        return
+        _set_service_status("missing_dir", f"未找到 Whisper 服务目录: {WHISPER_SERVER}")
+        return False
 
     server_script = _find_server_script()
     if not server_script:
-        return
+        _set_service_status("missing_entry", f"未找到服务入口 main.py/server.py: {WHISPER_SERVER}")
+        return False
+
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    python_exe = _find_server_python()
 
     try:
         env = os.environ.copy()
@@ -102,22 +118,37 @@ def _ensure_whisper_server():
         env.setdefault("WHISPER_SERVER_DIR", str(WHISPER_SERVER))
         env.setdefault("WHISPER_MODEL_DIR", str(WHISPER_MODEL_DIR))
 
-        popen_kwargs = {
-            "cwd": str(WHISPER_SERVER),
-            "stdout": subprocess.DEVNULL,
-            "stderr": subprocess.DEVNULL,
-            "env": env,
-        }
-        if os.name == "nt":
-            popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        with SERVICE_LOG_PATH.open("a", encoding="utf-8", errors="replace") as log:
+            log.write("\n" + "=" * 80 + "\n")
+            log.write(time.strftime("%Y-%m-%d %H:%M:%S") + " 启动本地 Whisper 服务\n")
+            log.write(f"python: {python_exe}\n")
+            log.write(f"script: {server_script}\n")
+            log.write(f"cwd: {WHISPER_SERVER}\n")
+            log.flush()
 
-        subprocess.Popen([_find_server_python(), str(server_script)], **popen_kwargs)
+            popen_kwargs = {
+                "cwd": str(WHISPER_SERVER),
+                "stdout": log,
+                "stderr": subprocess.STDOUT,
+                "env": env,
+            }
+            if os.name == "nt":
+                popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+            subprocess.Popen([python_exe, str(server_script)], **popen_kwargs)
+
+        _set_service_status("starting", f"正在启动本地 Whisper 服务，日志: {SERVICE_LOG_PATH}")
         for _ in range(20):
             time.sleep(0.5)
             if _is_local_server_ready():
-                return
-    except Exception:
-        pass
+                _set_service_status("started", f"本地 Whisper 服务已启动，日志: {SERVICE_LOG_PATH}")
+                return True
+
+        _set_service_status("timeout", f"已尝试启动但 10 秒内未就绪，请查看日志: {SERVICE_LOG_PATH}")
+        return False
+    except Exception as exc:
+        _set_service_status("error", f"启动本地 Whisper 服务失败: {exc}；日志: {SERVICE_LOG_PATH}")
+        return False
 
 
 def main():
