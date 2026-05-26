@@ -21,6 +21,7 @@
 - **本地文件 & 在线视频** — 支持 mp4/avi/mov/mkv 等常见格式，以及 YouTube、Bilibili 等平台链接
 - **内置本地 Whisper 服务** — 默认从项目内 `whisper-server/` 自动拉起服务，不再要求用户手动启动外部 server
 - **兼容 youtube-live-subtitles 服务** — 支持 `whisper-server/main.py` 入口，同时兼容旧版 `server.py`
+- **可见的服务状态** — 客户端底部会显示本地服务启动结果，启动日志写入 `.cache/whisper-service.log`
 - **客户端模型安装** — 设置窗口可选择模型大小、模型目录，并一键安装/检查模型
 - **本地优先流程** — 本地视频不再依赖服务器；在线链接由内置本地服务负责下载、分段、转录和缓存
 - **模型位置可配置** — 本地转录默认使用项目内 `models/` 作为模型目录，也支持指定自定义模型目录
@@ -140,6 +141,33 @@ set API_AUTH_KEY=your-secret-key
 python app.py
 ```
 
+### 本地服务启动状态排查 / Local Service Troubleshooting
+
+`start.bat` 和 `app.py` 都会尝试启动本地 Whisper 服务。为了避免打扰用户，生产模式下服务窗口默认隐藏；如果启动失败，客户端底部状态栏会显示原因。
+
+常见状态：
+
+- `本地+在线就绪`：本地模型可用，在线链接服务也已连接。
+- `在线服务已连接`：`127.0.0.1:8765` 可用，但本地 `faster-whisper` 未检测到。
+- `本地模式就绪`：本地视频可转录，但在线链接服务未启动或不可用。
+- `需要安装模型/服务`：既没有可用服务，也没有可用本地模型。
+
+启动日志位置：
+
+```text
+.cache/whisper-service.log
+```
+
+如果客户端没有显示在线服务已连接，请优先检查：
+
+1. `whisper-server/` 目录是否存在，或 `WHISPER_SERVER_DIR` 是否指向正确目录。
+2. 目录下是否有 `main.py`（来自 `youtube-live-subtitles/whisper-server`）或 `server.py`。
+3. `whisper-server/venv/` 是否存在，并已安装服务端依赖。
+4. 端口 `8765` 是否被其他程序占用。
+5. 打开 `.cache/whisper-service.log` 查看 Python 报错。
+
+需要直接看到服务窗口时，请使用 `start_debug.bat`。
+
 ### 基本流程 / Workflow
 
 1. **添加视频** — 点击「添加视频」选择本地文件，或粘贴在线视频链接
@@ -164,7 +192,7 @@ video_2_subtitles/
 ├── requirements.txt    # Python 依赖 / Dependencies
 ├── whisper-server/     # 可选内置 Whisper 服务 / Optional bundled service
 ├── models/             # 默认模型目录 / Default model directory
-├── .cache/             # 本地设置和辅助脚本缓存 / Local cache
+├── .cache/             # 本地设置、服务日志和辅助脚本缓存 / Local cache
 ├── start.bat           # 生产启动（Win） / Production launcher
 ├── start_debug.bat     # 调试启动（Win） / Debug launcher
 ├── example.png         # 界面截图 / Screenshot
