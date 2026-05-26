@@ -22,6 +22,8 @@
 - **已内置 Whisper 服务** — 项目自带 `whisper-server/main.py`，启动客户端时会自动拉起本机 sidecar 服务
 - **在线视频保留 MP4** — 在线链接默认优先下载并保存视频文件，字幕、原视频和 ChatGPT 分析包可以在同一输出目录中使用
 - **下载策略可配置** — 支持「保存 MP4 视频」「仅转写不保留视频」「仅音频转写」三种模式，并可限制最高质量
+- **自动多格式输出** — 任务完成后会自动保存 SRT、VTT、TXT，并生成 `manifest.json` 输出元数据
+- **历史记录增强** — 历史窗口可打开输出目录、加回任务列表、重新生成 ChatGPT 包、复制/打开来源
 - **一键环境检查** — 设置页可检查 Python、依赖、yt-dlp、ffmpeg、模型目录、输出目录、端口和服务健康状态
 - **统一模型目录** — 客户端模型安装目录 `models/` 同时供内置服务和本地 fallback 使用，下载一次，两边共用
 - **隐藏后台窗口** — Windows 下开始处理时，转写 helper、yt-dlp 等后台子进程不会再弹出空黑窗口
@@ -100,7 +102,32 @@ http://127.0.0.1:8765
 
 桌面端自动拉起本地服务时会把 `WHISPER_MODEL_DIR`、`WHISPER_MODEL_PATH`、`MODEL_SIZE`、`DEVICE`、`COMPUTE_TYPE`、`V2S_DOWNLOAD_MODE`、`V2S_DOWNLOAD_QUALITY` 传入服务进程。也就是说，在设置窗口里下载/选择的模型和下载策略，对在线链接和本地文件都有效。
 
-在线链接处理时，内置服务会优先使用 `yt-dlp` 下载视频并合并为 MP4；桌面端随后会把下载得到的视频、字幕和历史记录保存到同一个输出子目录。右键已完成任务，或在右侧字幕预览区点击「📦 生成 ChatGPT 包」，都可以生成 ChatGPT 分析包；分析包会使用该视频生成 480p 代理视频、关键帧和上传 zip。
+在线链接处理时，内置服务会优先使用 `yt-dlp` 下载视频并合并为 MP4；桌面端随后会把下载得到的视频、字幕、历史记录和 `manifest.json` 保存到同一个输出子目录。右键已完成任务，或在右侧字幕预览区点击「📦 生成 ChatGPT 包」，都可以生成 ChatGPT 分析包；分析包会使用该视频生成 480p 代理视频、关键帧和上传 zip。
+
+### 输出目录内容 / Output Folder
+
+每个任务完成后会生成独立输出子目录，通常包含：
+
+```text
+视频文件.mp4
+字幕.srt
+字幕.vtt
+字幕.txt
+manifest.json
+chatgpt_package/      # 生成 ChatGPT 包后出现
+```
+
+`manifest.json` 会记录来源链接/路径、标题、语言、字幕数量、视频文件、SRT/VTT/TXT 文件、下载模式、下载质量和 ChatGPT 包路径。即使历史记录文件损坏，输出目录本身也保留了任务元数据。
+
+### 历史记录 / History
+
+点击「历史记录」可以查看已处理任务。历史窗口支持：
+
+- 打开输出目录
+- 加回任务列表
+- 重新生成 ChatGPT 包
+- 复制来源路径/链接
+- 打开来源文件夹或浏览器链接
 
 ### 在线视频下载策略 / Online Download Strategy
 
@@ -197,6 +224,7 @@ python app.py
 2. **开始处理** — 点击「开始处理」下载/保存视频并进行字幕转录
 3. **预览字幕** — 点击已完成的任务查看字幕内容
 4. **导出/打包** — 右键导出 SRT/VTT/TXT，或在右侧字幕预览区点击「生成 ChatGPT 包」
+5. **历史管理** — 点击「历史记录」重新打开输出、加回任务列表或重新生成 ChatGPT 包
 
 ---
 
@@ -211,6 +239,8 @@ video_2_subtitles/
 ├── whisper_config.py   # Whisper 路径和模型配置 / Whisper path config
 ├── client_settings.py  # 客户端持久化设置 / Client settings
 ├── diagnostics.py      # 环境检查 / Runtime diagnostics
+├── output_manifest.py  # 输出元数据 / Output metadata
+├── output_patch.py     # 输出流程和历史记录增强 / Output workflow patch
 ├── settings_patch.py   # 设置窗口和启动流程扩展 / Setup flow extension
 ├── history.py          # 历史记录管理 / History manager
 ├── requirements.txt    # Python 依赖 / Dependencies
