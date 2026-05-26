@@ -11,18 +11,39 @@ DEFAULT_MODEL_DIR = APP_DIR / "models"
 SUPPORTED_MODEL_SIZES = [
     "tiny", "base", "small", "medium", "large-v2", "large-v3", "large-v3-turbo",
 ]
+SUPPORTED_DOWNLOAD_MODES = ["video", "transcribe_only", "audio"]
+SUPPORTED_DOWNLOAD_QUALITIES = ["best", "720p", "480p"]
 
 DEFAULT_SETTINGS = {
     "whisper_model_dir": str(DEFAULT_MODEL_DIR),
     "whisper_model_path": "",
     "model_size": "base",
+    # Keep MP4 by default. This protects the ChatGPT package workflow and makes
+    # the default behavior explicit instead of burying it in yt-dlp arguments.
+    "download_mode": "video",
+    "download_quality": "best",
+    "keep_downloaded_video": "true",
 }
 
 ENV_BY_KEY = {
     "whisper_model_dir": "WHISPER_MODEL_DIR",
     "whisper_model_path": "WHISPER_MODEL_PATH",
     "model_size": "MODEL_SIZE",
+    "download_mode": "V2S_DOWNLOAD_MODE",
+    "download_quality": "V2S_DOWNLOAD_QUALITY",
+    "keep_downloaded_video": "V2S_KEEP_DOWNLOADED_VIDEO",
 }
+
+
+def _as_bool_text(value, default="true"):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    text = str(value if value is not None else default).strip().lower()
+    if text in {"1", "true", "yes", "on", "y"}:
+        return "true"
+    if text in {"0", "false", "no", "off", "n"}:
+        return "false"
+    return default
 
 
 def _clean_settings(data):
@@ -36,6 +57,13 @@ def _clean_settings(data):
         settings["model_size"] = DEFAULT_SETTINGS["model_size"]
     if not settings["whisper_model_dir"]:
         settings["whisper_model_dir"] = DEFAULT_SETTINGS["whisper_model_dir"]
+    if settings["download_mode"] not in SUPPORTED_DOWNLOAD_MODES:
+        settings["download_mode"] = DEFAULT_SETTINGS["download_mode"]
+    if settings["download_quality"] not in SUPPORTED_DOWNLOAD_QUALITIES:
+        settings["download_quality"] = DEFAULT_SETTINGS["download_quality"]
+    settings["keep_downloaded_video"] = _as_bool_text(settings.get("keep_downloaded_video"), DEFAULT_SETTINGS["keep_downloaded_video"])
+    if settings["download_mode"] == "video":
+        settings["keep_downloaded_video"] = "true"
     return settings
 
 
@@ -62,7 +90,10 @@ def get_effective_settings():
 
 def save_settings(settings):
     """Persist client settings to .cache/settings.json."""
-    cleaned = _clean_settings(settings)
+    current = load_settings()
+    if isinstance(settings, dict):
+        current.update(settings)
+    cleaned = _clean_settings(current)
     SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
     SETTINGS_PATH.write_text(
         json.dumps(cleaned, ensure_ascii=False, indent=2),
