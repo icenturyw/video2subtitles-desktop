@@ -40,6 +40,9 @@ MODEL = None
 MODEL_KEY = None
 TASKS: Dict[str, Dict[str, Any]] = {}
 TASK_LOCK = threading.Lock()
+VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".flv", ".avi"}
+AUDIO_EXTS = {".mp3", ".m4a", ".opus", ".wav", ".aac", ".ogg"}
+MEDIA_EXTS = VIDEO_EXTS | AUDIO_EXTS
 
 
 class TranscribeRequest(BaseModel):
@@ -98,6 +101,24 @@ def _task_id_from_url(url: str) -> str:
     return hashlib.md5(url.encode("utf-8")).hexdigest()[:16]
 
 
+def _client_video_id_from_url(url: str) -> str:
+    """Match the desktop client's legacy output-copy ID fallback.
+
+    Older desktop code searches temp/{video_id}.* where video_id is extracted
+    with a YouTube-oriented regexp or falls back to md5(url)[:11].  The bundled
+    service keeps its richer task ID, but also creates this alias so downloaded
+    videos are copied into the user's output folder and ChatGPT packages can be
+    generated for online links.
+    """
+    match = re.search(
+        r"(?:v=|/videos/|embed/|youtu\.be/|/v/|/e/|watch\?v=|&v=)([^#&\n]*)",
+        url,
+    )
+    if match:
+        return re.sub(r"[^A-Za-z0-9_.-]", "_", match.group(1))[:80]
+    return hashlib.md5(url.encode("utf-8")).hexdigest()[:11]
+
+
 def _update_task(task_id: str, status: str, progress: int, message: str, **extra: Any) -> None:
     with TASK_LOCK:
         existing = TASKS.get(task_id, {})
@@ -131,51 +152,90 @@ def _cookie_args() -> list[str]:
     return []
 
 
-def _download_audio(video_url: str, task_id: str) -> Path:
-    _update_task(task_id, "downloading", 8, "正在下载音频...")
+def _existing_download(base_name: str, *, video_only: bool = False) -> Optional[Path]:
+    candidates = [p for p in TEMP_DIR.glob(f"{base_name}.*") if p.is_file() and p.stat().st_size > 0]
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    for item in candidates:
+        if item.suffix.lower() in VIDEO_EXTS:
+            return item
+    if video_only:
+        return None
+    for item in candidates:
+        if item.suffix.lower() in MEDIA_EXTS:
+            return item
+    return None
+
+
+def _ensure_client_video_alias(media_path: Path, video_url: str, task_id: str) -> Path:
+    if media_path.suffix.lower() not in VIDEO_EXTS:
+        return media_path
+    aliases = {
+        _safe_name(task_id),
+        _safe_name(_client_video_id_from_url(video_url)),
+    }
+    for alias in aliases:
+        alias_path = TEMP_DIR / f"{alias}{media_path.suffix}"
+        if alias_path.resolve() == media_path.resolve():
+            continue
+        try:
+            if not alias_path.exists() or alias_path.stat().st_size != media_path.stat().st_size:
+                shutil.copy2(str(media_path), str(alias_path))
+        except Exception:
+            pass
+    return media_path
+
+
+def _run_ytdlp(cmd: list[str]) -> None:
+    run_kwargs = {
+        "cwd": str(SERVER_DIR),
+        "capture_output": True,
+        "text": True,
+        "check": True,
+        "timeout": 1800,
+    }
+    run_kwargs.update(_hidden_subprocess_kwargs())
+    subprocess.run(cmd, **run_kwargs)
+
+
+def _download_video(video_url: str, task_id: str) -> Path:
+    _update_task(task_id, "downloading", 8, "正在下载视频...")
     base_name = _safe_name(task_id)
     output_template = str(TEMP_DIR / f"{base_name}.%(ext)s")
 
-    existing = sorted(TEMP_DIR.glob(f"{base_name}.*"))
-    for item in existing:
-        if item.suffix.lower() in {".mp3", ".m4a", ".webm", ".opus", ".wav"} and item.stat().st_size > 0:
-            return item
+    existing = _existing_download(base_name, video_only=True)
+    if existing:
+        return _ensure_client_video_alias(existing, video_url, task_id)
+
+    common = ["yt-dlp", "--no-playlist", "-o", output_template]
+    common += _cookie_args()
 
     cmd = [
-        "yt-dlp",
-        "--no-playlist",
-        "-x",
-        "--audio-format",
-        "mp3",
-        "--audio-quality",
-        "128K",
-        "-o",
-        output_template,
+        *common,
+        "-f",
+        "bv*+ba/b[ext=mp4]/best",
+        "--merge-output-format",
+        "mp4",
+        video_url,
     ]
-    cmd += _cookie_args()
-    cmd.append(video_url)
 
     try:
-        run_kwargs = {
-            "cwd": str(SERVER_DIR),
-            "capture_output": True,
-            "text": True,
-            "check": True,
-            "timeout": 1800,
-        }
-        run_kwargs.update(_hidden_subprocess_kwargs())
-        subprocess.run(cmd, **run_kwargs)
+        _run_ytdlp(cmd)
     except FileNotFoundError as exc:
         raise RuntimeError("未找到 yt-dlp，请运行 pip install -r requirements.txt") from exc
-    except subprocess.CalledProcessError as exc:
-        detail = (exc.stderr or exc.stdout or str(exc))[-800:]
-        raise RuntimeError(f"yt-dlp 下载失败: {detail}") from exc
+    except subprocess.CalledProcessError as first_exc:
+        fallback_cmd = [*common, "-f", "b[ext=mp4]/best", video_url]
+        try:
+            _run_ytdlp(fallback_cmd)
+        except subprocess.CalledProcessError as second_exc:
+            detail = (second_exc.stderr or second_exc.stdout or first_exc.stderr or first_exc.stdout or str(second_exc))[-800:]
+            raise RuntimeError(f"yt-dlp 下载视频失败: {detail}") from second_exc
 
-    candidates = sorted(TEMP_DIR.glob(f"{base_name}.*"), key=lambda p: p.stat().st_mtime, reverse=True)
-    for item in candidates:
-        if item.is_file() and item.stat().st_size > 0:
-            return item
-    raise RuntimeError("下载完成但未找到音频文件")
+    media_path = _existing_download(base_name, video_only=False)
+    if not media_path:
+        raise RuntimeError("下载完成但未找到音视频文件")
+    if media_path.suffix.lower() not in VIDEO_EXTS:
+        raise RuntimeError(f"下载完成但未得到视频文件: {media_path.name}")
+    return _ensure_client_video_alias(media_path, video_url, task_id)
 
 
 def _model_config() -> tuple[str, str, str, str]:
@@ -298,6 +358,13 @@ def _process_task(task_id: str, source_path: Optional[Path], video_url: Optional
     try:
         cached = _load_cache(task_id)
         if cached and cached.get("subtitles"):
+            media_path = None
+            if video_url:
+                media_path = _existing_download(_safe_name(task_id), video_only=True)
+                if not media_path:
+                    media_path = _download_video(video_url, task_id)
+                if media_path:
+                    _ensure_client_video_alias(media_path, video_url, task_id)
             _update_task(
                 task_id,
                 "completed",
@@ -305,16 +372,17 @@ def _process_task(task_id: str, source_path: Optional[Path], video_url: Optional
                 "从缓存加载",
                 subtitles=cached.get("subtitles", []),
                 detected_language=cached.get("detected_language", cached.get("language", "unknown")),
+                media_file=str(media_path) if media_path else cached.get("media_file", ""),
             )
             return
 
-        audio_path = source_path
+        media_path = source_path
         if video_url:
-            audio_path = _download_audio(video_url, task_id)
-        if not audio_path or not audio_path.exists():
+            media_path = _download_video(video_url, task_id)
+        if not media_path or not media_path.exists():
             raise RuntimeError("找不到可转写的音视频文件")
 
-        subtitles, detected_lang = _transcribe_file(audio_path, task_id, language)
+        subtitles, detected_lang = _transcribe_file(media_path, task_id, language)
         if not subtitles:
             raise RuntimeError("未识别到有效语音内容")
 
@@ -326,10 +394,11 @@ def _process_task(task_id: str, source_path: Optional[Path], video_url: Optional
             "subtitles": subtitles,
             "detected_language": detected_lang,
             "language": detected_lang,
+            "media_file": str(media_path),
             "updated_at": _now(),
         }
         _save_cache(task_id, result)
-        _update_task(task_id, "completed", 100, "完成", subtitles=subtitles, detected_language=detected_lang, language=detected_lang)
+        _update_task(task_id, "completed", 100, "完成", subtitles=subtitles, detected_language=detected_lang, language=detected_lang, media_file=str(media_path))
     except Exception as exc:
         _update_task(task_id, "error", 0, str(exc)[:1000], subtitles=[])
 
