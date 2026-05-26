@@ -20,7 +20,8 @@
 
 - **本地文件 & 在线视频** — 支持 mp4/avi/mov/mkv 等常见格式，以及 YouTube、Bilibili 等平台链接
 - **内置 Whisper 路径** — 默认从项目内 `whisper-server/` 启动服务，不再要求用户理解外部仓库目录
-- **客户端模型设置** — 可在设置窗口指定模型缓存目录、具体模型目录和模型大小
+- **客户端模型安装** — 设置窗口可选择模型大小、模型目录，并一键安装/检查模型
+- **本地优先流程** — 本地视频不再依赖服务器；服务器仅用于在线视频下载和服务模式转录
 - **模型位置可配置** — 本地转录默认使用项目内 `models/` 作为模型目录，也支持指定自定义模型目录
 - **本地 & API 转录** — 可直接使用 `faster-whisper` 本地转录，或配合 Whisper Server / Groq / OpenAI 云端 API
 - **多格式导出** — 导出 SRT、VTT、TXT 字幕格式
@@ -53,6 +54,16 @@ pip install -r requirements.txt
 
 ## 使用 / Usage
 
+### 推荐首次流程 / First-run Workflow
+
+1. 启动客户端：`python app.py` 或双击 `start.bat`。
+2. 如果右上角显示「⚠ 需要安装模型」，点击「⚙」打开设置。
+3. 在「Whisper 模型」里选择模型大小，通常先用 `base` 或 `small`。
+4. 点击「安装/检查模型」，等待状态显示「模型已就绪」。
+5. 添加本地视频并点击「开始处理」。
+
+> 本地视频可以直接转录，不需要 Whisper Server。在线视频链接下载仍需要 Whisper Server，因此未连接服务器时，界面会显示「本地模式就绪」而不是错误。
+
 ### 启动 / Launch
 
 ```bash
@@ -77,6 +88,7 @@ Windows 下也可双击：
 2. 在「Whisper 模型」里选择「模型大小」。
 3. 设置「模型缓存目录」，用于保存或读取 `faster-whisper` 模型文件。
 4. 如需使用某个已经转换好的模型，设置「具体模型目录」；留空时按「模型大小」从缓存目录加载或下载。
+5. 点击「安装/检查模型」提前下载或验证模型。
 
 设置会保存到 `.cache/settings.json`，下次启动自动生效。外部环境变量仍可覆盖客户端保存的值。
 
@@ -125,7 +137,7 @@ video_2_subtitles/
 ├── local_whisper.py    # 本地 Whisper 转录 / Local transcriber
 ├── whisper_config.py   # Whisper 路径和模型配置 / Whisper path config
 ├── client_settings.py  # 客户端持久化设置 / Client settings
-├── settings_patch.py   # 设置窗口扩展 / Settings dialog extension
+├── settings_patch.py   # 设置窗口和启动流程扩展 / Setup flow extension
 ├── history.py          # 历史记录管理 / History manager
 ├── requirements.txt    # Python 依赖 / Dependencies
 ├── whisper-server/     # 可选内置 Whisper Server / Optional bundled server
