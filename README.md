@@ -25,6 +25,7 @@
 - **下载策略可配置** — 支持「保存 MP4 视频」「仅转写不保留视频」「仅音频转写」三种模式，并可限制最高质量
 - **自动多格式输出** — 任务完成后会自动保存 SRT、VTT、TXT，并生成 `manifest.json` 输出元数据
 - **历史记录增强** — 历史窗口可打开输出目录、加回任务列表、重新生成 ChatGPT 包、复制/打开来源
+- **错误日志增强** — 生成失败时会突出显示错误、弹出可复制详情，并在右侧预览区保留完整错误日志和服务日志尾部
 - **一键环境检查** — 设置页可检查 Python、依赖、GPU、yt-dlp、ffmpeg、模型目录、输出目录、端口和服务健康状态
 - **统一模型目录** — 客户端模型安装目录 `models/` 同时供内置服务和本地 fallback 使用，下载一次，两边共用
 - **隐藏后台窗口** — Windows 下开始处理时，转写 helper、yt-dlp 等后台子进程不会再弹出空黑窗口
@@ -164,6 +165,15 @@ chatgpt_package/      # 生成 ChatGPT 包后出现
 - 复制来源路径/链接
 - 打开来源文件夹或浏览器链接
 
+### 错误日志 / Error Logs
+
+生成过程中如果任务失败，客户端会：
+
+- 在任务列表中使用更醒目的红色错误状态显示失败原因。
+- 弹出「错误日志」窗口，包含任务来源、完整错误信息、`.cache/whisper-service.log` 路径和最近 80 行服务日志，可一键复制。
+- 选中失败任务时，右侧预览区会显示完整错误日志，并提供「复制错误日志」按钮。
+- 重新处理失败任务时，会清理该任务的旧错误日志，避免误复制旧内容。
+
 ### 在线视频下载策略 / Online Download Strategy
 
 设置窗口支持三种下载模式：
@@ -267,8 +277,9 @@ python app.py
 1. **添加视频** — 点击「添加视频」选择本地文件，或粘贴在线视频链接
 2. **开始处理** — 点击「开始处理」下载/保存视频并进行字幕转录
 3. **预览字幕** — 点击已完成的任务查看字幕内容
-4. **导出/打包** — 右键导出 SRT/VTT/TXT，或在右侧字幕预览区点击「生成 ChatGPT 包」
-5. **历史管理** — 点击「历史记录」重新打开输出、加回任务列表或重新生成 ChatGPT 包
+4. **失败排查** — 如果任务失败，选中失败任务查看完整错误日志，或点击「复制错误日志」发给开发者定位
+5. **导出/打包** — 右键导出 SRT/VTT/TXT，或在右侧字幕预览区点击「生成 ChatGPT 包」
+6. **历史管理** — 点击「历史记录」重新打开输出、加回任务列表或重新生成 ChatGPT 包
 
 ---
 
@@ -287,6 +298,7 @@ video_2_subtitles/
 ├── diagnostics.py      # 环境检查 / Runtime diagnostics
 ├── output_manifest.py  # 输出元数据 / Output metadata
 ├── output_patch.py     # 输出流程和历史记录增强 / Output workflow patch
+├── error_log_patch.py  # 错误日志展示和复制增强 / Error log UI patch
 ├── settings_patch.py   # 设置窗口和启动流程扩展 / Setup flow extension
 ├── history.py          # 历史记录管理 / History manager
 ├── requirements.txt    # Python 依赖 / Dependencies

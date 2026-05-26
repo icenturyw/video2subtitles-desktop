@@ -30,10 +30,12 @@ from main_window import MainWindow, apply_theme
 import settings_patch
 import gpu_patch
 import output_patch
+import error_log_patch
 
 settings_patch.install()
 gpu_patch.install()
 output_patch.install()
+error_log_patch.install()
 
 
 def _get_server_device():
