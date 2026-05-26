@@ -15,11 +15,14 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QPushButton,
     QComboBox,
+    QCheckBox,
 )
 
 import main_window as mw
 from client_settings import (
     DEFAULT_MODEL_DIR,
+    SUPPORTED_DOWNLOAD_MODES,
+    SUPPORTED_DOWNLOAD_QUALITIES,
     SUPPORTED_MODEL_SIZES,
     apply_settings_to_env,
     get_effective_settings,
@@ -33,6 +36,20 @@ OriginalSettingsDialog = mw.SettingsDialog
 OriginalCheckServer = mw.MainWindow._check_server
 OriginalShowSettings = mw.MainWindow._show_settings
 OriginalStartProcessing = mw.MainWindow._start_processing
+OriginalSubtitleSetupUi = mw.SubtitleViewer._setup_ui
+OriginalSubtitleShow = mw.SubtitleViewer.show_subtitles
+OriginalSubtitleClear = mw.SubtitleViewer.clear
+
+DOWNLOAD_MODE_LABELS = {
+    "video": "保存 MP4 视频（推荐）",
+    "transcribe_only": "仅用于转写，不保留视频",
+    "audio": "仅音频转写（节省空间）",
+}
+DOWNLOAD_QUALITY_LABELS = {
+    "best": "最高可用质量",
+    "720p": "最高 720p",
+    "480p": "最高 480p",
+}
 
 INSTALL_MODEL_CODE = r'''
 import os
@@ -133,12 +150,19 @@ def _open_service_log():
     return False
 
 
+def _combo_select_data(combo, value):
+    for i in range(combo.count()):
+        if combo.itemData(i) == value or combo.itemText(i) == value:
+            combo.setCurrentIndex(i)
+            return
+
+
 class SettingsDialog(OriginalSettingsDialog):
-    """Existing settings dialog plus model installation controls."""
+    """Existing settings dialog plus model, download and diagnostics controls."""
 
     def __init__(self, parent=None, current_output_dir=None):
         super().__init__(parent, current_output_dir)
-        self.setFixedSize(660, 760)
+        self.setFixedSize(700, 840)
         self.model_settings = get_effective_settings()
         self._model_install_process = None
         self._append_model_group()
@@ -196,6 +220,22 @@ class SettingsDialog(OriginalSettingsDialog):
         model_path_layout.addWidget(clear_path_btn)
         form.addRow("具体模型目录:", model_path_layout)
 
+        self.download_mode_combo = QComboBox()
+        for mode in SUPPORTED_DOWNLOAD_MODES:
+            self.download_mode_combo.addItem(DOWNLOAD_MODE_LABELS.get(mode, mode), mode)
+        _combo_select_data(self.download_mode_combo, self.model_settings.get("download_mode", "video"))
+        form.addRow("在线视频下载模式:", self.download_mode_combo)
+
+        self.download_quality_combo = QComboBox()
+        for quality in SUPPORTED_DOWNLOAD_QUALITIES:
+            self.download_quality_combo.addItem(DOWNLOAD_QUALITY_LABELS.get(quality, quality), quality)
+        _combo_select_data(self.download_quality_combo, self.model_settings.get("download_quality", "best"))
+        form.addRow("下载质量:", self.download_quality_combo)
+
+        self.keep_video_check = QCheckBox("转写后保留下载的视频文件")
+        self.keep_video_check.setChecked(self.model_settings.get("keep_downloaded_video", "true") == "true")
+        form.addRow("", self.keep_video_check)
+
         install_layout = QHBoxLayout()
         install_layout.setSpacing(8)
         self.install_model_btn = QPushButton("安装/检查模型")
@@ -203,19 +243,25 @@ class SettingsDialog(OriginalSettingsDialog):
         self.install_model_btn.clicked.connect(self._install_or_check_model)
         install_layout.addWidget(self.install_model_btn)
 
-        self.save_model_btn = QPushButton("保存模型设置")
+        self.save_model_btn = QPushButton("保存设置")
         self.save_model_btn.setObjectName("btn_secondary")
         self.save_model_btn.setFixedHeight(36)
         self.save_model_btn.clicked.connect(self._save_model_settings_only)
         install_layout.addWidget(self.save_model_btn)
+
+        diagnostics_btn = QPushButton("一键检查环境")
+        diagnostics_btn.setObjectName("btn_secondary")
+        diagnostics_btn.setFixedHeight(36)
+        diagnostics_btn.clicked.connect(self._run_diagnostics)
+        install_layout.addWidget(diagnostics_btn)
         form.addRow("", install_layout)
 
-        self.model_install_status = QLabel("本地视频不需要服务器；首次使用建议先点击「安装/检查模型」。")
+        self.model_install_status = QLabel("本地视频可直接使用本地模型；在线链接会优先使用项目内置本地服务。")
         self.model_install_status.setWordWrap(True)
         self.model_install_status.setStyleSheet(f"font-size: 11px; color: {THEME['text_muted']};")
         form.addRow("", self.model_install_status)
 
-        hint = QLabel("在线链接下载仍需要 Whisper Server；本地视频可直接走 faster-whisper。")
+        hint = QLabel("默认保存 MP4，便于输出目录保留原视频并生成 ChatGPT 分析包；选择音频-only 会节省空间，但完整视频包可能无法生成。")
         hint.setWordWrap(True)
         hint.setStyleSheet(f"font-size: 11px; color: {THEME['text_muted']};")
         form.addRow("", hint)
@@ -259,10 +305,15 @@ class SettingsDialog(OriginalSettingsDialog):
                 return None
             model_path_str = str(model_path_path)
 
+        download_mode = self.download_mode_combo.currentData() or "video"
+        keep_video = self.keep_video_check.isChecked() or download_mode == "video"
         return {
             "whisper_model_dir": str(model_dir_path),
             "whisper_model_path": model_path_str,
             "model_size": self.model_size_combo.currentText().strip(),
+            "download_mode": download_mode,
+            "download_quality": self.download_quality_combo.currentData() or "best",
+            "keep_downloaded_video": "true" if keep_video else "false",
         }
 
     def _save_model_settings_only(self):
@@ -272,7 +323,7 @@ class SettingsDialog(OriginalSettingsDialog):
         saved = save_settings(settings)
         apply_settings_to_env(saved, overwrite=True)
         self.model_settings = saved
-        self._set_model_status("模型设置已保存。", "success")
+        self._set_model_status("设置已保存。", "success")
         return saved
 
     def _install_or_check_model(self):
@@ -321,7 +372,7 @@ class SettingsDialog(OriginalSettingsDialog):
         self.install_model_btn.setEnabled(True)
         self.save_model_btn.setEnabled(True)
         if exit_code == 0:
-            self._set_model_status("✅ 模型已就绪。现在可以添加本地视频并点击「开始处理」。", "success")
+            self._set_model_status("✅ 模型已就绪。现在可以添加视频并点击「开始处理」。", "success")
             parent = self.parent()
             if parent and hasattr(parent, "_check_server"):
                 parent._check_server()
@@ -342,6 +393,20 @@ class SettingsDialog(OriginalSettingsDialog):
         settings = self._collect_model_settings(create_model_dir=True)
         if settings:
             _open_folder(Path(settings["whisper_model_dir"]))
+
+    def _run_diagnostics(self):
+        try:
+            from diagnostics import format_diagnostics_report, run_diagnostics
+
+            result = run_diagnostics()
+            report = format_diagnostics_report(result)
+            title = "环境检查"
+            if result.get("overall") == "error":
+                QMessageBox.warning(self, title, report)
+            else:
+                QMessageBox.information(self, title, report)
+        except Exception as exc:
+            QMessageBox.warning(self, "环境检查失败", f"无法完成环境检查:\n{exc}")
 
     def _set_model_status(self, text, level="info"):
         colors = {
@@ -365,6 +430,41 @@ class SettingsDialog(OriginalSettingsDialog):
         super().accept()
 
 
+def _subtitle_setup_ui_with_package(self):
+    OriginalSubtitleSetupUi(self)
+    self.package_btn = QPushButton("📦 生成 ChatGPT 包")
+    self.package_btn.setObjectName("btn_secondary")
+    self.package_btn.setFixedHeight(34)
+    self.package_btn.setVisible(False)
+    self.package_btn.clicked.connect(lambda: _generate_package_from_viewer(self))
+    try:
+        self.layout().insertWidget(1, self.package_btn)
+    except Exception:
+        pass
+
+
+def _subtitle_show_with_package(self, key, subtitles, is_url=False):
+    OriginalSubtitleShow(self, key, subtitles, is_url)
+    if hasattr(self, "package_btn"):
+        self.package_btn.setVisible(bool(subtitles))
+        self.package_btn.setToolTip("为当前已完成任务生成轻量/完整 ChatGPT 上传包")
+
+
+def _subtitle_clear_with_package(self):
+    OriginalSubtitleClear(self)
+    if hasattr(self, "package_btn"):
+        self.package_btn.setVisible(False)
+
+
+def _generate_package_from_viewer(viewer):
+    file_path = getattr(viewer, "_file_path", None)
+    if not file_path:
+        return
+    parent = viewer.window() if viewer.window() else None
+    if parent and hasattr(parent, "_generate_chatgpt_package"):
+        parent._generate_chatgpt_package(file_path)
+
+
 def _patched_check_server(self):
     server_connected = False
     try:
@@ -379,28 +479,28 @@ def _patched_check_server(self):
     if server_connected and local_ready:
         self.server_status.setText("● 本地+在线就绪")
         _set_label_style(self.server_status, THEME["success"])
-        self.server_status.setToolTip(service_detail or "本地视频可直接转录；在线视频链接也可通过 Whisper Server 下载处理。")
+        self.server_status.setToolTip(service_detail or "本地视频可直接转录；在线视频链接会通过项目内置本地服务下载处理。")
         if hasattr(self, "status_label"):
-            self.status_label.setText("本地模型与在线链接服务均已就绪。")
+            self.status_label.setText("本地模型与内置在线链接服务均已就绪。")
     elif server_connected:
         self.server_status.setText("● 在线服务已连接")
         _set_label_style(self.server_status, THEME["success"])
-        self.server_status.setToolTip(service_detail or "Whisper Server 已连接；如需纯本地转录，请安装 faster-whisper。")
+        self.server_status.setToolTip(service_detail or "内置/远程 Whisper 服务已连接；本地模型未检测到时仍可走服务模式。")
         if hasattr(self, "status_label"):
             self.status_label.setText("在线链接服务已连接；本地模型未检测到或未安装。")
     elif local_ready:
         self.server_status.setText("● 本地模式就绪")
         _set_label_style(self.server_status, THEME["success"])
-        self.server_status.setToolTip(service_detail or "本地视频可直接转录；在线视频链接需要 Whisper Server。")
+        self.server_status.setToolTip(service_detail or "本地视频可直接转录；在线视频链接会自动尝试启动内置服务。")
         if hasattr(self, "status_label"):
             if service_status in {"missing_dir", "missing_entry", "timeout", "error"}:
-                self.status_label.setText(f"本地模式就绪；在线服务未启动：{service_detail}")
+                self.status_label.setText(f"本地模式就绪；内置在线服务未就绪：{service_detail}")
             else:
-                self.status_label.setText("本地模式就绪：可直接添加本地视频；在线视频链接需要启动 Whisper Server。")
+                self.status_label.setText("本地模式就绪：可直接添加本地视频；在线视频链接会自动尝试启动内置服务。")
     else:
         self.server_status.setText("⚠ 需要安装模型/服务")
         _set_label_style(self.server_status, THEME["warning"])
-        self.server_status.setToolTip(service_detail or "打开设置，点击「安装/检查模型」；如缺少依赖，请先运行 pip install -r requirements.txt。")
+        self.server_status.setToolTip(service_detail or "打开设置，点击「安装/检查模型」或「一键检查环境」。")
         if hasattr(self, "status_label"):
             self.status_label.setText(service_detail or "首次使用：请打开设置，选择模型后点击「安装/检查模型」。")
 
@@ -424,12 +524,12 @@ def _patched_start_processing(self, *args, **kwargs):
         QMessageBox.warning(
             self,
             "需要先安装本地模型",
-            "当前没有连接 Whisper Server，也未检测到可用的 faster-whisper。\n\n"
-            "请点击右上角「⚙」→「Whisper 模型」→「安装/检查模型」。\n"
+            "当前内置服务不可用，也未检测到可用的 faster-whisper。\n\n"
+            "请点击右上角「⚙」→「Whisper 模型」→「安装/检查模型」或「一键检查环境」。\n"
             "如果提示缺少依赖，请先运行: pip install -r requirements.txt",
         )
         if hasattr(self, "status_label"):
-            self.status_label.setText("请先在设置中安装/检查模型。")
+            self.status_label.setText("请先在设置中安装/检查模型，或运行一键环境检查。")
         return
 
     return OriginalStartProcessing(self, *args, **kwargs)
@@ -441,3 +541,6 @@ def install():
     mw.MainWindow._check_server = _patched_check_server
     mw.MainWindow._show_settings = _patched_show_settings
     mw.MainWindow._start_processing = _patched_start_processing
+    mw.SubtitleViewer._setup_ui = _subtitle_setup_ui_with_package
+    mw.SubtitleViewer.show_subtitles = _subtitle_show_with_package
+    mw.SubtitleViewer.clear = _subtitle_clear_with_package
