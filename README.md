@@ -19,13 +19,13 @@
 ## 功能特色 / Features
 
 - **本地文件 & 在线视频** — 支持 mp4/avi/mov/mkv 等常见格式，以及 YouTube、Bilibili 等平台链接
-- **内置本地 Whisper 服务** — 默认从项目内 `whisper-server/` 自动拉起服务，不再要求用户手动启动外部 server
-- **兼容 youtube-live-subtitles 服务** — 支持 `whisper-server/main.py` 入口，同时兼容旧版 `server.py`
+- **已内置 Whisper 服务** — 项目自带 `whisper-server/main.py`，启动客户端时会自动拉起本机 sidecar 服务
+- **统一模型目录** — 客户端模型安装目录 `models/` 同时供内置服务和本地 fallback 使用，下载一次，两边共用
 - **可见的服务状态** — 客户端底部会显示本地服务启动结果，启动日志写入 `.cache/whisper-service.log`
 - **客户端模型安装** — 设置窗口可选择模型大小、模型目录，并一键安装/检查模型
-- **本地优先流程** — 本地视频不再依赖服务器；在线链接由内置本地服务负责下载、分段、转录和缓存
+- **本地优先流程** — 本地视频和在线链接都优先走内置本地服务；服务不可用时，本地视频会 fallback 到客户端直转
 - **模型位置可配置** — 本地转录默认使用项目内 `models/` 作为模型目录，也支持指定自定义模型目录
-- **本地 & API 转录** — 可直接使用 `faster-whisper` 本地转录，或配合 Whisper Server / Groq / OpenAI 云端 API
+- **本地 & API 转录** — 可直接使用 `faster-whisper` 本地转录，或连接自定义 Whisper Server
 - **多格式导出** — 导出 SRT、VTT、TXT 字幕格式
 - **ChatGPT 分析包** — 一键生成含代理视频、关键帧和字幕的上传包，方便 ChatGPT 分析
 - **双语字幕** — 支持原文+翻译同时显示
@@ -38,11 +38,11 @@
 - Python 3.10+
 - PyQt5 `>=5.15`
 - `requests`
-- `faster-whisper` — 本地视频转录
+- `faster-whisper`
+- `fastapi` / `uvicorn` / `python-multipart` — 内置本地服务
+- `yt-dlp` — 在线视频下载
 - **可选依赖：**
-  - 项目内 `whisper-server/` 或自定义 Whisper Server — 在线视频下载和服务模式转录
-  - `ffmpeg` — ChatGPT 分析包的视频压缩、关键帧抽取，以及服务端音频处理
-  - `yt-dlp` — 在线视频标题获取和服务端在线链接下载
+  - `ffmpeg` — `yt-dlp` 提取音频和 ChatGPT 分析包的视频处理
 
 ---
 
@@ -52,7 +52,7 @@
 pip install -r requirements.txt
 ```
 
-如需在线链接下载/转录，把 `youtube-live-subtitles` 仓库中的 `whisper-server/` 目录放到本项目根目录，或通过 `WHISPER_SERVER_DIR` 指向该目录。桌面端会优先启动其中的 `main.py`。
+如果你只处理本地视频，安装完成即可使用。如果要处理 YouTube/Bilibili 等在线链接，请确保 `yt-dlp` 和 `ffmpeg` 可用。
 
 ---
 
@@ -64,9 +64,9 @@ pip install -r requirements.txt
 2. 如果右上角显示「⚠ 需要安装模型」，点击「⚙」打开设置。
 3. 在「Whisper 模型」里选择模型大小，通常先用 `base`、`small` 或速度更快的 `large-v3-turbo`。
 4. 点击「安装/检查模型」，等待状态显示「模型已就绪」。
-5. 添加本地视频并点击「开始处理」。
+5. 添加本地视频或在线视频链接并点击「开始处理」。
 
-> 本地视频可以直接转录，不需要 Whisper Server。在线链接会优先使用项目内置/指定的本地 Whisper 服务；服务缺失时，界面会保持「本地模式就绪」，并只限制在线链接处理。
+> 现在项目已经内置 `whisper-server/`。客户端安装的模型会通过 `WHISPER_MODEL_DIR` 传给内置服务，因此在线链接和本地文件可以共用同一份模型缓存。
 
 ### 启动 / Launch
 
@@ -76,17 +76,23 @@ python app.py
 
 Windows 下也可双击：
 
-- `start.bat` — 生产模式启动，会自动尝试拉起 `whisper-server/main.py` 或 `server.py`
+- `start.bat` — 生产模式启动，会自动尝试拉起 `whisper-server/main.py`
 - `start_debug.bat` — 调试模式启动（显示控制台），方便查看本地服务日志
 
 ### Whisper 服务与模型目录 / Whisper Service and Model Paths
 
-项目现在优先使用项目内目录，减少外部路径歧义：
+项目现在自带轻量本地服务：
 
-- `whisper-server/`：可选的内置 Whisper 服务目录。存在 `main.py`（`youtube-live-subtitles`）或 `server.py` 且具备 `venv/` 时，应用会自动尝试启动它；在线链接下载和服务模式转录使用该服务。
-- `models/`：默认的 `faster-whisper` 模型缓存/存放目录。本地视频转录会优先使用这里，缺少模型时按 `faster-whisper` 逻辑下载到该目录。
+- `whisper-server/main.py`：内置 FastAPI sidecar，提供 `/health`、`/transcribe`、`/upload`、`/status/{task_id}`。
+- `models/`：默认的 `faster-whisper` 模型缓存/存放目录。客户端本地 fallback 和内置服务都会使用这里。
 
-内置本地服务默认监听 `http://127.0.0.1:8765`。桌面端自动拉起本地服务时会把 `API_AUTH_KEY` 置空，避免本机调用被默认密钥拦截；如果你连接的是远程或手动启动的服务，可以通过环境变量 `API_AUTH_KEY` 设置客户端请求头 `x-api-key`。
+内置本地服务默认监听：
+
+```text
+http://127.0.0.1:8765
+```
+
+桌面端自动拉起本地服务时会把 `WHISPER_MODEL_DIR`、`WHISPER_MODEL_PATH`、`MODEL_SIZE`、`DEVICE`、`COMPUTE_TYPE` 传入服务进程。也就是说，在设置窗口里下载/选择的模型，对在线链接和本地文件都有效。
 
 客户端也可以直接设置模型位置：
 
@@ -126,13 +132,6 @@ set WHISPER_MODEL_PATH=D:\AI\whisper-models\models--Systran--faster-whisper-smal
 python app.py
 ```
 
-使用自定义服务目录：
-
-```bat
-set WHISPER_SERVER_DIR=D:\Projects\youtube-live-subtitles\whisper-server
-python app.py
-```
-
 连接已有远程服务：
 
 ```bat
@@ -160,11 +159,10 @@ python app.py
 
 如果客户端没有显示在线服务已连接，请优先检查：
 
-1. `whisper-server/` 目录是否存在，或 `WHISPER_SERVER_DIR` 是否指向正确目录。
-2. 目录下是否有 `main.py`（来自 `youtube-live-subtitles/whisper-server`）或 `server.py`。
-3. `whisper-server/venv/` 是否存在，并已安装服务端依赖。
-4. 端口 `8765` 是否被其他程序占用。
-5. 打开 `.cache/whisper-service.log` 查看 Python 报错。
+1. 是否已经运行 `pip install -r requirements.txt`。
+2. 端口 `8765` 是否被其他程序占用。
+3. `yt-dlp` 和 `ffmpeg` 是否可用，尤其是在线链接下载失败时。
+4. 打开 `.cache/whisper-service.log` 查看 Python 报错。
 
 需要直接看到服务窗口时，请使用 `start_debug.bat`。
 
@@ -190,7 +188,11 @@ video_2_subtitles/
 ├── settings_patch.py   # 设置窗口和启动流程扩展 / Setup flow extension
 ├── history.py          # 历史记录管理 / History manager
 ├── requirements.txt    # Python 依赖 / Dependencies
-├── whisper-server/     # 可选内置 Whisper 服务 / Optional bundled service
+├── whisper-server/     # 内置 Whisper 服务 / Bundled local service
+│   ├── main.py         # FastAPI sidecar / Local API server
+│   ├── requirements.txt
+│   ├── cache/          # 服务端字幕缓存 / Service cache
+│   └── temp/           # 下载和上传临时文件 / Temporary files
 ├── models/             # 默认模型目录 / Default model directory
 ├── .cache/             # 本地设置、服务日志和辅助脚本缓存 / Local cache
 ├── start.bat           # 生产启动（Win） / Production launcher
