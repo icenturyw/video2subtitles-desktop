@@ -16,6 +16,24 @@ HELPER_DIR = APP_DIR / ".cache"
 TRANSCRIBE_SCRIPT = HELPER_DIR / "transcribe_local.py"
 
 
+def _hidden_subprocess_kwargs():
+    """Hide child console windows on Windows.
+
+    When the desktop app is launched through pythonw/start.bat, starting a
+    console executable such as python.exe may otherwise flash an empty black
+    window. Keep stdout/stderr pipes intact while suppressing that window.
+    """
+    if os.name != "nt":
+        return {}
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = 0
+    return {
+        "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        "startupinfo": startupinfo,
+    }
+
+
 def _create_transcribe_script():
     """Write the transcribe helper script into the project cache directory."""
     HELPER_DIR.mkdir(parents=True, exist_ok=True)
@@ -179,16 +197,17 @@ class LocalWhisperTranscriber:
         env.setdefault("WHISPER_MODEL_DIR", str(WHISPER_MODEL_DIR))
 
         cmd = [find_python_executable(), str(TRANSCRIBE_SCRIPT), str(audio_path), language]
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            env=env,
-        )
+        popen_kwargs = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "bufsize": 1,
+            "env": env,
+        }
+        popen_kwargs.update(_hidden_subprocess_kwargs())
+        process = subprocess.Popen(cmd, **popen_kwargs)
 
         subtitles = []
         detected_lang = "unknown"

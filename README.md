@@ -21,6 +21,7 @@
 - **本地文件 & 在线视频** — 支持 mp4/avi/mov/mkv 等常见格式，以及 YouTube、Bilibili 等平台链接
 - **已内置 Whisper 服务** — 项目自带 `whisper-server/main.py`，启动客户端时会自动拉起本机 sidecar 服务
 - **统一模型目录** — 客户端模型安装目录 `models/` 同时供内置服务和本地 fallback 使用，下载一次，两边共用
+- **隐藏后台窗口** — Windows 下开始处理时，转写 helper、yt-dlp 等后台子进程不会再弹出空黑窗口
 - **可见的服务状态** — 客户端底部会显示本地服务启动结果，启动日志写入 `.cache/whisper-service.log`
 - **客户端模型安装** — 设置窗口可选择模型大小、模型目录，并一键安装/检查模型
 - **本地优先流程** — 本地视频和在线链接都优先走内置本地服务；服务不可用时，本地视频会 fallback 到客户端直转
@@ -76,7 +77,7 @@ python app.py
 
 Windows 下也可双击：
 
-- `start.bat` — 生产模式启动，会自动尝试拉起 `whisper-server/main.py`
+- `start.bat` — 生产模式启动，会自动尝试拉起 `whisper-server/main.py`，后台窗口默认隐藏
 - `start_debug.bat` — 调试模式启动（显示控制台），方便查看本地服务日志
 
 ### Whisper 服务与模型目录 / Whisper Service and Model Paths
@@ -142,7 +143,7 @@ python app.py
 
 ### 本地服务启动状态排查 / Local Service Troubleshooting
 
-`start.bat` 和 `app.py` 都会尝试启动本地 Whisper 服务。为了避免打扰用户，生产模式下服务窗口默认隐藏；如果启动失败，客户端底部状态栏会显示原因。
+`start.bat` 和 `app.py` 都会尝试启动本地 Whisper 服务。为了避免打扰用户，生产模式下服务窗口默认隐藏；点击「开始处理」时启动的转写 helper、`yt-dlp` 等后台子进程也会隐藏控制台窗口。如果启动失败，客户端底部状态栏会显示原因。
 
 常见状态：
 

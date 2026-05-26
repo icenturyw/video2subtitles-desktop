@@ -69,6 +69,19 @@ async def verify_api_key(x_api_key: Optional[str] = Header(None)):
     return x_api_key
 
 
+def _hidden_subprocess_kwargs() -> Dict[str, Any]:
+    """Hide console windows created by CLI helpers on Windows."""
+    if os.name != "nt":
+        return {}
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = 0
+    return {
+        "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        "startupinfo": startupinfo,
+    }
+
+
 def _now() -> float:
     return time.time()
 
@@ -143,7 +156,15 @@ def _download_audio(video_url: str, task_id: str) -> Path:
     cmd.append(video_url)
 
     try:
-        subprocess.run(cmd, cwd=str(SERVER_DIR), capture_output=True, text=True, check=True, timeout=1800)
+        run_kwargs = {
+            "cwd": str(SERVER_DIR),
+            "capture_output": True,
+            "text": True,
+            "check": True,
+            "timeout": 1800,
+        }
+        run_kwargs.update(_hidden_subprocess_kwargs())
+        subprocess.run(cmd, **run_kwargs)
     except FileNotFoundError as exc:
         raise RuntimeError("未找到 yt-dlp，请运行 pip install -r requirements.txt") from exc
     except subprocess.CalledProcessError as exc:
