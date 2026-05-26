@@ -34,6 +34,7 @@ DEFAULT_SETTINGS = {
     "download_mode": "video",
     "download_quality": "best",
     "keep_downloaded_video": "true",
+    "proxy_url": "",
 }
 
 ENV_BY_KEY = {
@@ -45,6 +46,7 @@ ENV_BY_KEY = {
     "download_mode": "V2S_DOWNLOAD_MODE",
     "download_quality": "V2S_DOWNLOAD_QUALITY",
     "keep_downloaded_video": "V2S_KEEP_DOWNLOADED_VIDEO",
+    "proxy_url": "V2S_PROXY",
 }
 
 

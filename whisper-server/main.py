@@ -162,11 +162,19 @@ def _safe_name(value: str) -> str:
     return value or uuid.uuid4().hex
 
 
-def _cookie_args() -> list[str]:
+def _extra_ytdlp_args() -> list[str]:
+    """Common yt-dlp arguments to handle YouTube anti-bot measures."""
+    args = [
+        "--extractor-args", "youtube:player_client=all",
+        "--extractor-retries", "3",
+    ]
+    proxy = os.environ.get("V2S_PROXY", "").strip()
+    if proxy:
+        args += ["--proxy", proxy]
     cookie_file = SERVER_DIR / "cookies.txt"
     if cookie_file.exists() and cookie_file.stat().st_size > 0:
-        return ["--cookies", str(cookie_file)]
-    return []
+        args += ["--cookies", str(cookie_file)]
+    return args
 
 
 def _existing_download(base_name: str, *, video_only: bool = False, audio_only: bool = False) -> Optional[Path]:
@@ -238,7 +246,7 @@ def _download_audio(video_url: str, task_id: str) -> Path:
         "-o",
         output_template,
     ]
-    cmd += _cookie_args()
+    cmd += _extra_ytdlp_args()
     cmd.append(video_url)
 
     try:
@@ -265,7 +273,7 @@ def _download_video(video_url: str, task_id: str, quality: str = "best") -> Path
         return _ensure_client_video_alias(existing, video_url, task_id)
 
     common = ["yt-dlp", "--no-playlist", "-o", output_template]
-    common += _cookie_args()
+    common += _extra_ytdlp_args()
 
     cmd = [
         *common,
@@ -479,6 +487,10 @@ def _process_task(
             media_path = _download_media(video_url, task_id, download_mode, download_quality)
         if not media_path or not media_path.exists():
             raise RuntimeError("找不到可转写的音视频文件")
+        if media_path.suffix.lower() not in MEDIA_EXTS:
+            raise RuntimeError(
+                f"不支持的文件格式 '{media_path.suffix}'，仅支持音视频文件: {', '.join(sorted(MEDIA_EXTS))}"
+            )
 
         subtitles, detected_lang = _transcribe_file(media_path, task_id, language)
         if not subtitles:
@@ -574,6 +586,15 @@ def transcribe(request: TranscribeRequest, auth: str = Depends(verify_api_key)):
     return {"task_id": task_id, "status": "pending"}
 
 
+def _raise_if_unsupported_media(path: Path) -> None:
+    suffix = path.suffix.lower()
+    if suffix not in MEDIA_EXTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支持的文件格式 {suffix}，仅支持音视频文件: {', '.join(sorted(MEDIA_EXTS))}",
+        )
+
+
 @app.post("/upload")
 async def upload_file(
     file: UploadFile = File(...),
@@ -586,7 +607,12 @@ async def upload_file(
 ):
     task_id = uuid.uuid4().hex
     filename = _safe_name(file.filename or f"upload_{task_id}")
-    suffix = Path(filename).suffix or ".bin"
+    suffix = Path(filename).suffix.lower()
+    if suffix not in MEDIA_EXTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支持的文件格式 '{suffix}'，仅支持音视频文件: {', '.join(sorted(MEDIA_EXTS))}",
+        )
     upload_path = TEMP_DIR / f"upload_{task_id}{suffix}"
     with upload_path.open("wb") as fh:
         shutil.copyfileobj(file.file, fh)

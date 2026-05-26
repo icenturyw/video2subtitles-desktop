@@ -1948,7 +1948,7 @@ class SettingsDialog(QDialog):
     def __init__(self, parent=None, current_output_dir=None):
         super().__init__(parent)
         self.setWindowTitle("设置")
-        self.setFixedSize(520, 520)
+        self.setMinimumSize(520, 480)
         self.setStyleSheet(f"""
             QDialog {{
                 background-color: {THEME["bg_dark"]};

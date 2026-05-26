@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Video2Subtitles - 视频字幕生成桌面客户端"""
 
+import json as _json
 import sys
 import os
 import subprocess
@@ -33,6 +34,59 @@ import output_patch
 settings_patch.install()
 gpu_patch.install()
 output_patch.install()
+
+
+def _get_server_device():
+    """Return (device, compute_type) reported by the running sidecar, or (None, None)."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:8765/health", timeout=1) as resp:
+            data = _json.loads(resp.read().decode("utf-8"))
+            return data.get("device"), data.get("compute_type")
+    except Exception:
+        return None, None
+
+
+def _find_server_pid():
+    """Return PID of the process listening on port 8765, or None."""
+    try:
+        kwargs = {"capture_output": True, "text": True, "timeout": 3}
+        if os.name == "nt":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        result = subprocess.run(["netstat", "-ano"], **kwargs)
+        for line in result.stdout.splitlines():
+            if ":8765" in line and "LISTENING" in line:
+                parts = line.strip().split()
+                if parts:
+                    return parts[-1]
+    except Exception:
+        pass
+    return None
+
+
+def _kill_server_process():
+    """Kill the process listening on port 8765 if any."""
+    pid = _find_server_pid()
+    if pid:
+        try:
+            kwargs = {"capture_output": True, "timeout": 3}
+            if os.name == "nt":
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+                subprocess.run(["taskkill", "/F", "/PID", pid], **kwargs)
+            else:
+                import signal
+                os.kill(int(pid), signal.SIGTERM)
+            time.sleep(0.5)
+        except Exception:
+            pass
+
+
+def restart_whisper_server():
+    """Kill the running sidecar and start a fresh one with current env vars."""
+    _set_service_status("restarting", "正在重启 Whisper 服务以应用新设置...")
+    _kill_server_process()
+    time.sleep(1)
+    return _ensure_whisper_server()
 
 
 def _set_service_status(status, detail=""):
@@ -98,9 +152,20 @@ def _ensure_whisper_server():
     """
     _set_service_status("checking", "正在检查 127.0.0.1:8765 本地 Whisper 服务...")
 
+    expected_device = os.environ.get("DEVICE", "cpu")
+
     if _is_local_server_ready():
-        _set_service_status("already_running", "本地 Whisper 服务已经在运行。")
-        return True
+        current_device, _ = _get_server_device()
+        if current_device and current_device != expected_device:
+            _set_service_status(
+                "restarting",
+                f"服务设备({current_device})与设置({expected_device})不匹配，正在重启...",
+            )
+            _kill_server_process()
+            time.sleep(1)
+        else:
+            _set_service_status("already_running", "本地 Whisper 服务已经在运行。")
+            return True
 
     if not WHISPER_SERVER.exists():
         _set_service_status("missing_dir", f"未找到 Whisper 服务目录: {WHISPER_SERVER}")

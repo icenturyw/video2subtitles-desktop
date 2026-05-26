@@ -17,6 +17,9 @@ output/
 *.log
 transcribe_local.py
 whisper-server/venv/
+whisper-server/cache/
+whisper-server/temp/
+whisper-server/cookies.txt
 
 # IDE
 .vscode/
