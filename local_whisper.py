@@ -1,39 +1,57 @@
-"""Direct local whisper transcription via subprocess (calls server's faster-whisper)"""
+"""Direct local whisper transcription via faster-whisper."""
 import json
 import os
 import subprocess
-import sys
 from pathlib import Path
 
+from whisper_config import (
+    APP_DIR,
+    WHISPER_MODEL_DIR,
+    WHISPER_SERVER,
+    find_python_executable,
+)
 
-WHISPER_SERVER = Path(os.environ.get(
-    "WHISPER_SERVER_DIR",
-    str(Path(__file__).parent.parent / "youtube-live-subtitles" / "whisper-server"),
-))
-TRANSCRIBE_SCRIPT = WHISPER_SERVER / "transcribe_local.py"
+
+HELPER_DIR = APP_DIR / ".cache"
+TRANSCRIBE_SCRIPT = HELPER_DIR / "transcribe_local.py"
 
 
 def _create_transcribe_script():
-    """Write the transcribe helper script to disk."""
+    """Write the transcribe helper script into the project cache directory."""
+    HELPER_DIR.mkdir(parents=True, exist_ok=True)
+    WHISPER_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
     script = r'''import sys, json, os
 from pathlib import Path
 
-sys.path.insert(0, r"WHISPER_SERVER_PLACEHOLDER")
-os.chdir(r"WHISPER_SERVER_PLACEHOLDER")
+
+def emit(payload):
+    print(json.dumps(payload))
+    sys.stdout.flush()
+
+
+whisper_server_dir = os.environ.get("WHISPER_SERVER_DIR", "").strip()
+if whisper_server_dir:
+    server_path = Path(whisper_server_dir)
+    if server_path.exists():
+        sys.path.insert(0, str(server_path))
 
 try:
     from faster_whisper import WhisperModel
-except ImportError:
-    from core.whisper_engine import whisper_engine
-    WhisperModel = None
+except ImportError as exc:
+    emit({
+        "type": "error",
+        "message": "未安装 faster-whisper，请运行 pip install -r requirements.txt，或配置可用的 Whisper Server。"
+    })
+    raise SystemExit(2) from exc
+
 
 def split_text(text, max_len=25):
     import re
     if len(text) <= max_len:
         return [text]
-    connectors = ['\\u2018\\u2019', '\\u201c\\u201d']  # never matched
-    sentence_endings = r'([\\u3002\\uff01\\uff1f\\uff1b.!?;])'
-    minor_punctuations = r'([\\uff0c,\\u3001])'
+    sentence_endings = r'([\u3002\uff01\uff1f\uff1b.!?;])'
+    minor_punctuations = r'([\uff0c,\u3001])'
     sentences = re.split(sentence_endings, text)
     result = []
     current = ""
@@ -83,19 +101,23 @@ def split_text(text, max_len=25):
             result.append(current.strip())
     return [r for r in result if r] or [text]
 
-def transcribe(audio_path, language=None):
-    import time
-    print(json.dumps({"type": "status", "progress": 10, "message": "Loading Whisper model..."}))
-    sys.stdout.flush()
 
-    model_size = os.environ.get("MODEL_SIZE", "base")
+def transcribe(audio_path, language=None):
+    emit({"type": "status", "progress": 10, "message": "Loading Whisper model..."})
+
+    model_name_or_path = os.environ.get("WHISPER_MODEL_PATH", "").strip() or os.environ.get("MODEL_SIZE", "base").strip() or "base"
+    model_dir = os.environ.get("WHISPER_MODEL_DIR", "").strip()
     device = os.environ.get("DEVICE", "cpu")
     compute_type = os.environ.get("COMPUTE_TYPE", "int8")
 
-    model = WhisperModel(model_size, device=device, compute_type=compute_type)
+    model_kwargs = {"device": device, "compute_type": compute_type}
+    if model_dir:
+        Path(model_dir).mkdir(parents=True, exist_ok=True)
+        model_kwargs["download_root"] = model_dir
 
-    print(json.dumps({"type": "status", "progress": 20, "message": "Model loaded, transcribing..."}))
-    sys.stdout.flush()
+    model = WhisperModel(model_name_or_path, **model_kwargs)
+
+    emit({"type": "status", "progress": 20, "message": "Model loaded, transcribing..."})
 
     segments, info = model.transcribe(
         audio_path,
@@ -103,14 +125,13 @@ def transcribe(audio_path, language=None):
         beam_size=1,
         vad_filter=True,
         vad_parameters=dict(min_silence_duration_ms=1000),
-        initial_prompt="\\u4ee5\\u4e0b\\u662f\\u666e\\u901a\\u8bdd\\u7684\\u53e5\\u5b50\\uff0c\\u8bf7\\u7528\\u7b80\\u4f53\\u4e2d\\u6587\\u3002"
+        initial_prompt="以下是普通话的句子，请用简体中文。"
     )
 
     detected_lang = info.language
     total_duration = info.duration
 
-    print(json.dumps({"type": "status", "progress": 25, "message": f"Detected: {detected_lang}, generating subtitles..."}))
-    sys.stdout.flush()
+    emit({"type": "status", "progress": 25, "message": f"Detected: {detected_lang}, generating subtitles..."})
 
     subtitles = []
     for segment in segments:
@@ -133,20 +154,16 @@ def transcribe(audio_path, language=None):
         if total_duration and total_duration > 0:
             progress = min(98, 25 + int((segment.end / total_duration) * 73))
             if int(progress) % 5 == 0:
-                print(json.dumps({"type": "status", "progress": int(progress), "message": f"Transcribing: {int(segment.end)}s / {int(total_duration)}s ({int(progress)}%)..."}))
-                sys.stdout.flush()
+                emit({"type": "status", "progress": int(progress), "message": f"Transcribing: {int(segment.end)}s / {int(total_duration)}s ({int(progress)}%)..."})
 
-    print(json.dumps({"type": "complete", "subtitles": subtitles, "language": detected_lang}))
-    sys.stdout.flush()
+    emit({"type": "complete", "subtitles": subtitles, "language": detected_lang})
+
 
 if __name__ == "__main__":
     audio_path = sys.argv[1]
     language = sys.argv[2] if len(sys.argv) > 2 else "auto"
     transcribe(audio_path, language)
 '''
-
-    # Replace placeholder with actual path
-    script = script.replace("WHISPER_SERVER_PLACEHOLDER", str(WHISPER_SERVER))
 
     with open(TRANSCRIBE_SCRIPT, "w", encoding="utf-8") as f:
         f.write(script)
@@ -157,11 +174,11 @@ class LocalWhisperTranscriber:
         _create_transcribe_script()
 
     def transcribe(self, audio_path, language="auto", progress_callback=None):
-        python_exe = str(WHISPER_SERVER / "venv" / "Scripts" / "python.exe")
-        if not Path(python_exe).exists():
-            python_exe = "python"
+        env = os.environ.copy()
+        env.setdefault("WHISPER_SERVER_DIR", str(WHISPER_SERVER))
+        env.setdefault("WHISPER_MODEL_DIR", str(WHISPER_MODEL_DIR))
 
-        cmd = [python_exe, str(TRANSCRIBE_SCRIPT), str(audio_path), language]
+        cmd = [find_python_executable(), str(TRANSCRIBE_SCRIPT), str(audio_path), language]
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -170,10 +187,12 @@ class LocalWhisperTranscriber:
             encoding="utf-8",
             errors="replace",
             bufsize=1,
+            env=env,
         )
 
         subtitles = []
         detected_lang = "unknown"
+        error_message = ""
 
         for line in iter(process.stdout.readline, ""):
             line = line.strip()
@@ -192,6 +211,10 @@ class LocalWhisperTranscriber:
                     detected_lang = data.get("language", "unknown")
                     if progress_callback:
                         progress_callback(100, f"Done! {len(subtitles)} subtitles", "completed")
+                elif msg_type == "error":
+                    error_message = data.get("message", "")
+                    if progress_callback:
+                        progress_callback(0, error_message, "error")
             except json.JSONDecodeError:
                 continue
 
@@ -199,9 +222,9 @@ class LocalWhisperTranscriber:
 
         if process.returncode != 0:
             stderr = process.stderr.read()
-            error_msg = stderr[-300:] if stderr else "Unknown error"
+            error_msg = error_message or (stderr[-300:] if stderr else "Unknown error")
             if progress_callback:
                 progress_callback(0, error_msg, "error")
-            return [], "error"
+            return [error_msg], "error"
 
         return subtitles, detected_lang
