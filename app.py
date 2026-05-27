@@ -32,12 +32,14 @@ import gpu_patch
 import output_patch
 import error_log_patch
 import title_fetch_patch
+import playlist_patch
 
 settings_patch.install()
 gpu_patch.install()
 output_patch.install()
 error_log_patch.install()
 title_fetch_patch.install()
+playlist_patch.install()
 
 
 def _get_server_device():

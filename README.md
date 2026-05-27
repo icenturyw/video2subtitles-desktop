@@ -23,6 +23,7 @@
 - **GPU 自动加速** — 默认自动检测 NVIDIA GPU；检测到 RTX/4070 等显卡时优先使用 `cuda + float16`，否则回退 `cpu + int8`
 - **在线视频保留 MP4** — 在线链接默认优先下载并保存视频文件，字幕、原视频和 ChatGPT 分析包可以在同一输出目录中使用
 - **下载策略可配置** — 支持「保存 MP4 视频」「仅转写不保留视频」「仅音频转写」三种模式，并可限制最高质量
+- **YouTube 播放列表选择** — 粘贴带 `list=` 的 YouTube 链接时，可选择添加整个播放列表，或只添加当前粘贴的视频
 - **自动多格式输出** — 任务完成后会自动保存 SRT、VTT、TXT，并生成 `manifest.json` 输出元数据
 - **历史记录增强** — 历史窗口可打开输出目录、加回任务列表、重新生成 ChatGPT 包、复制/打开来源
 - **错误日志增强** — 生成失败时会突出显示错误、弹出可复制详情，并在右侧预览区保留完整错误日志和服务日志尾部
@@ -177,6 +178,15 @@ chatgpt_package/      # 生成 ChatGPT 包后出现
 - 复用设置中的代理 `V2S_PROXY`，并自动使用 `whisper-server/cookies.txt`。
 - 如果标题仍然获取失败，则保留原始链接显示，不再把报错文本当标题。
 
+### YouTube 播放列表 / YouTube Playlists
+
+粘贴带 `list=` 参数的 YouTube 链接时，客户端会先弹出选择：
+
+- **添加整个列表**：使用 `yt-dlp` 读取播放列表条目，并把列表内视频逐个添加为普通单视频任务。
+- **只添加当前视频**：自动移除 `list`、`index`、`pp` 等播放列表参数，只保留当前粘贴视频本身。
+
+播放列表展开只发生在添加链接阶段；后续下载、转写、历史记录、输出目录和 ChatGPT 分析包仍复用单视频任务流程。
+
 ### 错误日志 / Error Logs
 
 生成过程中如果任务失败，客户端会：
@@ -288,7 +298,7 @@ python app.py
 
 ### 基本流程 / Workflow
 
-1. **添加视频** — 点击「添加视频」选择本地文件，或粘贴在线视频链接
+1. **添加视频** — 点击「添加视频」选择本地文件，或粘贴在线视频链接；若 YouTube 链接包含播放列表，可选择添加整个列表或只添加当前视频
 2. **开始处理** — 点击「开始处理」下载/保存视频并进行字幕转录
 3. **预览字幕** — 点击已完成的任务查看字幕内容
 4. **失败排查** — 如果任务失败，选中失败任务查看完整错误日志，或点击「复制错误日志」发给开发者定位
@@ -340,6 +350,7 @@ video_2_subtitles/
 ├── output_patch.py     # 输出流程和历史记录增强 / Output workflow patch
 ├── error_log_patch.py  # 错误日志展示和复制增强 / Error log UI patch
 ├── title_fetch_patch.py # 在线标题获取增强 / Online title fetch patch
+├── playlist_patch.py   # YouTube 播放列表添加模式选择 / Playlist add-mode patch
 ├── settings_patch.py   # 设置窗口和启动流程扩展 / Setup flow extension
 ├── history.py          # 历史记录管理 / History manager
 ├── requirements.txt    # Python 依赖 / Dependencies
