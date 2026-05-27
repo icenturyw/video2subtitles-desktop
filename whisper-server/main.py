@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -223,7 +224,14 @@ def _run_ytdlp(cmd: list[str]) -> None:
         "timeout": 1800,
     }
     run_kwargs.update(_hidden_subprocess_kwargs())
-    subprocess.run(cmd, **run_kwargs)
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    run_kwargs["env"] = env
+    try:
+        subprocess.run(cmd, **run_kwargs)
+    except FileNotFoundError:
+        cmd = [sys.executable, "-m", "yt_dlp", *cmd[1:]]
+        subprocess.run(cmd, **run_kwargs)
 
 
 def _download_audio(video_url: str, task_id: str) -> Path:

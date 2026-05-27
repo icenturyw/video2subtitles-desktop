@@ -38,9 +38,33 @@ if %ERRORLEVEL% NEQ 0 (
 )
 echo.
 
+:: Find Python interpreter (pythonw > python > py)
+set "PYTHON_CMD="
+where pythonw >nul 2>&1
+if %ERRORLEVEL% EQU 0 (
+    set "PYTHON_CMD=pythonw"
+) else (
+    where python >nul 2>&1
+    if %ERRORLEVEL% EQU 0 (
+        set "PYTHON_CMD=python"
+    ) else (
+        where py >nul 2>&1
+        if %ERRORLEVEL% EQU 0 (
+            set "PYTHON_CMD=py"
+        )
+    )
+)
+
+if not defined PYTHON_CMD (
+    echo [ERROR] Python not found! Please install Python 3.10+ and ensure it is in PATH.
+    echo You can also try running: py app.py
+    pause
+    exit /b 1
+)
+
 :: Start desktop client
-echo [2/2] Starting desktop client...
-start "" pythonw app.py
+echo [2/2] Starting desktop client with %PYTHON_CMD%...
+start "" %PYTHON_CMD% app.py
 echo Client started
 timeout /t 2 >nul
 exit

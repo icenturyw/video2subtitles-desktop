@@ -379,14 +379,14 @@ class VideoItemWidget(QWidget):
             if len(display) > 55:
                 display = display[:52] + "..."
             self.name_label = QLabel(display)
-            self.name_label.setStyleSheet(f"font-size: 13px; font-weight: 600; color: {THEME['info']};")
+            self.name_label.setStyleSheet(f"font-size: 13px; font-weight: 600; font-family: 'Segoe UI', 'Microsoft YaHei', 'PingFang SC', sans-serif; color: {THEME['info']};")
             self.name_label.setToolTip(str(self.file_path))
         else:
             name = Path(self.file_path).name
             if len(name) > 50:
                 name = name[:47] + "..."
             self.name_label = QLabel(name)
-            self.name_label.setStyleSheet(f"font-size: 13px; font-weight: 600; color: {THEME['text_primary']};")
+            self.name_label.setStyleSheet(f"font-size: 13px; font-weight: 600; font-family: 'Segoe UI', 'Microsoft YaHei', 'PingFang SC', sans-serif; color: {THEME['text_primary']};")
             self.name_label.setToolTip(str(self.file_path))
         info_layout.addWidget(self.name_label)
 

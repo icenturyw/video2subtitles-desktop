@@ -297,6 +297,32 @@ python app.py
 
 ---
 
+## 常见问题修复 / Troubleshooting
+
+### 中文标题乱码 / Chinese Title Garbled
+
+如果 YouTube/Bilibili 视频的中文标题显示为乱码（如 `???????? S1 Ep4??...`），是由于 Windows 系统编码（CP936/GBK）无法正确输出 Unicode 字符。
+
+**修复**：已在以下位置设置 `PYTHONIOENCODING=utf-8` 环境变量：
+- `title_fetch_patch.py` — 标题预取时 QProcess 子进程
+- `whisper-server/main.py` — yt-dlp 下载子进程
+
+### yt-dlp 未找到 / yt-dlp Not Found
+
+如果提示 `未找到 yt-dlp`，但已通过 pip 安装，说明 `yt-dlp.exe` 不在系统 PATH 中。
+
+**自动降级**：代码已内置自动降级逻辑，依次尝试：
+1. `yt-dlp` 命令（PATH 中查找）
+2. 用户 Python Scripts 目录下的 `yt-dlp.exe`
+3. `python -m yt_dlp`（模块方式运行）
+
+### pythonw 未找到 / pythonw Not Found
+
+启动脚本 `start.bat` / `start_debug.bat` 现在会自动查找可用的 Python 解释器：
+`pythonw` → `python` → `py`，找不到时给出明确提示。
+
+---
+
 ## 项目结构 / Project Structure
 
 ```

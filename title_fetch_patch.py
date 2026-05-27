@@ -7,8 +7,11 @@ added, so yt-dlp warnings are never shown as if they were video titles.
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from urllib.parse import urlparse
+
+from PyQt5.QtCore import QProcessEnvironment
 
 
 def _is_youtube_url(url: str) -> bool:
@@ -33,6 +36,22 @@ def _noise_line(line: str) -> bool:
     if text.startswith("[") and "]" in text and any(tag in lower for tag in ("youtube", "download", "info")):
         return True
     return False
+
+
+def _find_ytdlp():
+    """Return (executable, extra_args_prefix) for launching yt-dlp.
+
+    Prefer the yt-dlp command directly; fall back to python -m yt_dlp.
+    """
+    import shutil
+    yt_dlp_exe = shutil.which("yt-dlp")
+    if not yt_dlp_exe:
+        user_scripts = Path(os.environ.get("APPDATA", "")) / "Python" / "Python313" / "Scripts" / "yt-dlp.exe"
+        if user_scripts.exists():
+            yt_dlp_exe = str(user_scripts)
+    if yt_dlp_exe:
+        return yt_dlp_exe, []
+    return sys.executable, ["-m", "yt_dlp"]
 
 
 def _clean_title(raw: str) -> str:
@@ -82,10 +101,17 @@ def install() -> None:
 
     def patched_start(self):
         self._proc = mw.QProcess(self)
-        # Keep stderr away from stdout. yt-dlp warnings should not become titles.
         self._proc.setProcessChannelMode(mw.QProcess.SeparateChannels)
         self._proc.finished.connect(self._on_finished)
-        self._proc.start("yt-dlp", _title_fetch_args(self.url, mw))
+        env = QProcessEnvironment.systemEnvironment()
+        env.insert("PYTHONIOENCODING", "utf-8")
+        self._proc.setProcessEnvironment(env)
+        args = _title_fetch_args(self.url, mw)
+        exe, prefix = _find_ytdlp()
+        if prefix:
+            self._proc.start(exe, prefix + args)
+        else:
+            self._proc.start(exe, args)
 
     def patched_on_finished(self, *args):
         if not self._proc:

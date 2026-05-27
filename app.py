@@ -232,8 +232,8 @@ def main():
     app.setApplicationName("Video2Subtitles")
     app.setApplicationDisplayName("Video2Subtitles - 视频字幕生成")
 
-    # Load font
-    font = QFont("Segoe UI", 10)
+    # Load font (Segoe UI for English, Microsoft YaHei for Chinese)
+    font = QFont("Microsoft YaHei", 10)
     font.setStyleStrategy(QFont.PreferAntialias)
     app.setFont(font)
 
