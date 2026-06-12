@@ -857,8 +857,102 @@ class WorkerThread(QThread):
         self._running = False
 
 
+class PackageProgressDialog(QDialog):
+    """Small modeless progress window for ChatGPT package generation."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._finished = False
+        self.setObjectName("package_progress_dialog")
+        self.setWindowTitle("正在生成 ChatGPT 包")
+        self.setModal(False)
+        self.setMinimumSize(460, 190)
+        self.setStyleSheet(f"""
+            QDialog#package_progress_dialog {{
+                background-color: {THEME["bg_dark"]};
+                border: 1px solid {THEME["border"]};
+                border-radius: 14px;
+            }}
+            QLabel#package_title {{
+                color: {THEME["text_primary"]};
+                font-size: 17px;
+                font-weight: 800;
+            }}
+            QLabel#package_message {{
+                color: {THEME["info"]};
+                font-size: 13px;
+                font-weight: 600;
+            }}
+            QLabel#package_detail {{
+                color: {THEME["text_muted"]};
+                font-size: 11px;
+            }}
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(10)
+
+        self.title_label = QLabel("📦 正在生成 ChatGPT 分析包")
+        self.title_label.setObjectName("package_title")
+        layout.addWidget(self.title_label)
+
+        self.message_label = QLabel("准备生成...")
+        self.message_label.setObjectName("package_message")
+        self.message_label.setWordWrap(True)
+        layout.addWidget(self.message_label)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("%p%")
+        self.progress_bar.setTextVisible(True)
+        layout.addWidget(self.progress_bar)
+
+        self.detail_label = QLabel("")
+        self.detail_label.setObjectName("package_detail")
+        self.detail_label.setWordWrap(True)
+        layout.addWidget(self.detail_label)
+
+        hint = QLabel("生成过程中窗口会持续显示，完成或失败后会弹出提醒。")
+        hint.setObjectName("package_detail")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+    def start_progress(self, source_video, output_dir):
+        self._finished = False
+        self.title_label.setText("📦 正在生成 ChatGPT 分析包")
+        self.detail_label.setText(f"来源: {Path(str(source_video)).name}\n输出目录: {output_dir}")
+        self.update_progress("正在准备生成包...", 5)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def update_progress(self, message, percent=None):
+        self.message_label.setText(str(message or "正在处理..."))
+        if percent is None:
+            percent = min(95, max(5, self.progress_bar.value() + 6))
+        self.progress_bar.setValue(max(0, min(100, int(percent))))
+
+    def mark_finished(self, success=True, message=""):
+        self._finished = True
+        if success:
+            self.title_label.setText("✅ ChatGPT 分析包生成完成")
+            self.update_progress(message or "生成完成", 100)
+        else:
+            self.title_label.setText("❌ ChatGPT 分析包生成失败")
+            self.update_progress(message or "生成失败", 0)
+
+    def closeEvent(self, event):
+        if not self._finished:
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+
 class ChatGPTPackageWorker(QThread):
     progress = pyqtSignal(str)
+    progress_detail = pyqtSignal(str, int)
     completed = pyqtSignal(str)
     failed = pyqtSignal(str)
 
@@ -868,6 +962,10 @@ class ChatGPTPackageWorker(QThread):
         self.srt_path = Path(srt_path)
         self.output_dir = Path(output_dir)
         self.title = title or self.source_video.stem
+
+    def _emit_progress(self, message, percent):
+        self.progress.emit(message)
+        self.progress_detail.emit(message, int(percent))
 
     def run(self):
         import shutil
@@ -889,16 +987,18 @@ class ChatGPTPackageWorker(QThread):
                 self.failed.emit(f"找不到字幕文件: {self.srt_path}")
                 return
 
+            self._emit_progress("正在准备 ChatGPT 包目录...", 8)
             package_dir = self.output_dir / "chatgpt_package"
             frames_dir = package_dir / "frames"
             package_dir.mkdir(parents=True, exist_ok=True)
             frames_dir.mkdir(parents=True, exist_ok=True)
 
+            self._emit_progress("正在复制字幕文件...", 12)
             package_srt = package_dir / self.srt_path.name
             shutil.copy2(str(self.srt_path), str(package_srt))
 
             proxy_video = package_dir / f"{self.source_video.stem}_proxy_480p.mp4"
-            self.progress.emit("正在生成 480p 低帧率代理视频...")
+            self._emit_progress("正在生成 480p 低帧率代理视频...", 25)
             subprocess.run(
                 [
                     ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
@@ -910,7 +1010,7 @@ class ChatGPTPackageWorker(QThread):
                 **run_kwargs,
             )
 
-            self.progress.emit("正在抽取关键帧...")
+            self._emit_progress("正在抽取关键帧...", 50)
             for old_frame in frames_dir.glob("frame_*.jpg"):
                 old_frame.unlink(missing_ok=True)
             subprocess.run(
@@ -936,6 +1036,7 @@ class ChatGPTPackageWorker(QThread):
                     **run_kwargs,
                 )
                 frames = sorted(frames_dir.glob("frame_*.jpg"))
+            self._emit_progress("正在写入包清单 manifest.json...", 68)
             manifest = {
                 "title": self.title,
                 "source_video": str(self.source_video),
@@ -964,14 +1065,14 @@ class ChatGPTPackageWorker(QThread):
                 if zip_path.exists():
                     zip_path.unlink()
 
-            self.progress.emit("正在生成轻量上传包...")
+            self._emit_progress("正在生成轻量上传包...", 80)
             with zipfile.ZipFile(light_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
                 zf.write(package_srt, package_srt.name)
                 zf.write(package_dir / "manifest.json", "manifest.json")
                 for frame in frames:
                     zf.write(frame, f"frames/{frame.name}")
 
-            self.progress.emit("正在生成完整上传包...")
+            self._emit_progress("正在生成完整上传包...", 92)
             with zipfile.ZipFile(full_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
                 zf.write(package_srt, package_srt.name)
                 zf.write(proxy_video, proxy_video.name)
@@ -979,6 +1080,7 @@ class ChatGPTPackageWorker(QThread):
                 for frame in frames:
                     zf.write(frame, f"frames/{frame.name}")
 
+            self._emit_progress("ChatGPT 包生成完成", 100)
             self.completed.emit(str(package_dir))
         except subprocess.CalledProcessError as e:
             self.failed.emit(f"ffmpeg 处理失败，退出码: {e.returncode}")
@@ -992,6 +1094,7 @@ class MainWindow(QMainWindow):
         self.video_items = {}
         self.worker = None
         self.package_worker = None
+        self._package_progress_dialog = None
         self.output_dir = Path(WHISPER_SERVER) / "output" if WHISPER_SERVER.exists() else Path.cwd() / "output"
         self.history = HistoryManager(self.output_dir / "history.json")
         self._setup_ui()
@@ -1716,6 +1819,98 @@ class MainWindow(QMainWindow):
                     candidates.insert(0, src)
         return candidates[0] if candidates else None
 
+    def _open_path_safely(self, path):
+        try:
+            path = Path(path)
+            if os.name == "nt":
+                os.startfile(str(path))
+            elif os.sys.platform == "darwin":
+                import subprocess
+                subprocess.Popen(["open", str(path)])
+            else:
+                import subprocess
+                subprocess.Popen(["xdg-open", str(path)])
+        except Exception as exc:
+            if hasattr(self, "status_label"):
+                self.status_label.setText(f"打开目录失败: {exc}")
+
+    def _set_chatgpt_package_button_enabled(self, enabled):
+        btn = getattr(getattr(self, "subtitle_viewer", None), "package_btn", None)
+        if btn is not None:
+            btn.setEnabled(bool(enabled))
+            btn.setText("📦 生成 ChatGPT 包" if enabled else "📦 生成中...")
+
+    def _position_package_progress_dialog(self):
+        dialog = getattr(self, "_package_progress_dialog", None)
+        if dialog is None or not dialog.isVisible():
+            return
+        dialog.adjustSize()
+        parent_rect = self.frameGeometry()
+        width = max(dialog.width(), 460)
+        height = max(dialog.height(), 190)
+        dialog.resize(width, height)
+        x = parent_rect.right() - width - 28
+        y = parent_rect.bottom() - height - 72
+        dialog.move(max(parent_rect.left() + 24, x), max(parent_rect.top() + 24, y))
+
+    def _begin_chatgpt_package_progress(self, source_video, output_dir):
+        if self._package_progress_dialog is None:
+            self._package_progress_dialog = PackageProgressDialog(self)
+        self._set_chatgpt_package_button_enabled(False)
+        self._package_progress_dialog.start_progress(source_video, output_dir)
+        self._position_package_progress_dialog()
+        QTimer.singleShot(0, self._position_package_progress_dialog)
+
+    def _on_chatgpt_package_progress(self, message, percent=None):
+        if hasattr(self, "status_label"):
+            self.status_label.setText(str(message or "正在生成 ChatGPT 分析包..."))
+        dialog = getattr(self, "_package_progress_dialog", None)
+        if dialog is not None:
+            dialog.update_progress(message, percent)
+            self._position_package_progress_dialog()
+
+    def _finish_chatgpt_package_progress(self, success=True, message=""):
+        self._set_chatgpt_package_button_enabled(True)
+        dialog = getattr(self, "_package_progress_dialog", None)
+        if dialog is not None:
+            dialog.mark_finished(success, message)
+            self._position_package_progress_dialog()
+            QTimer.singleShot(450, dialog.hide)
+
+    def _show_chatgpt_package_success(self, package_dir):
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Information)
+        box.setWindowTitle("生成完成")
+        box.setText("ChatGPT 分析包已生成。")
+        box.setInformativeText(str(package_dir))
+        open_btn = box.addButton("📂 打开包目录", QMessageBox.AcceptRole)
+        copy_btn = box.addButton("📋 复制路径", QMessageBox.ActionRole)
+        box.addButton("知道了", QMessageBox.RejectRole)
+        box.exec_()
+
+        clicked = box.clickedButton()
+        if clicked == open_btn:
+            self._open_path_safely(package_dir)
+        elif clicked == copy_btn:
+            QApplication.clipboard().setText(str(package_dir))
+            if hasattr(self, "status_label"):
+                self.status_label.setText("ChatGPT 分析包路径已复制到剪贴板")
+
+    def _show_chatgpt_package_failure(self, message):
+        detail = str(message or "未知错误")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("生成失败")
+        box.setText("ChatGPT 分析包生成失败。")
+        box.setInformativeText(detail)
+        copy_btn = box.addButton("📋 复制错误信息", QMessageBox.ActionRole)
+        box.addButton("知道了", QMessageBox.RejectRole)
+        box.exec_()
+        if box.clickedButton() == copy_btn:
+            QApplication.clipboard().setText(detail)
+            if hasattr(self, "status_label"):
+                self.status_label.setText("ChatGPT 包错误信息已复制到剪贴板")
+
     def _generate_chatgpt_package(self, key):
         if self.package_worker and self.package_worker.isRunning():
             QMessageBox.information(self, "正在生成", "已有一个 ChatGPT 分析包正在生成，请稍后再试。")
@@ -1742,7 +1937,10 @@ class MainWindow(QMainWindow):
 
         title = entry.get("title") or Path(source_video).name
         self.package_worker = ChatGPTPackageWorker(source_video, srt_path, out_dir, title, self)
-        self.package_worker.progress.connect(self.status_label.setText)
+        self._begin_chatgpt_package_progress(source_video, out_dir)
+        self.package_worker.progress.connect(lambda message: self._on_chatgpt_package_progress(message, None))
+        if hasattr(self.package_worker, "progress_detail"):
+            self.package_worker.progress_detail.connect(self._on_chatgpt_package_progress)
         self.package_worker.completed.connect(self._on_chatgpt_package_done)
         self.package_worker.failed.connect(self._on_chatgpt_package_failed)
         self.status_label.setText("正在生成 ChatGPT 分析包...")
@@ -1750,13 +1948,14 @@ class MainWindow(QMainWindow):
 
     def _on_chatgpt_package_done(self, package_dir):
         self.status_label.setText(f"ChatGPT 分析包已生成: {package_dir}")
-        QMessageBox.information(self, "生成完成", f"ChatGPT 分析包已生成:\n{package_dir}")
-        os.startfile(package_dir)
+        self._finish_chatgpt_package_progress(True, "ChatGPT 包生成完成")
+        self._show_chatgpt_package_success(package_dir)
         self.package_worker = None
 
     def _on_chatgpt_package_failed(self, message):
         self.status_label.setText("ChatGPT 分析包生成失败")
-        QMessageBox.warning(self, "生成失败", message)
+        self._finish_chatgpt_package_progress(False, message)
+        self._show_chatgpt_package_failure(message)
         self.package_worker = None
 
     def _export_single(self, key, fmt):

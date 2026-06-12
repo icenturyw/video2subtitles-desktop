@@ -446,7 +446,14 @@ def _patched_generate_chatgpt_package(self, key):
 
     title = entry.get("title") or Path(source_video).name
     self.package_worker = mw.ChatGPTPackageWorker(source_video, srt_path, out_dir, title, self)
-    self.package_worker.progress.connect(self.status_label.setText)
+    if hasattr(self, "_begin_chatgpt_package_progress"):
+        self._begin_chatgpt_package_progress(source_video, out_dir)
+    if hasattr(self, "_on_chatgpt_package_progress"):
+        self.package_worker.progress.connect(lambda message: self._on_chatgpt_package_progress(message, None))
+        if hasattr(self.package_worker, "progress_detail"):
+            self.package_worker.progress_detail.connect(self._on_chatgpt_package_progress)
+    else:
+        self.package_worker.progress.connect(self.status_label.setText)
     self.package_worker.completed.connect(self._on_chatgpt_package_done)
     self.package_worker.failed.connect(self._on_chatgpt_package_failed)
     self.status_label.setText("正在生成 ChatGPT 分析包...")
