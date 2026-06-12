@@ -6,6 +6,13 @@ from pathlib import Path
 from urllib.parse import urljoin
 
 from client_settings import get_effective_settings
+from subtitle_utils import (
+    VIDEO_EXTENSIONS,
+    format_subtitle_time,
+    save_srt_file,
+    save_txt_file,
+    save_vtt_file,
+)
 
 
 class WhisperApiClient:
@@ -130,55 +137,21 @@ class WhisperApiClient:
             return {"error": str(e)}
 
     def save_srt(self, subtitles, output_path):
-        lines = []
-        for i, sub in enumerate(subtitles, 1):
-            start = self._format_time(sub.get("start", 0))
-            end = self._format_time(sub.get("end", 0))
-            text = sub.get("text", "")
-            translation = sub.get("translation", "")
-            if translation:
-                text = f"{text}\n{translation}"
-            lines.append(str(i))
-            lines.append(f"{start} --> {end}")
-            lines.append(text)
-            lines.append("")
-        content = "\n".join(lines)
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write(content)
+        save_srt_file(subtitles, output_path)
 
     def save_vtt(self, subtitles, output_path):
-        lines = ["WEBVTT", ""]
-        for i, sub in enumerate(subtitles, 1):
-            start = self._format_time(sub.get("start", 0)).replace(",", ".")
-            end = self._format_time(sub.get("end", 0)).replace(",", ".")
-            text = sub.get("text", "")
-            lines.append(f"{start} --> {end}")
-            lines.append(text)
-            lines.append("")
-        content = "\n".join(lines)
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write(content)
+        save_vtt_file(subtitles, output_path)
 
     def save_txt(self, subtitles, output_path):
-        lines = [sub.get("text", "") for sub in subtitles]
-        content = "\n".join(lines)
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write(content)
+        save_txt_file(subtitles, output_path)
 
     @staticmethod
     def _format_time(seconds):
-        h = int(seconds // 3600)
-        m = int((seconds % 3600) // 60)
-        s = int(seconds % 60)
-        ms = int((seconds - int(seconds)) * 1000)
-        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+        return format_subtitle_time(seconds, ",")
 
     @staticmethod
     def get_supported_formats():
-        return {
-            ".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm",
-            ".m4v", ".mpg", ".mpeg", ".3gp", ".ogv", ".ts",
-        }
+        return set(VIDEO_EXTENSIONS)
 
     @staticmethod
     def scan_video_files(paths):

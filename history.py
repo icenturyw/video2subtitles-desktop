@@ -3,6 +3,8 @@ import json
 import time
 from pathlib import Path
 
+from subtitle_utils import parse_srt_file
+
 
 class HistoryManager:
     def __init__(self, history_path=None):
@@ -79,43 +81,7 @@ class HistoryManager:
 
     @staticmethod
     def _parse_srt(srt_path):
-        import re
-        subtitles = []
-        try:
-            text = Path(srt_path).read_text(encoding="utf-8")
-            blocks = re.split(r"\n\s*\n", text.strip())
-            for block in blocks:
-                lines = block.strip().split("\n")
-                if len(lines) < 3:
-                    continue
-                time_line = lines[1] if len(lines) > 1 else ""
-                m = re.match(
-                    r"(\d+):(\d+):(\d+)[,.](\d+)\s*-->\s*(\d+):(\d+):(\d+)[,.](\d+)",
-                    time_line,
-                )
-                if not m:
-                    continue
-                start = (
-                    int(m.group(1)) * 3600
-                    + int(m.group(2)) * 60
-                    + int(m.group(3))
-                    + int(m.group(4)) / 1000
-                )
-                end = (
-                    int(m.group(5)) * 3600
-                    + int(m.group(6)) * 60
-                    + int(m.group(7))
-                    + int(m.group(8)) / 1000
-                )
-                text_content = "\n".join(lines[2:])
-                subtitles.append({
-                    "start": round(start, 2),
-                    "end": round(end, 2),
-                    "text": text_content,
-                })
-        except Exception:
-            pass
-        return subtitles
+        return parse_srt_file(srt_path)
 
     def make_entry(self, subtitles, language, srt_path, output_dir, is_url=False, title=""):
         return {

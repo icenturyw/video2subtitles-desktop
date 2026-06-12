@@ -28,6 +28,7 @@ from PyQt5.QtWidgets import (
 from api_client import WhisperApiClient
 from local_whisper import LocalWhisperTranscriber, WHISPER_SERVER
 from history import HistoryManager
+from subtitle_utils import format_subtitle_time, sanitize_filename
 
 
 THEME = {
@@ -687,11 +688,7 @@ class SubtitleViewer(QWidget):
 
     @staticmethod
     def _format_time(seconds):
-        h = int(seconds // 3600)
-        m = int((seconds % 3600) // 60)
-        s = int(seconds % 60)
-        ms = int((seconds - int(seconds)) * 1000)
-        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+        return format_subtitle_time(seconds, ",")
 
 
 class TitleFetcher(QObject):
@@ -1516,8 +1513,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _sanitize_filename(name):
-        sanitized = "".join(c if c.isalnum() or c in " ._-" else "_" for c in name).strip().strip("._")
-        return sanitized if sanitized else "video"
+        return sanitize_filename(name)
 
     def _add_url(self):
         try:

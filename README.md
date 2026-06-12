@@ -25,6 +25,8 @@
 - **下载策略可配置** — 支持「保存 MP4 视频」「仅转写不保留视频」「仅音频转写」三种模式，并可限制最高质量
 - **YouTube 播放列表选择** — 粘贴带 `list=` 的 YouTube 链接时，可选择添加整个播放列表，或只添加当前粘贴的视频
 - **自动多格式输出** — 任务完成后会自动保存 SRT、VTT、TXT，并生成 `manifest.json` 输出元数据
+- **字幕工具模块化** — 字幕时间格式、SRT/VTT/TXT 读写、SRT 解析和文件名清洗集中到 `subtitle_utils.py`，降低重复实现
+- **基础验证脚本** — 新增 `tools/check_project.py`，可执行源码语法检查和基础单元测试
 - **历史记录增强** — 历史窗口可打开输出目录、加回任务列表、重新生成 ChatGPT 包、复制/打开来源
 - **错误日志增强** — 生成失败时会突出显示错误、弹出可复制详情，并在右侧预览区保留完整错误日志和服务日志尾部
 - **标题获取增强** — 添加 YouTube 链接时会过滤 yt-dlp 的警告输出，避免把 `No supported JavaScript runtime...` 当成视频标题显示
@@ -64,6 +66,19 @@ pip install -r requirements.txt
 ```
 
 如果你只处理本地视频，安装完成即可使用。如果要处理 YouTube/Bilibili 等在线链接，请确保 `yt-dlp` 和 `ffmpeg` 可用。打开设置后也可以点击「一键检查环境」查看当前依赖、GPU 和服务状态。
+
+---
+
+## 开发与验证 / Development Checks
+
+轻量验证不会下载模型，也不会启动 Whisper 服务，适合每次改动后快速检查：
+
+```bash
+python tools/check_project.py
+python -m unittest discover -s tests
+```
+
+`tools/check_project.py` 会执行项目 Python 源码语法编译和 `tests/` 基础单元测试。完整桌面端验证仍建议在 Windows 图形环境中手动启动 `python app.py` 或 `start_debug.bat` 检查。
 
 ---
 
@@ -347,6 +362,7 @@ video_2_subtitles/
 ├── client_settings.py  # 客户端持久化设置 / Client settings
 ├── diagnostics.py      # 环境检查 / Runtime diagnostics
 ├── output_manifest.py  # 输出元数据 / Output metadata
+├── subtitle_utils.py   # 字幕格式化、解析和文件名清洗 / Subtitle utilities
 ├── output_patch.py     # 输出流程和历史记录增强 / Output workflow patch
 ├── error_log_patch.py  # 错误日志展示和复制增强 / Error log UI patch
 ├── title_fetch_patch.py # 在线标题获取增强 / Online title fetch patch
@@ -363,6 +379,8 @@ video_2_subtitles/
 ├── .cache/             # 本地设置、服务日志和辅助脚本缓存 / Local cache
 ├── start.bat           # 生产启动（Win） / Production launcher
 ├── start_debug.bat     # 调试启动（Win） / Debug launcher
+├── tools/              # 开发验证脚本 / Development check scripts
+├── tests/              # 基础单元测试 / Unit tests
 ├── example.png         # 界面截图 / Screenshot
 ├── example2.png        # 界面截图 / Screenshot
 ├── example3.png        # 运行截图 / Processing screenshot
