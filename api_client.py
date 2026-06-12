@@ -78,8 +78,10 @@ class WhisperApiClient:
         except Exception:
             return None
 
-    def wait_for_result(self, task_id, progress_callback=None, poll_interval=1.0):
+    def wait_for_result(self, task_id, progress_callback=None, poll_interval=1.0, cancel_checker=None):
         while True:
+            if cancel_checker and cancel_checker():
+                return {"status": "cancelled", "message": "任务已取消"}
             result = self.get_task_status(task_id)
             if result is None:
                 return {"status": "error", "message": "无法连接到服务器"}

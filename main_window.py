@@ -443,6 +443,7 @@ class VideoItemWidget(QWidget):
                 "processing": "🔄",
                 "completed": "✅",
                 "error": "❌",
+                "cancelled": "⏹",
                 "cached": "📦",
             }
         else:
@@ -453,6 +454,7 @@ class VideoItemWidget(QWidget):
                 "processing": "🔄",
                 "completed": "✅",
                 "error": "❌",
+                "cancelled": "⏹",
                 "cached": "📦",
             }
         self.icon_label.setText(status_icons.get(self.status, "🔗" if self.is_url else "🎬"))
@@ -470,6 +472,7 @@ class VideoItemWidget(QWidget):
             "processing": THEME["accent"],
             "completed": THEME["success"],
             "error": THEME["error"],
+            "cancelled": THEME["text_muted"],
             "cached": THEME["warning"],
         }
         status_texts = {
@@ -479,6 +482,7 @@ class VideoItemWidget(QWidget):
             "processing": "处理中",
             "completed": "已完成",
             "error": "失败",
+            "cancelled": "已取消",
             "cached": "从缓存加载",
         }
 
@@ -728,6 +732,7 @@ class WorkerThread(QThread):
         self.language = language
         self.service = service
         self._running = True
+        self._cancel_event = threading.Event()
         self.client = WhisperApiClient()
         self.local = LocalWhisperTranscriber()
         self._use_api = self.client.health_check()
@@ -743,7 +748,7 @@ class WorkerThread(QThread):
                 return
 
             for path_or_url, is_url in self.items:
-                if not self._running:
+                if not self._running or self._cancel_event.is_set():
                     break
 
                 key = str(path_or_url)
@@ -795,16 +800,20 @@ class WorkerThread(QThread):
             task_result = self.client.wait_for_result(
                 task_id,
                 progress_callback=on_progress,
+                cancel_checker=lambda: self._cancel_event.is_set(),
             )
 
             if not isinstance(task_result, dict):
                 self.task_error.emit(url, "服务器返回异常结果")
                 return
 
-            if task_result.get("status") == "completed":
+            status = task_result.get("status")
+            if status == "completed":
                 subtitles = task_result.get("subtitles", [])
                 lang = task_result.get("detected_language", "unknown")
                 self.task_completed.emit(url, subtitles or [], lang or "unknown")
+            elif status == "cancelled":
+                pass
             else:
                 self.task_error.emit(
                     url,
@@ -833,11 +842,15 @@ class WorkerThread(QThread):
                     progress_callback=lambda p, m, s: self.progress_updated.emit(
                         file_path, p, m, "processing" if s != "completed" else "completed"
                     ),
+                    cancel_checker=lambda: self._cancel_event.is_set(),
                 )
-                if task_result.get("status") == "completed":
+                status = task_result.get("status")
+                if status == "completed":
                     subs = task_result.get("subtitles", [])
                     lang = task_result.get("detected_language", "unknown")
                     self.task_completed.emit(file_path, subs, lang)
+                    return
+                if status == "cancelled":
                     return
                 self.task_error.emit(file_path, task_result.get("message", "未知错误"))
                 return
@@ -855,6 +868,7 @@ class WorkerThread(QThread):
 
     def stop(self):
         self._running = False
+        self._cancel_event.set()
 
 
 class PackageProgressDialog(QDialog):
@@ -1095,6 +1109,7 @@ class MainWindow(QMainWindow):
         self.worker = None
         self.package_worker = None
         self._package_progress_dialog = None
+        self._stopped = False
         self.output_dir = Path(WHISPER_SERVER) / "output" if WHISPER_SERVER.exists() else Path.cwd() / "output"
         self.history = HistoryManager(self.output_dir / "history.json")
         self._setup_ui()
@@ -1430,6 +1445,7 @@ class MainWindow(QMainWindow):
 
     def _start_processing(self, specific_files=None):
         try:
+            self._stopped = False
             if specific_files is None:
                 pending = [(p, d.get("is_url", False)) for p, d in self.video_items.items()
                            if d["widget"].status in ("pending", "error")]
@@ -1476,13 +1492,20 @@ class MainWindow(QMainWindow):
             self.add_folder_btn.setEnabled(True)
 
     def _stop_processing(self):
+        self._stopped = True
         if self.worker:
             self.worker.stop()
             self.worker.wait(2000)
+        for path, data in self.video_items.items():
+            widget = data["widget"]
+            if widget.status in ("queued", "downloading", "processing", "pending"):
+                widget.update_status("cancelled", widget.progress, "已取消")
         self._on_all_done()
 
     def _on_progress(self, file_path, progress, message, status):
         try:
+            if self._stopped:
+                return
             if file_path in self.video_items:
                 self.video_items[file_path]["widget"].update_status(status, progress, message)
         except Exception as e:
@@ -1490,6 +1513,8 @@ class MainWindow(QMainWindow):
 
     def _on_completed(self, file_path, subtitles, language):
         try:
+            if self._stopped:
+                return
             if file_path in self.video_items:
                 widget = self.video_items[file_path]["widget"]
                 widget.update_status("completed", 100, f"完成 ({language})")
@@ -1511,6 +1536,8 @@ class MainWindow(QMainWindow):
 
     def _on_error(self, file_path, error_msg):
         try:
+            if self._stopped:
+                return
             if file_path and file_path in self.video_items:
                 self.video_items[file_path]["widget"].update_status("error", 0, error_msg[:80])
             elif not file_path:
@@ -1528,12 +1555,18 @@ class MainWindow(QMainWindow):
 
             completed = sum(1 for d in self.video_items.values() if d["widget"].status == "completed")
             failed = sum(1 for d in self.video_items.values() if d["widget"].status == "error")
+            cancelled = sum(1 for d in self.video_items.values() if d["widget"].status == "cancelled")
             total = len(self.video_items)
 
             self.retry_all_btn.setEnabled(failed > 0)
 
             if total > 0:
-                self.status_label.setText(f"完成: {completed}/{total}  失败: {failed}/{total}")
+                parts = [f"完成: {completed}/{total}"]
+                if failed:
+                    parts.append(f"失败: {failed}/{total}")
+                if cancelled:
+                    parts.append(f"已取消: {cancelled}/{total}")
+                self.status_label.setText("  ".join(parts))
         except Exception as e:
             print(f"_on_all_done error: {e}")
 
@@ -1726,8 +1759,9 @@ class MainWindow(QMainWindow):
         remove_action.triggered.connect(lambda: self._remove_file(key))
         menu.addAction(remove_action)
 
-        if widget.status in ("error",):
-            retry_action = QAction("🔄 重试", self)
+        if widget.status in ("error", "cancelled"):
+            label = "🔄 重新处理" if widget.status == "cancelled" else "🔄 重试"
+            retry_action = QAction(label, self)
             retry_action.triggered.connect(lambda: self._start_processing(specific_files=[key]))
             menu.addAction(retry_action)
 

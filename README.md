@@ -82,6 +82,17 @@ python -m unittest discover -s tests
 
 ---
 
+## 维护记录 / Maintenance Notes
+
+### 2026-06 — 任务状态模型与取消/重试优化
+
+- **新增任务状态模型**：在 `core/task_state.py` 中定义 `TaskStatus` 枚举（PENDING、QUEUED、DOWNLOADING、PROCESSING、SAVING、COMPLETED、ERROR、CANCELLED）和 `TaskInfo` 数据类，提供 `status_to_ui_text()` 和 `normalize_status()` 安全转换函数，兼容现有字符串状态。
+- **停止按钮行为改进**：点击停止后，WorkerThread 立即设置 `_cancel_event`，`wait_for_result()` 循环中检测到取消标记后立即返回 `{"status": "cancelled"}`，不再无休止等待服务结果。UI 中被取消的任务显示「已取消」，进度保持当前值。已完成任务不受影响。停止后所有按钮状态正确恢复。
+- **失败任务重试整理**：「重试失败」按钮只处理 `error` 状态任务，不处理 `cancelled` 任务。右键菜单对 `cancelled` 任务提供「重新处理」选项。重试前清理旧错误信息。已完成任务不会被重试。
+- **`api_client.py` 兼容性**：`wait_for_result()` 新增可选参数 `cancel_checker=None`，旧调用方式完全兼容。
+
+---
+
 ## 使用 / Usage
 
 ### 推荐首次流程 / First-run Workflow
