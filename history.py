@@ -93,3 +93,54 @@ class HistoryManager:
             "title": title,
             "timestamp": time.time(),
         }
+
+    def make_entry_v2(
+        self,
+        job_id,
+        title,
+        output_dir,
+        source="",
+        source_type="local",
+        mode="subtitle",
+        source_language="auto",
+        target_language="",
+        language="unknown",
+        subtitle_count=0,
+        srt_path="",
+        is_url=False,
+    ):
+        """Create a v2-compatible history entry.
+
+        Preserves all v1 fields for backward compatibility while adding
+        v2-specific metadata.
+        """
+        return {
+            "schema_version": 2,
+            "job_id": str(job_id),
+            "language": language,
+            "subtitle_count": subtitle_count,
+            "srt_path": str(srt_path) if srt_path else "",
+            "output_dir": str(output_dir) if output_dir else "",
+            "is_url": is_url,
+            "title": title,
+            "source": source,
+            "source_type": source_type,
+            "mode": mode,
+            "source_language": source_language,
+            "target_language": target_language,
+            "timestamp": time.time(),
+        }
+
+    def get_entry_mode(self, key):
+        """Return the processing mode for a history entry ('subtitle' for v1)."""
+        entry = self.get(key)
+        if not entry:
+            return "subtitle"
+        return entry.get("mode", "subtitle")
+
+    def get_job_id(self, key):
+        """Return the job_id for a history entry (empty for v1)."""
+        entry = self.get(key)
+        if not entry:
+            return ""
+        return entry.get("job_id", "")
