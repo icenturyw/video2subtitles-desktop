@@ -17,9 +17,38 @@ output/
 *.log
 transcribe_local.py
 whisper-server/venv/
+whisper-server/.venv/
 whisper-server/cache/
 whisper-server/temp/
 whisper-server/cookies.txt
+
+# Localization Engine
+localization-engine/.venv/
+localization-engine/venv/
+localization-engine/temp/
+localization-engine/cache/
+localization-engine/models/
+
+# Qwen3-TTS Engine
+qwen3-tts-engine/.venv/
+qwen3-tts-engine/venv/
+qwen3-tts-engine/models/
+qwen3-tts-engine/cache/
+qwen3-tts-engine/temp/
+qwen3-tts-engine/voices/private/
+
+# Media artifacts and temp files
+*.partial
+*.wav
+*.mp3
+*.m4a
+*.ass.tmp
+
+# Secrets and credentials
+cookies.txt
+.env
+.env.*
+!.env.example
 
 # IDE
 .vscode/
