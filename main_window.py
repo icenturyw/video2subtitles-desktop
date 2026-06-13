@@ -1133,11 +1133,11 @@ class LocalizationWorker(QThread):
             self.progress_updated.emit(self.file_path, 0, "准备本地化工作空间...", "processing")
 
             workspace = self.srt_path.parent / "localization_workspace"
-            for d in ["raw", "subtitle", "translation", "render", "checkpoints", "logs", "temp"]:
+            for d in ["source", "subtitles", "translation", "render", "audio", "audio/tts", "checkpoints", "logs", "temp"]:
                 (workspace / d).mkdir(parents=True, exist_ok=True)
 
             import shutil
-            raw_video = workspace / "raw" / self.source_video.name
+            raw_video = workspace / "source" / self.source_video.name
             try:
                 shutil.copy2(str(self.source_video), str(raw_video))
             except Exception as e:
@@ -1145,7 +1145,7 @@ class LocalizationWorker(QThread):
                 return
 
             source_srt_name = self.srt_path.name
-            source_sub = workspace / "subtitle" / source_srt_name
+            source_sub = workspace / "subtitles" / source_srt_name
             try:
                 shutil.copy2(str(self.srt_path), str(source_sub))
             except Exception as e:
@@ -1168,6 +1168,9 @@ class LocalizationWorker(QThread):
                 subtitle_mode=cfg.get("subtitle_mode", "bilingual"),
                 burn_subtitles=cfg.get("burn_subtitles", False),
                 embed_soft_subtitles=cfg.get("embed_soft_subtitles", False),
+                dubbing_enabled=cfg.get("dubbing_enabled", False),
+                tts_provider=cfg.get("tts_provider", "edge-tts"),
+                tts_voice=cfg.get("tts_voice", ""),
                 translation=cfg.get("translation_config"),
             )
 
@@ -2308,10 +2311,13 @@ class MainWindow(QMainWindow):
         dialog = LocalizationDialog(self)
         if dialog.exec_():
             self._localization_config = dialog.get_settings()
-            if self._localization_config["is_translate_mode"]:
+            if self._localization_config.get("is_dub_mode"):
+                tgt = self._localization_config["target_language"]
+                self.status_label.setText(f"配音模式: → {tgt}")
+            elif self._localization_config.get("is_translate_mode"):
                 src = self._localization_config["source_language"]
                 tgt = self._localization_config["target_language"]
-                self.status_label.setText(f"本地化模式: {src} → {tgt}")
+                self.status_label.setText(f"翻译模式: {src} → {tgt}")
             else:
                 self.status_label.setText("字幕模式（不翻译）")
 

@@ -40,6 +40,8 @@ class CreateJobRequest(BaseModel):
     burn_subtitles: bool = True
     embed_soft_subtitles: bool = False
     dubbing_enabled: bool = False
+    tts_provider: str = "edge-tts"
+    tts_voice: str = ""
     translation: Optional[TranslationRequest] = None
     style: Optional[StyleRequest] = None
 

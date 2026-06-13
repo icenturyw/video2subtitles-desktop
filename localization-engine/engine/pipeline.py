@@ -61,7 +61,8 @@ except ImportError as e:
 
 
 _STAGE_ORDER = [
-    "prepare", "normalize", "translate", "subtitle_export", "render", "finalize",
+    "prepare", "normalize", "translate", "subtitle_export",
+    "tts", "audio_mix", "render", "finalize",
 ]
 
 
@@ -111,7 +112,9 @@ class PipelineRunner:
         if not source_sub:
             self._fail(job_id, ws, "SOURCE_SUBTITLE_NOT_FOUND", "找不到源字幕文件")
             return
-        source_video = get_source_video(ws)
+
+        req_video = request.get("source_video", "")
+        source_video = Path(req_video) if req_video and Path(req_video).exists() else get_source_video(ws)
 
         self._progress.update(job_id, "prepare", 100, "准备完成")
 
@@ -164,6 +167,35 @@ class PipelineRunner:
             self._store.add_artifact(job_id, art)
 
         self._progress.update(job_id, "subtitle_export", 100, "字幕生成完成")
+
+        # --- TTS (dub mode only) ---
+        dubbing = request.get("dubbing_enabled", False)
+        if dubbing:
+            if self._check_cancel(job_id, ws, cancel_token):
+                return
+            self._store.update(job_id, stage="tts")
+            self._progress.update(job_id, "tts", 0, "语音合成...")
+            write_log(ws, "Stage: tts")
+
+            tts_success = self._run_tts(job_id, ws, segments, request, target_lang, cancel_token)
+            if not tts_success:
+                return
+
+            self._progress.update(job_id, "tts", 100, "语音合成完成")
+
+        # --- AUDIO_MIX (dub mode only) ---
+        if dubbing:
+            if self._check_cancel(job_id, ws, cancel_token):
+                return
+            self._store.update(job_id, stage="audio_mix")
+            self._progress.update(job_id, "audio_mix", 0, "音频混合...")
+            write_log(ws, "Stage: audio_mix")
+
+            mix_success = self._run_audio_mix(job_id, ws, segments, source_video, target_lang, cancel_token)
+            if not mix_success:
+                return
+
+            self._progress.update(job_id, "audio_mix", 100, "音频混合完成")
 
         # --- RENDER ---
         if self._check_cancel(job_id, ws, cancel_token):
@@ -422,6 +454,151 @@ class PipelineRunner:
                 pass
 
         return artifacts
+
+    def _run_tts(self, job_id: str, ws: Path,
+                  segments: List[SubtitleSegment],
+                  request: Dict[str, Any],
+                  target_lang: str,
+                  cancel_token: CancellationToken) -> bool:
+        """Synthesize TTS audio for each translated segment."""
+        tts_dir = ws / "audio" / "tts"
+        tts_dir.mkdir(parents=True, exist_ok=True)
+
+        tts_provider_name = request.get("tts_provider", "edge-tts")
+        tts_voice = request.get("tts_voice", "")
+        if not tts_voice:
+            tts_voice = self._default_tts_voice(target_lang)
+
+        try:
+            from tts.edge_tts import _synthesize_sync
+        except ImportError:
+            self._fail(job_id, ws, "TTS_UNAVAILABLE", "TTS 模块不可用")
+            return False
+
+        from tts.timing import adjust_timing
+
+        tts_segments = []
+        total = len([s for s in segments if s.translation])
+        completed = 0
+
+        for seg in segments:
+            if cancel_token.is_cancelled():
+                self._mark_cancelled(job_id, ws)
+                return False
+
+            text = seg.translation or seg.text
+            if not text.strip():
+                continue
+
+            seg_path = tts_dir / f"seg_{seg.index:04d}.wav"
+            temp_path = tts_dir / f"seg_{seg.index:04d}_raw.wav"
+
+            try:
+                result = _synthesize_sync(text.strip(), tts_voice, temp_path)
+            except Exception as e:
+                write_log(ws, f"  TTS failed for seg {seg.index}: {e}")
+                continue
+
+            actual_dur = result.duration_seconds
+            target_dur = seg.end - seg.start
+
+            if actual_dur > 0 and target_dur > 0:
+                adj_dur, warning = adjust_timing(temp_path, seg_path, actual_dur, target_dur)
+                if warning:
+                    write_log(ws, f"  TTS timing [{seg.index}]: {warning}")
+                if not seg_path.exists():
+                    import shutil
+                    shutil.copy2(str(temp_path), str(seg_path))
+            else:
+                import shutil
+                shutil.copy2(str(temp_path), str(seg_path))
+
+            tts_segments.append((seg_path, seg.start))
+            completed += 1
+            pct = int((completed / total) * 100) if total else 100
+            self._progress.update(job_id, "tts", pct, f"语音合成 {completed}/{total}")
+
+        if not tts_segments:
+            self._fail(job_id, ws, "TTS_NO_OUTPUT", "未生成任何语音")
+            return False
+
+        # Save TTS segment index for audio_mix stage
+        import json
+        index_path = tts_dir / "index.json"
+        index_data = [{"index": i, "path": str(p), "start": s}
+                      for i, (p, s) in enumerate(tts_segments)]
+        index_path.write_text(json.dumps(index_data, ensure_ascii=False), encoding="utf-8")
+
+        self._store.update(job_id, stage="tts", message=f"语音合成 {completed} 句")
+        return True
+
+    def _run_audio_mix(self, job_id: str, ws: Path,
+                        segments: List[SubtitleSegment],
+                        source_video: Optional[Path],
+                        target_lang: str,
+                        cancel_token: CancellationToken) -> bool:
+        """Mix TTS audio with original video audio."""
+        if not source_video:
+            self._fail(job_id, ws, "AUDIO_MIX_NO_VIDEO", "找不到源视频文件")
+            return False
+
+        tts_dir = ws / "audio" / "tts"
+        index_path = tts_dir / "index.json"
+        if not index_path.exists():
+            self._fail(job_id, ws, "AUDIO_MIX_NO_TTS", "未找到 TTS 语音数据")
+            return False
+
+        import json
+        index_data = json.loads(index_path.read_text(encoding="utf-8"))
+        tts_segments = [(Path(p), s) for item in index_data for p, s in [item]]
+
+        from audio.mix import mix_audio
+
+        def cc():
+            return cancel_token.is_cancelled()
+
+        output_path = ws / "rendered" / f"{ws.name}_{target_lang}_dubbed.mp4"
+
+        self._progress.update(job_id, "audio_mix", 10, "正在混合音频...")
+        result = mix_audio(
+            video_path=source_video,
+            tts_segments=tts_segments,
+            output_path=output_path,
+            original_volume=0.3,
+            cancel_checker=cc,
+            log_path=ws / "logs" / "ffmpeg.log",
+        )
+
+        if cancel_token.is_cancelled():
+            self._mark_cancelled(job_id, ws)
+            return False
+
+        if not result.get("success"):
+            self._fail(job_id, ws, "AUDIO_MIX_FAILED",
+                       result.get("error", "音频混合失败"))
+            return False
+
+        self._store.add_artifact(job_id, {
+            "kind": "dubbed_video",
+            "path": f"rendered/{output_path.name}",
+            "language": target_lang,
+        })
+        self._progress.update(job_id, "audio_mix", 100, "音频混合完成")
+        return True
+
+    @staticmethod
+    def _default_tts_voice(language: str) -> str:
+        voices = {
+            "zh": "zh-CN-XiaoxiaoNeural",
+            "zh-CN": "zh-CN-XiaoxiaoNeural",
+            "en": "en-US-JennyNeural",
+            "ja": "ja-JP-NanamiNeural",
+            "ko": "ko-KR-SunHiNeural",
+            "fr": "fr-FR-DeniseNeural",
+            "de": "de-DE-KatjaNeural",
+            "es": "es-ES-ElviraNeural",
+        }
+        return voices.get(language, "zh-CN-XiaoxiaoNeural")
 
     def _mark_cancelled(self, job_id: str, ws: Path) -> None:
         self._store.update(

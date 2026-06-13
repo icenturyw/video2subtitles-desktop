@@ -70,6 +70,8 @@ class LocalizationClient:
         burn_subtitles: bool = True,
         embed_soft_subtitles: bool = False,
         dubbing_enabled: bool = False,
+        tts_provider: str = "edge-tts",
+        tts_voice: str = "",
         translation: Optional[Dict[str, Any]] = None,
         style: Optional[Dict[str, Any]] = None,
         job_id: str = "",
@@ -88,6 +90,8 @@ class LocalizationClient:
             "burn_subtitles": burn_subtitles,
             "embed_soft_subtitles": embed_soft_subtitles,
             "dubbing_enabled": dubbing_enabled,
+            "tts_provider": tts_provider,
+            "tts_voice": tts_voice,
         }
         if job_id:
             payload["job_id"] = job_id

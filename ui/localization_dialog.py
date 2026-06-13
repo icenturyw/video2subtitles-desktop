@@ -14,6 +14,12 @@ from PyQt5.QtWidgets import (
 from client_settings import get_effective_settings, save_settings
 from job_models import SubtitleStyle, TranslationConfig
 
+try:
+    import edge_tts
+    _EDGE_TTS_AVAILABLE = True
+except ImportError:
+    _EDGE_TTS_AVAILABLE = False
+
 _THEME = {
     "bg_dark": "#1a1b2e",
     "bg_medium": "#232540",
@@ -84,11 +90,17 @@ class LocalizationDialog(QDialog):
 
         self.mode_translate = QCheckBox("翻译字幕成片")
         self.mode_translate.setChecked(False)
-        self.mode_translate.toggled.connect(self._on_mode_changed)
+
+        self.mode_dub = QCheckBox("指定语言配音")
+        self.mode_dub.setChecked(False)
 
         mode_layout.addWidget(self.mode_subtitle)
         mode_layout.addWidget(self.mode_translate)
+        mode_layout.addWidget(self.mode_dub)
         layout.addWidget(mode_group)
+
+        self.mode_translate.toggled.connect(self._on_mode_changed)
+        self.mode_dub.toggled.connect(self._on_mode_changed)
 
         # Translation settings
         self.trans_group = QGroupBox("翻译设置")
@@ -134,6 +146,30 @@ class LocalizationDialog(QDialog):
 
         layout.addWidget(self.trans_group)
 
+        # TTS / Dubbing settings
+        self.tts_group = QGroupBox("配音设置")
+        tts_form = QFormLayout(self.tts_group)
+        tts_form.setSpacing(8)
+        self.tts_group.setEnabled(False)
+
+        self.tts_provider = QComboBox()
+        self.tts_provider.addItems(["edge-tts"])
+        if not _EDGE_TTS_AVAILABLE:
+            self.tts_provider.setItemData(0, "需要安装: pip install edge-tts")
+        tts_form.addRow("TTS 服务:", self.tts_provider)
+
+        self.tts_voice_label = QLabel("zh-CN-XiaoxiaoNeural")
+        self.tts_voice_label.setStyleSheet(f"color: {_THEME['text_primary']}; font-size: 12px;")
+        tts_form.addRow("音色:", self.tts_voice_label)
+
+        self.orig_volume = QSpinBox()
+        self.orig_volume.setRange(0, 100)
+        self.orig_volume.setValue(30)
+        self.orig_volume.setSuffix(" %")
+        tts_form.addRow("原声保留:", self.orig_volume)
+
+        layout.addWidget(self.tts_group)
+
         # Subtitle output settings
         sub_group = QGroupBox("字幕输出")
         sub_form = QFormLayout(sub_group)
@@ -176,8 +212,11 @@ class LocalizationDialog(QDialog):
         layout.addWidget(buttons)
 
     def _on_mode_changed(self, checked: bool):
-        self.trans_group.setEnabled(checked)
-        if checked:
+        trans = self.mode_translate.isChecked()
+        dub = self.mode_dub.isChecked()
+        self.trans_group.setEnabled(trans or dub)
+        self.tts_group.setEnabled(dub)
+        if trans or dub:
             self.mode_subtitle.setChecked(False)
         else:
             self.mode_subtitle.setChecked(True)
@@ -199,6 +238,10 @@ class LocalizationDialog(QDialog):
     @property
     def is_translate_mode(self) -> bool:
         return self.mode_translate.isChecked()
+
+    @property
+    def is_dub_mode(self) -> bool:
+        return self.mode_dub.isChecked()
 
     @property
     def source_language(self) -> str:
@@ -233,7 +276,8 @@ class LocalizationDialog(QDialog):
     def get_settings(self) -> dict:
         tc = self.get_translation_config()
         return {
-            "is_translate_mode": self.is_translate_mode,
+            "is_translate_mode": self.is_translate_mode or self.is_dub_mode,
+            "is_dub_mode": self.is_dub_mode,
             "source_language": self.source_language,
             "target_language": self.target_language,
             "subtitle_mode": self.subtitle_mode_value,
@@ -241,6 +285,10 @@ class LocalizationDialog(QDialog):
             "export_ass": self.export_ass.isChecked(),
             "burn_subtitles": self.burn_subtitles.isChecked(),
             "embed_soft_subtitles": self.embed_soft.isChecked(),
+            "dubbing_enabled": self.is_dub_mode,
+            "tts_provider": self.tts_provider.currentText(),
+            "tts_voice": self.tts_voice_label.text(),
+            "original_volume": self.orig_volume.value() / 100.0,
             "translation_config": {
                 "provider": tc.provider,
                 "base_url": tc.base_url,

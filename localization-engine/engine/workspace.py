@@ -59,27 +59,29 @@ def get_log_path(workspace_dir: Path, name: str = "localization.log") -> Path:
 def get_source_subtitle(workspace_dir: Path) -> Optional[Path]:
     """Find the source subtitle file in the workspace.
 
-    Looks for common subtitle formats in the subtitles/ directory.
+    Looks for common subtitle formats in the subtitles/ or subtitle/ directory.
     """
-    subs_dir = Path(workspace_dir) / "subtitles"
-    if not subs_dir.exists():
-        return None
-    for ext in ("srt", "ass", "vtt"):
-        for f in sorted(subs_dir.iterdir()):
-            if f.suffix.lower() == f".{ext}" and f.is_file():
-                return f
+    for dir_name in ("subtitles", "subtitle"):
+        subs_dir = Path(workspace_dir) / dir_name
+        if not subs_dir.exists():
+            continue
+        for ext in ("srt", "ass", "vtt"):
+            for f in sorted(subs_dir.iterdir()):
+                if f.suffix.lower() == f".{ext}" and f.is_file():
+                    return f
     return None
 
 
 def get_source_video(workspace_dir: Path) -> Optional[Path]:
     """Find the source video file in the workspace."""
-    source_dir = Path(workspace_dir) / "source"
-    if not source_dir.exists():
-        return None
-    video_exts = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv"}
-    for f in sorted(source_dir.iterdir()):
-        if f.suffix.lower() in video_exts and f.is_file():
-            return f
+    for subdir in ("source", "raw"):
+        source_dir = Path(workspace_dir) / subdir
+        if not source_dir.exists():
+            continue
+        video_exts = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv"}
+        for f in sorted(source_dir.iterdir()):
+            if f.suffix.lower() in video_exts and f.is_file():
+                return f
     return None
 
 

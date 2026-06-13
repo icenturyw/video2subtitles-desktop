@@ -171,6 +171,8 @@ def create_job(req: CreateJobRequest):
         "burn_subtitles": req.burn_subtitles,
         "embed_soft_subtitles": req.embed_soft_subtitles,
         "dubbing_enabled": req.dubbing_enabled,
+        "tts_provider": req.tts_provider,
+        "tts_voice": req.tts_voice,
     }
     if req.translation:
         request_payload["translation"] = req.translation.model_dump()
