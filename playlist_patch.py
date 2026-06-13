@@ -13,6 +13,7 @@ import subprocess
 import sys
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.request import getproxies
 
 
 def _hidden_subprocess_kwargs():
@@ -103,6 +104,9 @@ def _extra_ytdlp_args(mw) -> list[str]:
         "--extractor-retries", "2",
     ]
     proxy = os.environ.get("V2S_PROXY", "").strip()
+    if not proxy:
+        system_proxies = getproxies()
+        proxy = system_proxies.get("http") or system_proxies.get("https") or ""
     if proxy:
         args += ["--proxy", proxy]
 

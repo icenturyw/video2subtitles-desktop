@@ -10,6 +10,7 @@ import os
 import sys
 from pathlib import Path
 from urllib.parse import urlparse
+from urllib.request import getproxies
 
 from PyQt5.QtCore import QProcessEnvironment
 
@@ -81,6 +82,9 @@ def _title_fetch_args(url: str, mw) -> list[str]:
         args += ["--extractor-args", "youtube:player_client=default"]
 
     proxy = os.environ.get("V2S_PROXY", "").strip()
+    if not proxy:
+        system_proxies = getproxies()
+        proxy = system_proxies.get("http") or system_proxies.get("https") or ""
     if proxy:
         args += ["--proxy", proxy]
 

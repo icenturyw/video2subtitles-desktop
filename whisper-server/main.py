@@ -20,6 +20,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional
+from urllib.request import getproxies
 
 import uvicorn
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
@@ -163,17 +164,48 @@ def _safe_name(value: str) -> str:
     return value or uuid.uuid4().hex
 
 
-def _extra_ytdlp_args() -> list[str]:
-    """Common yt-dlp arguments to handle YouTube anti-bot measures."""
-    args = [
-        "--extractor-args", "youtube:player_client=all",
-        "--extractor-retries", "3",
-    ]
+def _detect_system_proxy() -> str:
     proxy = os.environ.get("V2S_PROXY", "").strip()
     if proxy:
-        args += ["--proxy", proxy]
+        return proxy
+    system_proxies = getproxies()
+    http_proxy = system_proxies.get("http") or system_proxies.get("https") or ""
+    return http_proxy
+
+
+def _classify_ytdlp_error(stderr: str) -> str:
+    if "LOGIN_REQUIRED" in stderr or "Sign in to confirm" in stderr or "Sign in" in stderr:
+        return "需要登录 YouTube。请更新 cookies.txt（在浏览器中登录 YouTube 后用插件导出 Netscape 格式的 cookies）"
+    if "Video unavailable" in stderr:
+        return "视频不可用（可能已删除、私密或地区限制）"
+    if "Private video" in stderr:
+        return "该视频是私密视频"
+    if "This video is not available" in stderr:
+        return "视频不可用（可能已删除、私密或地区限制）"
+    if "connect timeout" in stderr or "timed out" in stderr:
+        return "连接 YouTube 超时，请检查网络连接或代理设置"
+    if "HTTP Error 403" in stderr:
+        return "YouTube 返回 403 禁止访问，可能是 cookies 过期或被风控"
+    if "HTTP Error 429" in stderr:
+        return "请求过于频繁，被 YouTube 限流，请稍后再试"
+    return ""
+
+
+def _extra_ytdlp_args() -> list[str]:
+    """Common yt-dlp arguments to handle YouTube anti-bot measures."""
     cookie_file = SERVER_DIR / "cookies.txt"
-    if cookie_file.exists() and cookie_file.stat().st_size > 0:
+    has_cookies = cookie_file.exists() and cookie_file.stat().st_size > 0
+    player_client = "default" if has_cookies else "android,tv"
+    args = [
+        "--extractor-args", f"youtube:player_client={player_client}",
+        "--remote-components", "ejs:github",
+        "--js-runtimes", "node",
+        "--extractor-retries", "3",
+    ]
+    proxy = _detect_system_proxy()
+    if proxy:
+        args += ["--proxy", proxy]
+    if has_cookies:
         args += ["--cookies", str(cookie_file)]
     return args
 
@@ -263,6 +295,9 @@ def _download_audio(video_url: str, task_id: str) -> Path:
         raise RuntimeError("未找到 yt-dlp，请运行 pip install -r requirements.txt") from exc
     except subprocess.CalledProcessError as exc:
         detail = (exc.stderr or exc.stdout or str(exc))[-800:]
+        classified = _classify_ytdlp_error(exc.stderr or exc.stdout or "")
+        if classified:
+            raise RuntimeError(classified) from exc
         raise RuntimeError(f"yt-dlp 下载音频失败: {detail}") from exc
 
     media_path = _existing_download(base_name, audio_only=True)
@@ -301,7 +336,11 @@ def _download_video(video_url: str, task_id: str, quality: str = "best") -> Path
         try:
             _run_ytdlp(fallback_cmd)
         except subprocess.CalledProcessError as second_exc:
+            stderr_combined = (second_exc.stderr or "") + (first_exc.stderr or "")
             detail = (second_exc.stderr or second_exc.stdout or first_exc.stderr or first_exc.stdout or str(second_exc))[-800:]
+            classified = _classify_ytdlp_error(stderr_combined)
+            if classified:
+                raise RuntimeError(classified) from second_exc
             raise RuntimeError(f"yt-dlp 下载视频失败: {detail}") from second_exc
 
     media_path = _existing_download(base_name, video_only=False)
