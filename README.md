@@ -40,7 +40,9 @@
 - **本地 & API 转录** — 可直接使用 `faster-whisper` 本地转录，或连接自定义 Whisper Server
 - **多格式导出** — 导出 SRT、VTT、TXT 字幕格式
 - **ChatGPT 分析包** — 右侧字幕预览区和右键菜单都可生成含代理视频、关键帧和字幕的上传包；生成过程中会显示持续进度浮层，完成/失败后弹窗提醒，并支持打开包目录或复制路径/错误信息
-- **双语字幕** — 支持原文+翻译同时显示
+- **字幕翻译** — 集成本地化引擎，支持 OpenAI 兼容 API 批量翻译字幕，术语表注入，断点续翻
+- **双语+样式字幕** — 支持原文、译文、双语 ASS/SSA 字幕，可自定义字体、大小、轮廓、阴影和边距
+- **硬字幕烧录** — 通过 FFmpeg 将字幕直接烧录到视频画面，支持质量预设（快速/平衡/高质量）
 - **深色主题** — 现代化暗色 UI 界面
 
 ---
@@ -83,6 +85,17 @@ python -m unittest discover -s tests
 ---
 
 ## 维护记录 / Maintenance Notes
+
+### 2026-06 — Phase 3：字幕翻译与烧录 MVP
+
+- **本地化引擎 sidecar**：在 `localization-engine/` 中新增独立的 FastAPI 服务（端口 8766），提供 `/health`、`/jobs`、`/cancel`、`/retry`、`/logs` 端点，由 `app.py` 自动启动。
+- **Pipeline 编排**：新增 `PipelineRunner`，按 `prepare → normalize → translate → subtitle_export → render → finalize` 顺序执行，支持 checkpoint 断点续跑。
+- **字幕标准化**：`localization-engine/subtitles/normalize.py` 支持读取 SRT/ASS/VTT 并转为 `SubtitleSegment`；`subtitle_ass.py` 支持生成带样式的 ASS 字幕（原文/译文/双语）。
+- **翻译引擎**：`localization-engine/translation/` 提供 OpenAI 兼容 API 翻译提供者、分段批处理、术语表注入（JSON/CSV）、响应解析和 API Key 脱敏日志。
+- **FFmpeg 渲染**：`services/ffmpeg_service.py` 支持硬字幕烧录（atomic rename 防止损坏文件）和软字幕封装；`localization-engine/rendering/` 提供字幕滤镜构造和编码预设（快速/平衡/高质量）。
+- **客户端集成**：新增「🌐 本地化」工具栏按钮，打开 `LocalizationDialog` 设置翻译参数；ASR 完成后自动将源字幕提交到本地化引擎，翻译完成后的字幕自动显示在预览区。
+- **详情配置**：`localization_dialog.py` 支持模式选择（快速字幕/翻译字幕成片）、源语言/目标语言、翻译服务（OpenAI 兼容）、API 地址/模型/Key、字幕模式（双语/仅译文/仅原文）、硬字幕烧录和软字幕封装。
+- **新增文件**：`localization_client.py`、`localization-engine/`、`services/ffmpeg_service.py`、`services/sidecar_manager.py`、`ui/localization_dialog.py`、`ui/subtitle_style_dialog.py`、`subtitle_ass.py`。
 
 ### 2026-06 — 任务状态模型与取消/重试优化
 
@@ -329,9 +342,10 @@ python app.py
 1. **添加视频** — 点击「添加视频」选择本地文件，或粘贴在线视频链接；若 YouTube 链接包含播放列表，可选择添加整个列表或只添加当前视频
 2. **开始处理** — 点击「开始处理」下载/保存视频并进行字幕转录
 3. **预览字幕** — 点击已完成的任务查看字幕内容
-4. **失败排查** — 如果任务失败，选中失败任务查看完整错误日志，或点击「复制错误日志」发给开发者定位
-5. **导出/打包** — 右键导出 SRT/VTT/TXT，或在右侧字幕预览区点击「生成 ChatGPT 包」；打包期间会显示进度浮层，完成后可打开包目录或复制路径
-6. **历史管理** — 点击「历史记录」重新打开输出、加回任务列表或重新生成 ChatGPT 包
+4. **翻译字幕（可选）** — 点击「🌐 本地化」打开翻译设置，选择目标语言和翻译服务（OpenAI 兼容 API），点击确定后再次处理时会自动翻译字幕并将翻译烧录到视频
+5. **失败排查** — 如果任务失败，选中失败任务查看完整错误日志，或点击「复制错误日志」发给开发者定位
+6. **导出/打包** — 右键导出 SRT/VTT/TXT，或在右侧字幕预览区点击「生成 ChatGPT 包」；打包期间会显示进度浮层，完成后可打开包目录或复制路径
+7. **历史管理** — 点击「历史记录」重新打开输出、加回任务列表或重新生成 ChatGPT 包
 
 ---
 
@@ -388,6 +402,19 @@ video_2_subtitles/
 │   ├── requirements.txt
 │   ├── cache/          # 服务端字幕缓存 / Service cache
 │   └── temp/           # 下载和上传临时文件 / Temporary files
+├── localization-engine/ # 本地化引擎 / Localization engine sidecar
+│   ├── main.py         # FastAPI sidecar (port 8766)
+│   ├── engine/         # Pipeline 编排 / Pipeline orchestrator
+│   ├── subtitles/      # 字幕读写、标准化、验证 / Subtitle I/O & validation
+│   ├── translation/    # 翻译提供者、批处理、术语表 / Translation providers
+│   └── rendering/      # FFmpeg 滤镜和编码预设 / FFmpeg filters & presets
+├── localization_client.py # 本地化引擎 HTTP 客户端 / Localization API client
+├── services/
+│   ├── ffmpeg_service.py  # FFmpeg 渲染（烧录/软字幕）/ Rendering service
+│   └── sidecar_manager.py  # Sidecar 进程管理 / Sidecar process manager
+├── ui/
+│   ├── localization_dialog.py   # 本地化设置对话框 / Localization settings dialog
+│   └── subtitle_style_dialog.py # 字幕样式编辑器 / Subtitle style editor
 ├── models/             # 默认模型目录 / Default model directory
 ├── .cache/             # 本地设置、服务日志和辅助脚本缓存 / Local cache
 ├── start.bat           # 生产启动（Win） / Production launcher

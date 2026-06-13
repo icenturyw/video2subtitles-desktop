@@ -29,6 +29,8 @@ from api_client import WhisperApiClient
 from local_whisper import LocalWhisperTranscriber, WHISPER_SERVER
 from history import HistoryManager
 from subtitle_utils import format_subtitle_time, sanitize_filename
+from localization_client import LocalizationClient
+from ui.localization_dialog import LocalizationDialog
 
 
 THEME = {
@@ -1102,6 +1104,119 @@ class ChatGPTPackageWorker(QThread):
             self.failed.emit(str(e)[:300])
 
 
+class LocalizationWorker(QThread):
+    progress_updated = pyqtSignal(str, int, str, str)
+    task_completed = pyqtSignal(str, str)
+    task_error = pyqtSignal(str, str)
+
+    def __init__(self, file_path, srt_path, source_video, config, output_dir):
+        super().__init__()
+        self.file_path = file_path
+        self.srt_path = Path(srt_path)
+        self.source_video = Path(source_video)
+        self.config = config
+        self.output_dir = Path(output_dir)
+        self._cancelled = False
+        self._job_id = None
+        self._client = LocalizationClient()
+
+    def stop(self):
+        self._cancelled = True
+        if self._job_id:
+            try:
+                self._client.cancel_job(self._job_id)
+            except Exception:
+                pass
+
+    def run(self):
+        try:
+            self.progress_updated.emit(self.file_path, 0, "准备本地化工作空间...", "processing")
+
+            workspace = self.srt_path.parent / "localization_workspace"
+            for d in ["raw", "subtitle", "translation", "render", "checkpoints", "logs", "temp"]:
+                (workspace / d).mkdir(parents=True, exist_ok=True)
+
+            import shutil
+            raw_video = workspace / "raw" / self.source_video.name
+            try:
+                shutil.copy2(str(self.source_video), str(raw_video))
+            except Exception as e:
+                self.task_error.emit(self.file_path, f"复制视频文件失败: {e}")
+                return
+
+            source_srt_name = self.srt_path.name
+            source_sub = workspace / "subtitle" / source_srt_name
+            try:
+                shutil.copy2(str(self.srt_path), str(source_sub))
+            except Exception as e:
+                self.task_error.emit(self.file_path, f"复制字幕文件失败: {e}")
+                return
+
+            self.progress_updated.emit(self.file_path, 5, "连接本地化引擎...", "processing")
+            if not self._client.health_check():
+                self.task_error.emit(self.file_path, "本地化引擎未启动，请先启动服务")
+                return
+
+            self.progress_updated.emit(self.file_path, 10, "提交翻译任务...", "processing")
+            cfg = self.config
+            result = self._client.create_job(
+                workspace_dir=str(workspace),
+                source_video=str(raw_video),
+                source_subtitle=str(source_sub),
+                source_language=cfg.get("source_language", "auto"),
+                target_language=cfg.get("target_language", "zh"),
+                subtitle_mode=cfg.get("subtitle_mode", "bilingual"),
+                burn_subtitles=cfg.get("burn_subtitles", False),
+                embed_soft_subtitles=cfg.get("embed_soft_subtitles", False),
+                translation=cfg.get("translation_config"),
+            )
+
+            if "error" in result:
+                self.task_error.emit(self.file_path, result["error"])
+                return
+
+            self._job_id = result.get("job_id")
+            if not self._job_id:
+                self.task_error.emit(self.file_path, "引擎未返回任务 ID")
+                return
+
+            def on_progress(p, m, s):
+                self.progress_updated.emit(self.file_path, int(p), str(m or ""), str(s or "processing"))
+
+            final = self._client.wait_for_result(
+                self._job_id,
+                progress_callback=on_progress,
+                poll_interval=1.0,
+                cancel_checker=lambda: self._cancelled,
+            )
+
+            status = final.get("status")
+            if status == "completed":
+                trans_dir = workspace / "translation"
+                output_srt = trans_dir / f"{self.srt_path.stem}_translated.srt"
+                if not output_srt.exists():
+                    output_srt = trans_dir / source_srt_name
+                if not output_srt.exists():
+                    srt_files = list(trans_dir.glob("*.srt"))
+                    if srt_files:
+                        output_srt = srt_files[0]
+                if output_srt.exists():
+                    dst = self.srt_path.parent / f"{self.srt_path.stem}_translated.srt"
+                    shutil.copy2(str(output_srt), str(dst))
+                    self.task_completed.emit(self.file_path, str(dst))
+                else:
+                    self.task_completed.emit(self.file_path, "")
+            elif status == "cancelled":
+                pass
+            else:
+                self.task_error.emit(self.file_path, final.get("message", "处理失败"))
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.task_error.emit(self.file_path, str(e)[:200])
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1110,6 +1225,8 @@ class MainWindow(QMainWindow):
         self.package_worker = None
         self._package_progress_dialog = None
         self._stopped = False
+        self._localization_config = None
+        self._localization_worker = None
         self.output_dir = Path(WHISPER_SERVER) / "output" if WHISPER_SERVER.exists() else Path.cwd() / "output"
         self.history = HistoryManager(self.output_dir / "history.json")
         self._setup_ui()
@@ -1199,6 +1316,13 @@ class MainWindow(QMainWindow):
         self.output_dir_btn.clicked.connect(self._change_output_dir)
         self.output_dir_btn.setToolTip(str(self.output_dir))
         layout.addWidget(self.output_dir_btn)
+
+        self.localize_btn = QPushButton("🌐 本地化")
+        self.localize_btn.setObjectName("btn_secondary")
+        self.localize_btn.setFixedHeight(38)
+        self.localize_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self.localize_btn.clicked.connect(self._show_localization_dialog)
+        layout.addWidget(self.localize_btn)
 
         settings_btn = QPushButton("⚙")
         settings_btn.setObjectName("btn_icon")
@@ -1496,6 +1620,10 @@ class MainWindow(QMainWindow):
         if self.worker:
             self.worker.stop()
             self.worker.wait(2000)
+        if self._localization_worker:
+            self._localization_worker.stop()
+            self._localization_worker.wait(2000)
+            self._localization_worker = None
         for path, data in self.video_items.items():
             widget = data["widget"]
             if widget.status in ("queued", "downloading", "processing", "pending"):
@@ -1529,6 +1657,10 @@ class MainWindow(QMainWindow):
                 idx = self.file_list.row(self.video_items[file_path]["item"])
                 if idx == self.file_list.currentRow():
                     self.subtitle_viewer.show_subtitles(file_path, subtitles, widget.is_url)
+
+                if self._localization_config and self._localization_config.get("is_translate_mode"):
+                    widget.update_status("processing", 50, "开始翻译字幕...")
+                    self._start_localization(file_path, str(srt_path))
 
             self._update_progress()
         except Exception as e:
@@ -2171,6 +2303,68 @@ class MainWindow(QMainWindow):
                 self.output_dir = dialog.output_dir
                 self.output_dir.mkdir(parents=True, exist_ok=True)
                 self.output_dir_btn.setToolTip(str(self.output_dir))
+
+    def _show_localization_dialog(self):
+        dialog = LocalizationDialog(self)
+        if dialog.exec_():
+            self._localization_config = dialog.get_settings()
+            if self._localization_config["is_translate_mode"]:
+                src = self._localization_config["source_language"]
+                tgt = self._localization_config["target_language"]
+                self.status_label.setText(f"本地化模式: {src} → {tgt}")
+            else:
+                self.status_label.setText("字幕模式（不翻译）")
+
+    def _start_localization(self, file_path, srt_path):
+        is_url = self.video_items.get(file_path, {}).get("is_url", False)
+        if is_url:
+            self.video_items[file_path]["widget"].update_status(
+                "completed", 100, "翻译暂不支持 URL 视频"
+            )
+            self._update_progress()
+            return
+        if not Path(file_path).exists():
+            self.video_items[file_path]["widget"].update_status("error", 0, "源视频文件不存在")
+            return
+
+        worker = LocalizationWorker(
+            file_path, srt_path, file_path,
+            self._localization_config, self.output_dir,
+        )
+        worker.progress_updated.connect(self._on_localization_progress)
+        worker.task_completed.connect(self._on_localization_completed)
+        worker.task_error.connect(self._on_localization_error)
+        self._localization_worker = worker
+        worker.start()
+
+    def _on_localization_progress(self, file_path, progress, message, status):
+        if self._stopped or file_path not in self.video_items:
+            return
+        self.video_items[file_path]["widget"].update_status(status, progress, message)
+
+    def _on_localization_completed(self, file_path, translated_srt):
+        if file_path not in self.video_items:
+            return
+        from subtitle_utils import parse_srt_file
+        widget = self.video_items[file_path]["widget"]
+        tgt = self._localization_config.get("target_language", "zh") if self._localization_config else "zh"
+        if translated_srt and Path(translated_srt).exists():
+            subtitles = parse_srt_file(translated_srt)
+            widget.subtitles = subtitles
+            widget.update_status("completed", 100, f"翻译完成 ({tgt})")
+            idx = self.file_list.row(self.video_items[file_path]["item"])
+            if idx == self.file_list.currentRow():
+                self.subtitle_viewer.show_subtitles(
+                    file_path, subtitles, self.video_items[file_path].get("is_url", False)
+                )
+        else:
+            widget.update_status("completed", 100, f"ASR 完成（翻译输出未找到）")
+        self._update_progress()
+
+    def _on_localization_error(self, file_path, error_msg):
+        if file_path in self.video_items:
+            self.video_items[file_path]["widget"].update_status("error", 0, error_msg[:80])
+            self._update_progress()
 
 
 class SettingsDialog(QDialog):
