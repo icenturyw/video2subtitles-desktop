@@ -470,16 +470,26 @@ class PipelineRunner:
             tts_voice = self._default_tts_voice(target_lang)
 
         try:
-            from tts.edge_tts import _synthesize_sync
-        except ImportError:
-            self._fail(job_id, ws, "TTS_UNAVAILABLE", "TTS 模块不可用")
+            from tts import get_provider as get_tts_provider
+            provider = get_tts_provider(tts_provider_name, cache_dir=tts_dir)
+        except (ImportError, ValueError) as e:
+            self._fail(job_id, ws, "TTS_UNAVAILABLE",
+                       f"TTS provider {tts_provider_name} 不可用: {e}")
             return False
 
-        from tts.timing import adjust_timing
+        from tts.timing import adjust_timing, save_timing_report
 
         tts_segments = []
+        speed_ratios = {}
         total = len([s for s in segments if s.translation])
         completed = 0
+
+        options = {
+            "rate": "+0%",
+            "pitch": "+0Hz",
+            "volume": "+0%",
+            "timeout": 60,
+        }
 
         for seg in segments:
             if cancel_token.is_cancelled():
@@ -494,7 +504,9 @@ class PipelineRunner:
             temp_path = tts_dir / f"seg_{seg.index:04d}_raw.wav"
 
             try:
-                result = _synthesize_sync(text.strip(), tts_voice, temp_path)
+                result = provider.synthesize(
+                    text.strip(), target_lang, tts_voice, temp_path, options,
+                )
             except Exception as e:
                 write_log(ws, f"  TTS failed for seg {seg.index}: {e}")
                 continue
@@ -503,12 +515,15 @@ class PipelineRunner:
             target_dur = seg.end - seg.start
 
             if actual_dur > 0 and target_dur > 0:
-                adj_dur, warning = adjust_timing(temp_path, seg_path, actual_dur, target_dur)
+                adj_dur, warning, speed = adjust_timing(
+                    temp_path, seg_path, actual_dur, target_dur,
+                )
                 if warning:
                     write_log(ws, f"  TTS timing [{seg.index}]: {warning}")
                 if not seg_path.exists():
                     import shutil
                     shutil.copy2(str(temp_path), str(seg_path))
+                speed_ratios[seg.index] = speed
             else:
                 import shutil
                 shutil.copy2(str(temp_path), str(seg_path))
@@ -522,12 +537,14 @@ class PipelineRunner:
             self._fail(job_id, ws, "TTS_NO_OUTPUT", "未生成任何语音")
             return False
 
-        # Save TTS segment index for audio_mix stage
         import json
         index_path = tts_dir / "index.json"
         index_data = [{"index": i, "path": str(p), "start": s}
                       for i, (p, s) in enumerate(tts_segments)]
         index_path.write_text(json.dumps(index_data, ensure_ascii=False), encoding="utf-8")
+
+        if speed_ratios:
+            save_timing_report(speed_ratios, tts_dir / "timing_report.json")
 
         self._store.update(job_id, stage="tts", message=f"语音合成 {completed} 句")
         return True
@@ -543,14 +560,16 @@ class PipelineRunner:
             return False
 
         tts_dir = ws / "audio" / "tts"
-        index_path = tts_dir / "index.json"
-        if not index_path.exists():
-            self._fail(job_id, ws, "AUDIO_MIX_NO_TTS", "未找到 TTS 语音数据")
+        tts_wavs = sorted(tts_dir.glob("seg_*.wav"))
+        if not tts_wavs:
+            self._fail(job_id, ws, "AUDIO_MIX_NO_TTS", "未找到 TTS 语音文件")
             return False
 
-        import json
-        index_data = json.loads(index_path.read_text(encoding="utf-8"))
-        tts_segments = [(Path(p), s) for item in index_data for p, s in [item]]
+        tts_segments = []
+        for seg in segments:
+            match = [w for w in tts_wavs if w.stem.endswith(f"{seg.index:04d}")]
+            if match:
+                tts_segments.append((match[0], seg.start))
 
         from audio.mix import mix_audio
 

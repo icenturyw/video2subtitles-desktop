@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import asyncio
-import os
+import logging
 import subprocess
-import sys
-import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from tts.base import TTSResult, TTSUnavailableError
+from tts.base import (
+    TTSResult, TTSUnavailableError, TTSCache,
+)
 
+logger = logging.getLogger("tts.edge_tts")
 
 _EDGE_TTS_AVAILABLE = False
 try:
@@ -19,58 +20,80 @@ except ImportError:
     pass
 
 
-_EDGE_TTS_CACHE: Dict[str, str] = {}
+class EdgeTTSProvider:
+    def __init__(self, cache: Optional[TTSCache] = None):
+        self._cache = cache
+        self._voice_cache: Optional[List[Dict[str, str]]] = None
 
+    def list_voices(self, language: Optional[str] = None) -> List[Dict[str, str]]:
+        if not _EDGE_TTS_AVAILABLE:
+            return []
+        if self._voice_cache is None:
+            try:
+                voices = asyncio.run(edge_tts.list_voices())
+                self._voice_cache = [
+                    {"name": v["ShortName"], "locale": v["Locale"],
+                     "gender": v.get("Gender", "")}
+                    for v in voices
+                ]
+            except Exception as e:
+                logger.warning("Failed to list Edge-TTS voices: %s", e)
+                return []
+        if language:
+            return [v for v in self._voice_cache
+                    if v["locale"].lower().startswith(language.lower())]
+        return list(self._voice_cache)
 
-def _get_voices_sync(language: Optional[str] = None) -> List[Dict[str, str]]:
-    """Synchronously fetch available Edge-TTS voices."""
-    if not _EDGE_TTS_AVAILABLE:
-        return []
-    try:
-        voices = asyncio.run(edge_tts.list_voices())
-        result = []
-        for v in voices:
-            if language and not v["Locale"].lower().startswith(language.lower()):
-                continue
-            result.append({
-                "name": v["ShortName"],
-                "locale": v["Locale"],
-                "gender": v.get("Gender", ""),
-            })
-        return result
-    except Exception:
-        return []
+    def synthesize(
+        self,
+        text: str,
+        language: str,
+        voice: str,
+        output_path: Path,
+        options: dict,
+    ) -> TTSResult:
+        if not _EDGE_TTS_AVAILABLE:
+            raise TTSUnavailableError("edge-tts 未安装，请执行 pip install edge-tts")
 
+        # Check cache
+        if self._cache:
+            cached = self._cache.get(text, voice, language)
+            if cached:
+                dur = _get_audio_duration(cached)
+                if dur > 0:
+                    import shutil
+                    shutil.copy2(str(cached), str(output_path))
+                    return TTSResult(output_path=output_path, duration_seconds=dur)
 
-def _synthesize_sync(
-    text: str,
-    voice: str,
-    output_path: Path,
-    rate: str = "+0%",
-    pitch: str = "+0Hz",
-    volume: str = "+0%",
-) -> TTSResult:
-    """Synchronously synthesize speech using edge-tts."""
-    if not _EDGE_TTS_AVAILABLE:
-        raise TTSUnavailableError("edge-tts 未安装，请执行 pip install edge-tts")
+        rate = options.get("rate", "+0%")
+        pitch = options.get("pitch", "+0Hz")
+        volume = options.get("volume", "+0%")
+        timeout = options.get("timeout", 60)
 
-    try:
-        communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch, volume=volume)
-        asyncio.run(communicate.save(str(output_path)))
-    except Exception as e:
-        raise TTSUnavailableError(f"Edge-TTS 合成失败: {e}") from e
+        try:
+            communicate = edge_tts.Communicate(
+                text, voice, rate=rate, pitch=pitch, volume=volume,
+            )
+            asyncio.run(communicate.save(str(output_path)))
+        except Exception as e:
+            raise TTSUnavailableError(f"Edge-TTS 合成失败: {e}") from e
 
-    duration = _get_audio_duration(output_path)
-    return TTSResult(output_path=output_path, duration_seconds=duration)
+        duration = _get_audio_duration(output_path)
+
+        # Store in cache
+        if self._cache and duration > 0:
+            self._cache.put(text, voice, language, output_path)
+
+        return TTSResult(output_path=output_path, duration_seconds=duration)
 
 
 def _get_audio_duration(path: Path) -> float:
-    """Get audio duration in seconds using ffprobe."""
     try:
         result = subprocess.run(
             [
                 "ffprobe", "-v", "error", "-show_entries",
-                "format=duration", "-of", "default=noprint_wrappers=1:nokey=1",
+                "format=duration", "-of",
+                "default=noprint_wrappers=1:nokey=1",
                 str(path),
             ],
             capture_output=True, text=True, timeout=30,
@@ -80,13 +103,3 @@ def _get_audio_duration(path: Path) -> float:
     except Exception:
         pass
     return 0.0
-
-
-def get_provider() -> object:
-    """Return a dict-based provider adapter for the pipeline."""
-    return {
-        "name": "edge-tts",
-        "available": _EDGE_TTS_AVAILABLE,
-        "list_voices": _get_voices_sync,
-        "synthesize": _synthesize_sync,
-    }
