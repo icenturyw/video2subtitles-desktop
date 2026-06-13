@@ -35,6 +35,20 @@ DEFAULT_SETTINGS = {
     "download_quality": "best",
     "keep_downloaded_video": "true",
     "proxy_url": "",
+    # Localization Engine settings
+    "localization_engine_url": "http://127.0.0.1:8766",
+    "localization_engine_auto_start": "true",
+    "translation_provider": "openai_compatible",
+    "translation_base_url": "",
+    "translation_model": "",
+    "translation_timeout": "60",
+    "translation_concurrency": "2",
+    "translation_quality": "fast",
+    "default_target_language": "zh-CN",
+    "subtitle_style_preset": "default",
+    "tts_provider": "",
+    "tts_voice": "",
+    "original_audio_volume": "0.2",
 }
 
 ENV_BY_KEY = {
@@ -47,6 +61,10 @@ ENV_BY_KEY = {
     "download_quality": "V2S_DOWNLOAD_QUALITY",
     "keep_downloaded_video": "V2S_KEEP_DOWNLOADED_VIDEO",
     "proxy_url": "V2S_PROXY",
+    "localization_engine_url": "LOCALIZATION_ENGINE_URL",
+    "translation_base_url": "V2S_TRANSLATION_BASE_URL",
+    "translation_model": "V2S_TRANSLATION_MODEL",
+    "default_target_language": "V2S_TARGET_LANGUAGE",
 }
 
 

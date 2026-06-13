@@ -4,11 +4,10 @@
 import json as _json
 import sys
 import os
-import subprocess
 import time
 from pathlib import Path
 
-from client_settings import apply_saved_settings_to_env
+from client_settings import apply_saved_settings_to_env, get_effective_settings
 
 # Apply persisted client settings before importing modules that read env vars.
 apply_saved_settings_to_env()
@@ -17,7 +16,7 @@ from whisper_config import WHISPER_SERVER, WHISPER_MODEL_DIR
 
 APP_DIR = Path(__file__).resolve().parent
 CACHE_DIR = APP_DIR / ".cache"
-SERVICE_LOG_PATH = CACHE_DIR / "whisper-service.log"
+LOCALIZATION_ENGINE_DIR = APP_DIR / "localization-engine"
 
 # Add the bundled/custom whisper server to path so we can optionally use it directly.
 # Default location: ./whisper-server. Override with WHISPER_SERVER_DIR when needed.
@@ -41,189 +40,119 @@ error_log_patch.install()
 title_fetch_patch.install()
 playlist_patch.install()
 
+# ---------------------------------------------------------------------------
+# Sidecar managers (initialized in main(), reused by restart_whisper_server)
+# ---------------------------------------------------------------------------
+from services.sidecar_manager import SidecarManager
 
-def _get_server_device():
-    """Return (device, compute_type) reported by the running sidecar, or (None, None)."""
-    import urllib.request
-    try:
-        with urllib.request.urlopen("http://127.0.0.1:8765/health", timeout=1) as resp:
-            data = _json.loads(resp.read().decode("utf-8"))
-            return data.get("device"), data.get("compute_type")
-    except Exception:
-        return None, None
-
-
-def _find_server_pid():
-    """Return PID of the process listening on port 8765, or None."""
-    try:
-        kwargs = {"capture_output": True, "text": True, "timeout": 3}
-        if os.name == "nt":
-            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-        result = subprocess.run(["netstat", "-ano"], **kwargs)
-        for line in result.stdout.splitlines():
-            if ":8765" in line and "LISTENING" in line:
-                parts = line.strip().split()
-                if parts:
-                    return parts[-1]
-    except Exception:
-        pass
-    return None
-
-
-def _kill_server_process():
-    """Kill the process listening on port 8765 if any."""
-    pid = _find_server_pid()
-    if pid:
-        try:
-            kwargs = {"capture_output": True, "timeout": 3}
-            if os.name == "nt":
-                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-                subprocess.run(["taskkill", "/F", "/PID", pid], **kwargs)
-            else:
-                import signal
-                os.kill(int(pid), signal.SIGTERM)
-            time.sleep(0.5)
-        except Exception:
-            pass
-
-
-def restart_whisper_server():
-    """Kill the running sidecar and start a fresh one with current env vars."""
-    _set_service_status("restarting", "正在重启 Whisper 服务以应用新设置...")
-    _kill_server_process()
-    time.sleep(1)
-    return _ensure_whisper_server()
+_whisper_manager: SidecarManager | None = None
+_localization_manager: SidecarManager | None = None
 
 
 def _set_service_status(status, detail=""):
     """Expose sidecar startup details to the already-running UI process."""
     os.environ["V2S_WHISPER_SERVICE_STATUS"] = status
     os.environ["V2S_WHISPER_SERVICE_DETAIL"] = detail
-    os.environ["V2S_WHISPER_SERVICE_LOG"] = str(SERVICE_LOG_PATH)
+    os.environ["V2S_WHISPER_SERVICE_LOG"] = str(CACHE_DIR / "whisper-service.log")
 
 
-def _is_local_server_ready():
-    """Return True when the local Whisper HTTP service is already reachable."""
-    import urllib.request
-
-    try:
-        with urllib.request.urlopen("http://127.0.0.1:8765/health", timeout=1) as resp:
-            return 200 <= resp.status < 300
-    except Exception:
-        return False
+def _set_localization_status(status, detail=""):
+    """Expose localization engine status to the UI process."""
+    os.environ["V2S_LOCALIZATION_STATUS"] = status
+    os.environ["V2S_LOCALIZATION_DETAIL"] = detail
+    os.environ["V2S_LOCALIZATION_LOG"] = str(CACHE_DIR / "localization-service.log")
 
 
-def _find_server_script():
-    """Find the bundled/custom Whisper server entry script.
+def _build_whisper_manager() -> SidecarManager:
+    """Create a SidecarManager configured for the Whisper server."""
+    def _find_script():
+        for name in ("main.py", "server.py"):
+            candidate = WHISPER_SERVER / name
+            if candidate.exists():
+                return candidate.name
+        return "main.py"
 
-    youtube-live-subtitles uses whisper-server/main.py. Older desktop bundles used
-    whisper-server/server.py, so keep both for compatibility.
-    """
-    for name in ("main.py", "server.py"):
-        candidate = WHISPER_SERVER / name
-        if candidate.exists():
-            return candidate
-    return None
-
-
-def _find_server_python():
-    """Prefer the Whisper server venv, then project venv/current interpreter."""
-    if os.name == "nt":
-        candidates = [
-            WHISPER_SERVER / "venv" / "Scripts" / "python.exe",
-            WHISPER_SERVER / ".venv" / "Scripts" / "python.exe",
-            APP_DIR / ".venv" / "Scripts" / "python.exe",
-            APP_DIR / "venv" / "Scripts" / "python.exe",
-        ]
-    else:
-        candidates = [
-            WHISPER_SERVER / "venv" / "bin" / "python",
-            WHISPER_SERVER / ".venv" / "bin" / "python",
-            APP_DIR / ".venv" / "bin" / "python",
-            APP_DIR / "venv" / "bin" / "python",
-        ]
-
-    for candidate in candidates:
-        if candidate.exists():
-            return str(candidate)
-    return sys.executable or "python"
+    return SidecarManager(
+        name="Whisper",
+        port=8765,
+        service_dir=WHISPER_SERVER,
+        script_name=_find_script(),
+        log_filename="whisper-service.log",
+        log_dir=CACHE_DIR,
+        extra_env={
+            "API_AUTH_KEY": "",
+            "WHISPER_SERVER_DIR": str(WHISPER_SERVER),
+            "WHISPER_MODEL_DIR": str(WHISPER_MODEL_DIR),
+        },
+        extra_venv_dirs=[APP_DIR],
+        startup_timeout=10.0,
+        status_callback=lambda s, d: _set_service_status(s, d),
+    )
 
 
-def _ensure_whisper_server():
-    """Start the bundled/custom Whisper server in background when available.
+def _build_localization_manager() -> SidecarManager:
+    """Create a SidecarManager configured for the Localization Engine."""
+    return SidecarManager(
+        name="Localization Engine",
+        port=8766,
+        service_dir=LOCALIZATION_ENGINE_DIR,
+        script_name="main.py",
+        log_filename="localization-service.log",
+        log_dir=CACHE_DIR,
+        extra_venv_dirs=[APP_DIR],
+        startup_timeout=10.0,
+        status_callback=lambda s, d: _set_localization_status(s, d),
+    )
 
-    The desktop app should feel self-contained: online links can use the bundled
-    service automatically, while local files can still fall back to faster-whisper
-    when the service is absent.
-    """
-    _set_service_status("checking", "正在检查 127.0.0.1:8765 本地 Whisper 服务...")
+
+def _ensure_whisper_server() -> bool:
+    """Start the Whisper sidecar. Checks for device mismatch and restarts if needed."""
+    global _whisper_manager
+    if _whisper_manager is None:
+        _whisper_manager = _build_whisper_manager()
 
     expected_device = os.environ.get("DEVICE", "cpu")
 
-    if _is_local_server_ready():
-        current_device, _ = _get_server_device()
+    # If already running, check device match
+    info = _whisper_manager.get_server_info()
+    if info is not None:
+        current_device = info.get("device")
         if current_device and current_device != expected_device:
             _set_service_status(
                 "restarting",
                 f"服务设备({current_device})与设置({expected_device})不匹配，正在重启...",
             )
-            _kill_server_process()
+            _whisper_manager.shutdown()
             time.sleep(1)
         else:
             _set_service_status("already_running", "本地 Whisper 服务已经在运行。")
             return True
 
-    if not WHISPER_SERVER.exists():
-        _set_service_status("missing_dir", f"未找到 Whisper 服务目录: {WHISPER_SERVER}")
+    return _whisper_manager.ensure_running()
+
+
+def restart_whisper_server():
+    """Kill the running sidecar and start a fresh one with current env vars."""
+    global _whisper_manager
+    if _whisper_manager is None:
+        _whisper_manager = _build_whisper_manager()
+    return _whisper_manager.restart()
+
+
+def _ensure_localization_engine() -> bool:
+    """Start the Localization Engine sidecar if auto-start is enabled."""
+    global _localization_manager
+
+    settings = get_effective_settings()
+    auto_start = settings.get("localization_engine_auto_start", "true")
+    if auto_start.lower() not in ("true", "1", "yes", "on"):
+        _set_localization_status("disabled", "自动启动已关闭")
         return False
 
-    server_script = _find_server_script()
-    if not server_script:
-        _set_service_status("missing_entry", f"未找到服务入口 main.py/server.py: {WHISPER_SERVER}")
-        return False
+    if _localization_manager is None:
+        _localization_manager = _build_localization_manager()
 
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    python_exe = _find_server_python()
-
-    try:
-        env = os.environ.copy()
-        # Local sidecar is loopback-only by convention here. Disable the default
-        # FastAPI API key ("your-secret-key") so desktop requests do not fail 401.
-        env.setdefault("API_AUTH_KEY", "")
-        env.setdefault("WHISPER_SERVER_DIR", str(WHISPER_SERVER))
-        env.setdefault("WHISPER_MODEL_DIR", str(WHISPER_MODEL_DIR))
-
-        with SERVICE_LOG_PATH.open("a", encoding="utf-8", errors="replace") as log:
-            log.write("\n" + "=" * 80 + "\n")
-            log.write(time.strftime("%Y-%m-%d %H:%M:%S") + " 启动本地 Whisper 服务\n")
-            log.write(f"python: {python_exe}\n")
-            log.write(f"script: {server_script}\n")
-            log.write(f"cwd: {WHISPER_SERVER}\n")
-            log.flush()
-
-            popen_kwargs = {
-                "cwd": str(WHISPER_SERVER),
-                "stdout": log,
-                "stderr": subprocess.STDOUT,
-                "env": env,
-            }
-            if os.name == "nt":
-                popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-
-            subprocess.Popen([python_exe, str(server_script)], **popen_kwargs)
-
-        _set_service_status("starting", f"正在启动本地 Whisper 服务，日志: {SERVICE_LOG_PATH}")
-        for _ in range(20):
-            time.sleep(0.5)
-            if _is_local_server_ready():
-                _set_service_status("started", f"本地 Whisper 服务已启动，日志: {SERVICE_LOG_PATH}")
-                return True
-
-        _set_service_status("timeout", f"已尝试启动但 10 秒内未就绪，请查看日志: {SERVICE_LOG_PATH}")
-        return False
-    except Exception as exc:
-        _set_service_status("error", f"启动本地 Whisper 服务失败: {exc}；日志: {SERVICE_LOG_PATH}")
-        return False
+    return _localization_manager.ensure_running()
 
 
 def main():
@@ -244,6 +173,12 @@ def main():
 
     # Auto-start bundled/custom whisper server in background when present.
     _ensure_whisper_server()
+
+    # Auto-start localization engine (failure does not block the app).
+    try:
+        _ensure_localization_engine()
+    except Exception as exc:
+        _set_localization_status("error", f"启动失败: {exc}")
 
     window = MainWindow()
     window.show()

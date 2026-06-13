@@ -28,6 +28,7 @@ localization-engine/venv/
 localization-engine/temp/
 localization-engine/cache/
 localization-engine/models/
+localization-engine/data/
 
 # Qwen3-TTS Engine
 qwen3-tts-engine/.venv/
