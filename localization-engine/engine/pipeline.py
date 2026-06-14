@@ -362,7 +362,7 @@ class PipelineRunner:
             batch_pct = int((completed_batches / total) * 100)
             self._progress.update(
                 job_id, "translate", batch_pct,
-                f"翻译批次 {completed_batches + 1}/{total}",
+                f"正在请求翻译 API：批次 {completed_batches + 1}/{total}",
             )
 
             batch_req = batch_to_request(batch)
@@ -385,6 +385,10 @@ class PipelineRunner:
             checkpoints.mark_completed([s.index for s in batch])
             write_log(ws, f"  Batch {completed_batches + 1}/{total} translated ({len(batch)} segments)")
             completed_batches += 1
+            self._progress.update(
+                job_id, "translate", int((completed_batches / total) * 100),
+                f"已完成翻译批次 {completed_batches}/{total}",
+            )
 
         return True
 

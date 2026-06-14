@@ -16,6 +16,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 # Add localization-engine to path
 ENGINE_DIR = Path(__file__).resolve().parent.parent / "localization-engine"
@@ -419,6 +420,67 @@ class TestWorkspaceHelpers(unittest.TestCase):
         lines, truncated = read_log_tail(Path(self.tmpdir), max_lines=10)
         self.assertEqual(lines, [])
         self.assertFalse(truncated)
+
+
+# ---------------------------------------------------------------------------
+# Audio mix tests
+# ---------------------------------------------------------------------------
+
+class TestAudioMix(unittest.TestCase):
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_mix_audio_creates_output_directory(self):
+        from audio.mix import mix_audio
+
+        root = Path(self.tmpdir)
+        video = root / "source.mp4"
+        tts = root / "seg_0001.wav"
+        output = root / "rendered" / "dubbed.mp4"
+        video.write_bytes(b"video")
+        tts.write_bytes(b"wav")
+
+        def fake_run(*args, **kwargs):
+            output.write_bytes(b"mp4")
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = ""
+            result.stderr = ""
+            return result
+
+        with patch("audio.mix.subprocess.run", side_effect=fake_run):
+            result = mix_audio(video, [(tts, 0.0)], output)
+
+        self.assertTrue(result["success"])
+        self.assertTrue(output.parent.is_dir())
+        self.assertTrue(output.exists())
+
+    def test_mix_audio_returns_stderr_tail_on_failure(self):
+        from audio.mix import mix_audio
+
+        root = Path(self.tmpdir)
+        video = root / "source.mp4"
+        tts = root / "seg_0001.wav"
+        output = root / "rendered" / "dubbed.mp4"
+        video.write_bytes(b"video")
+        tts.write_bytes(b"wav")
+
+        fake_result = MagicMock()
+        fake_result.returncode = 1
+        fake_result.stdout = ""
+        fake_result.stderr = "ffmpeg version banner\n" + ("x" * 1400) + "\nreal error"
+
+        with patch("audio.mix.subprocess.run", return_value=fake_result):
+            result = mix_audio(video, [(tts, 0.0)], output)
+
+        self.assertFalse(result["success"])
+        self.assertIn("real error", result["error"])
+        self.assertNotIn("ffmpeg version banner", result["error"])
 
 
 if __name__ == "__main__":

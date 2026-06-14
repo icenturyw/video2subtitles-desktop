@@ -36,17 +36,17 @@ def compile_sources() -> bool:
             py_compile.compile(str(path), doraise=True)
         except py_compile.PyCompileError as exc:
             ok = False
-            print(f"❌ 语法检查失败: {path.relative_to(ROOT)}")
+            print(f"[FAIL] 语法检查失败: {path.relative_to(ROOT)}")
             print(exc)
     if ok:
-        print("✅ Python 语法检查通过")
+        print("[OK] Python 语法检查通过")
     return ok
 
 
 def run_tests() -> bool:
     tests_dir = ROOT / "tests"
     if not tests_dir.exists():
-        print("ℹ️ 未找到 tests/ 目录，跳过单元测试")
+        print("[INFO] 未找到 tests/ 目录，跳过单元测试")
         return True
     print("正在运行基础单元测试...")
     suite = unittest.defaultTestLoader.discover(str(tests_dir))
@@ -59,9 +59,9 @@ def main() -> int:
     compile_ok = compile_sources()
     tests_ok = run_tests()
     if compile_ok and tests_ok:
-        print("✅ 项目轻量检查通过")
+        print("[OK] 项目轻量检查通过")
         return 0
-    print("❌ 项目轻量检查失败")
+    print("[FAIL] 项目轻量检查失败")
     return 1
 
 

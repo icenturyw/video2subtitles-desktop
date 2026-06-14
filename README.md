@@ -41,8 +41,10 @@
 - **多格式导出** — 导出 SRT、VTT、TXT 字幕格式
 - **ChatGPT 分析包** — 右侧字幕预览区和右键菜单都可生成含代理视频、关键帧和字幕的上传包；生成过程中会显示持续进度浮层，完成/失败后弹窗提醒，并支持打开包目录或复制路径/错误信息
 - **字幕翻译** — 集成本地化引擎，支持 OpenAI 兼容 API 批量翻译字幕，术语表注入，断点续翻
+- **翻译配置持久化** — 本地化设置中的 API 地址、模型和 Key 会保存到 `.cache/settings.json`，点击 OK 后同步刷新当前进程和本地化引擎运行时配置
 - **双语+样式字幕** — 支持原文、译文、双语 ASS/SSA 字幕，可自定义字体、大小、轮廓、阴影和边距
 - **硬字幕烧录** — 通过 FFmpeg 将字幕直接烧录到视频画面，支持质量预设（快速/平衡/高质量）
+- **配音音色与试听** — 配音模式支持 Edge-TTS 与本地 Qwen3-TTS，目标语言变化时自动刷新音色列表，并可生成试听音频
 - **深色主题** — 现代化暗色 UI 界面
 
 ---
@@ -85,6 +87,17 @@ python -m unittest discover -s tests
 ---
 
 ## 维护记录 / Maintenance Notes
+
+### 2026-06 — 本地化、翻译 API 与 Qwen3-TTS 增强
+
+- **TTS 音色选择与试听**：本地化设置的配音模式新增音色下拉、刷新和试听按钮；Edge-TTS 会按目标语言过滤音色，Qwen3-TTS 会优先读取本地 sidecar `/voices`，服务未启动时回退到预设音色。
+- **Qwen3-TTS sidecar**：新增 `qwen3-tts-engine/` 和 `ui/qwen_tts_setup_dialog.py`，支持本地 Qwen3-TTS 服务状态检测、模型加载、语音合成能力探测，以及与本地化引擎的 TTS provider 对接。
+- **翻译设置保存修复**：`LocalizationDialog` 点击 OK 后会保存 `translation_base_url`、`translation_model`、`translation_api_key`，并调用 `apply_settings_to_env(..., overwrite=True)` 覆盖旧 `V2S_TRANSLATION_*` 运行时变量，避免旧环境变量反向覆盖新设置。
+- **翻译 Key 热更新**：本地化引擎新增 `/config/translation-api-key`，新任务也会把当前 Key 传给引擎但不会写入任务记录，避免重启前后继续使用旧 Key。
+- **OpenAI 兼容响应增强**：翻译客户端兼容 NewAPI 风格的 `data.choices` 响应；401/403/404/400 会保留服务端 JSON 错误详情，不可恢复错误不再重复重试，日志会继续脱敏 API Key。
+- **YouTube cookies 与下载错误提示**：Whisper 服务会检查 `whisper-server/cookies.txt` 是否包含真实 YouTube/Google cookies，并在登录、过期、格式不可用时给出更明确的中文提示。
+- **FFmpeg 配音合成修复**：配音合成统一使用 `localization_workspace/rendered/` 输出目录，自动创建父目录，并在 FFmpeg 失败时返回 stderr 尾部，便于复制错误日志定位问题。
+- **验证覆盖**：新增/更新 `tests/test_qwen3_tts.py`、`tests/test_translation_parser.py`、`tests/test_localization_language_codes.py`、`tests/test_youtube_captions.py` 和 `tests/test_localization_engine.py`，覆盖音色、翻译响应解析、YouTube cookies 和音频合成错误路径。
 
 ### 2026-06 — Phase 3：字幕翻译与烧录 MVP
 
@@ -343,6 +356,8 @@ python app.py
 2. **开始处理** — 点击「开始处理」下载/保存视频并进行字幕转录
 3. **预览字幕** — 点击已完成的任务查看字幕内容
 4. **翻译字幕（可选）** — 点击「🌐 本地化」打开翻译设置，选择目标语言和翻译服务（OpenAI 兼容 API），点击确定后再次处理时会自动翻译字幕并将翻译烧录到视频
+   - 配音模式可选择 `edge-tts` 或 `qwen3-tts`，选择目标语言后会刷新可用音色，点击「试听」可快速验证当前音色。
+   - OpenAI 兼容 API 地址请使用真实接口根路径，例如 `https://example.com/v1`；`/chat/completions` 会由程序自动拼接。
 5. **失败排查** — 如果任务失败，选中失败任务查看完整错误日志，或点击「复制错误日志」发给开发者定位
 6. **导出/打包** — 右键导出 SRT/VTT/TXT，或在右侧字幕预览区点击「生成 ChatGPT 包」；打包期间会显示进度浮层，完成后可打开包目录或复制路径
 7. **历史管理** — 点击「历史记录」重新打开输出、加回任务列表或重新生成 ChatGPT 包
@@ -367,6 +382,26 @@ python app.py
 1. `yt-dlp` 命令（PATH 中查找）
 2. 用户 Python Scripts 目录下的 `yt-dlp.exe`
 3. `python -m yt_dlp`（模块方式运行）
+
+### 翻译 API 认证或模型不可用 / Translation API Auth or Model Errors
+
+本地化引擎使用 OpenAI 兼容的 `/chat/completions` 接口。若翻译失败，请优先检查：
+
+1. API 地址应指向真实接口根路径，例如 `https://example.com/v1`，不要填写文档站地址或网页控制台地址。
+2. 点击本地化设置 OK 后，API 地址、模型和 Key 会保存并热更新到本地化引擎；如果引擎进程很旧，重启应用可强制加载最新代码。
+3. `401/403` 通常表示 Key 无效、过期、额度不足或分组权限不匹配。
+4. `404 当前 API 不支持所选模型` 表示 Key 可以访问服务，但该网关的 chat 通道不支持当前模型；即使 `/models` 能列出模型，也不代表 `/chat/completions` 一定可调用。
+5. `5xx` 或空响应通常是上游通道暂时不可用，建议在网关后台切换可用渠道或更换模型后重试。
+
+### YouTube 需要登录 / YouTube Login Required
+
+如果 YouTube 下载提示需要登录，请在浏览器中登录 YouTube 后导出 Netscape 格式 cookies，并放到：
+
+```text
+whisper-server/cookies.txt
+```
+
+`whisper-server/cookie_backups/` 和 cookies 文件不会提交到仓库。替换 cookies 后重新处理任务即可。
 
 ### pythonw 未找到 / pythonw Not Found
 
@@ -408,12 +443,16 @@ video_2_subtitles/
 │   ├── subtitles/      # 字幕读写、标准化、验证 / Subtitle I/O & validation
 │   ├── translation/    # 翻译提供者、批处理、术语表 / Translation providers
 │   └── rendering/      # FFmpeg 滤镜和编码预设 / FFmpeg filters & presets
+├── qwen3-tts-engine/   # 本地 Qwen3-TTS sidecar / Local Qwen3-TTS sidecar
+│   ├── main.py         # FastAPI sidecar (port 8767)
+│   └── engine/         # 模型管理、音色、合成 / Model manager & synthesis
 ├── localization_client.py # 本地化引擎 HTTP 客户端 / Localization API client
 ├── services/
 │   ├── ffmpeg_service.py  # FFmpeg 渲染（烧录/软字幕）/ Rendering service
 │   └── sidecar_manager.py  # Sidecar 进程管理 / Sidecar process manager
 ├── ui/
 │   ├── localization_dialog.py   # 本地化设置对话框 / Localization settings dialog
+│   ├── qwen_tts_setup_dialog.py # Qwen3-TTS 管理对话框 / Qwen3-TTS setup dialog
 │   └── subtitle_style_dialog.py # 字幕样式编辑器 / Subtitle style editor
 ├── models/             # 默认模型目录 / Default model directory
 ├── .cache/             # 本地设置、服务日志和辅助脚本缓存 / Local cache

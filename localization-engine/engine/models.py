@@ -16,6 +16,12 @@ class TranslationRequest(BaseModel):
     base_url: str = ""
     model: str = ""
     api_key_env: str = "V2S_TRANSLATION_API_KEY"
+    api_key: str = ""
+
+
+class TranslationApiKeyRequest(BaseModel):
+    """Runtime translation API key update."""
+    api_key: str = ""
 
 
 class StyleRequest(BaseModel):

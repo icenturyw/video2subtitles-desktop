@@ -33,6 +33,7 @@ from engine.models import (
     HealthResponse,
     LogResponse,
     RetryRequest,
+    TranslationApiKeyRequest,
     TaskResultResponse,
 )
 from engine.pipeline import start_pipeline
@@ -133,6 +134,17 @@ def health():
     except Exception:
         pass
 
+    # Check for qwen3-tts sidecar
+    try:
+        import urllib.request
+        with urllib.request.urlopen(
+            "http://127.0.0.1:8767/health", timeout=1.5
+        ) as resp:
+            if resp.status == 200:
+                capabilities["tts"].append("qwen3-tts")
+    except Exception:
+        pass
+
     return HealthResponse(
         status="ok",
         service="video2subtitles-localization-engine",
@@ -140,6 +152,17 @@ def health():
         capabilities=capabilities,
         ffmpeg=ffmpeg_available,
     )
+
+
+@app.post("/config/translation-api-key")
+def update_translation_api_key(req: TranslationApiKeyRequest):
+    """Update the in-process translation API key without restarting the engine."""
+    key = (req.api_key or "").strip()
+    if key:
+        os.environ["V2S_TRANSLATION_API_KEY"] = key
+    else:
+        os.environ.pop("V2S_TRANSLATION_API_KEY", None)
+    return {"status": "ok", "translation": bool(key)}
 
 
 @app.post("/jobs", response_model=TaskResultResponse)
@@ -175,7 +198,10 @@ def create_job(req: CreateJobRequest):
         "tts_voice": req.tts_voice,
     }
     if req.translation:
-        request_payload["translation"] = req.translation.model_dump()
+        if req.translation.api_key:
+            key_env = req.translation.api_key_env or "V2S_TRANSLATION_API_KEY"
+            os.environ[key_env] = req.translation.api_key
+        request_payload["translation"] = req.translation.model_dump(exclude={"api_key"})
     if req.style:
         request_payload["style"] = req.style.model_dump()
 

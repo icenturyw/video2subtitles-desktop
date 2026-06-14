@@ -34,6 +34,13 @@ def parse_translation_response(response_text: str,
         else:
             return [], [f"Invalid JSON response: {cleaned[:200]}"]
 
+    if isinstance(data, dict):
+        for key in ("translations", "items", "segments", "result", "data"):
+            value = data.get(key)
+            if isinstance(value, list):
+                data = value
+                break
+
     if not isinstance(data, list):
         return [], [f"Expected JSON array, got {type(data).__name__}"]
 

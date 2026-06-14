@@ -6,6 +6,7 @@ import sys
 import os
 import time
 from pathlib import Path
+from typing import Optional
 
 from client_settings import apply_saved_settings_to_env, get_effective_settings
 
@@ -47,6 +48,7 @@ from services.sidecar_manager import SidecarManager
 
 _whisper_manager: SidecarManager | None = None
 _localization_manager: SidecarManager | None = None
+_qwen3_tts_manager: SidecarManager | None = None
 
 
 def _set_service_status(status, detail=""):
@@ -61,6 +63,13 @@ def _set_localization_status(status, detail=""):
     os.environ["V2S_LOCALIZATION_STATUS"] = status
     os.environ["V2S_LOCALIZATION_DETAIL"] = detail
     os.environ["V2S_LOCALIZATION_LOG"] = str(CACHE_DIR / "localization-service.log")
+
+
+def _set_qwen3_tts_status(status, detail=""):
+    """Expose Qwen3-TTS service status to the UI process."""
+    os.environ["V2S_QWEN3_TTS_STATUS"] = status
+    os.environ["V2S_QWEN3_TTS_DETAIL"] = detail
+    os.environ["V2S_QWEN3_TTS_LOG"] = str(CACHE_DIR / "qwen3-tts-service.log")
 
 
 def _build_whisper_manager() -> SidecarManager:
@@ -102,6 +111,22 @@ def _build_localization_manager() -> SidecarManager:
         extra_venv_dirs=[APP_DIR],
         startup_timeout=10.0,
         status_callback=lambda s, d: _set_localization_status(s, d),
+    )
+
+
+def _build_qwen3_tts_manager() -> SidecarManager:
+    """Create a SidecarManager configured for the Qwen3-TTS service."""
+    QWEN3_TTS_DIR = APP_DIR / "qwen3-tts-engine"
+    return SidecarManager(
+        name="Qwen3-TTS",
+        port=8767,
+        service_dir=QWEN3_TTS_DIR,
+        script_name="main.py",
+        log_filename="qwen3-tts-service.log",
+        log_dir=CACHE_DIR,
+        extra_venv_dirs=[APP_DIR],
+        startup_timeout=30.0,  # model loading can be slow
+        status_callback=lambda s, d: _set_qwen3_tts_status(s, d),
     )
 
 
@@ -153,6 +178,25 @@ def _ensure_localization_engine() -> bool:
         _localization_manager = _build_localization_manager()
 
     return _localization_manager.ensure_running()
+
+
+def ensure_qwen3_tts_engine() -> bool:
+    """Start the Qwen3-TTS sidecar. Returns True if healthy."""
+    global _qwen3_tts_manager
+    if _qwen3_tts_manager is None:
+        _qwen3_tts_manager = _build_qwen3_tts_manager()
+    return _qwen3_tts_manager.ensure_running()
+
+
+def shutdown_qwen3_tts_engine():
+    """Shut down the Qwen3-TTS sidecar."""
+    global _qwen3_tts_manager
+    if _qwen3_tts_manager is not None:
+        _qwen3_tts_manager.shutdown()
+
+
+def get_qwen3_tts_manager() -> Optional[SidecarManager]:
+    return _qwen3_tts_manager
 
 
 def main():

@@ -33,6 +33,8 @@ PROJECT_DIR = SERVER_DIR.parent
 TEMP_DIR = SERVER_DIR / "temp"
 CACHE_DIR = SERVER_DIR / "cache"
 RAW_DIR = SERVER_DIR / "raw"
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
 for directory in (TEMP_DIR, CACHE_DIR, RAW_DIR):
     directory.mkdir(parents=True, exist_ok=True)
 
@@ -115,7 +117,18 @@ def _video_format_selector(quality: str) -> str:
     return "bv*+ba/b[ext=mp4]/best"
 
 
-def _task_id_from_url(url: str) -> str:
+def _clean_language(value: Optional[str]) -> str:
+    text = str(value or "auto").strip()
+    if not text:
+        return "auto"
+    if "(" in text:
+        text = text.split("(", 1)[0].strip()
+    return text or "auto"
+
+
+def _task_id_from_url(url: str, language: str = "auto") -> str:
+    lang = _clean_language(language)
+    suffix = "" if lang == "auto" else f"_{_safe_name(lang)}"
     patterns = [
         r"(?:v=|/videos/|embed/|youtu\.be/|/v/|/e/|watch\?v=|&v=)([^#&\n/?]+)",
         r"bilibili\.com/video/([^/?#]+)",
@@ -123,8 +136,9 @@ def _task_id_from_url(url: str) -> str:
     for pattern in patterns:
         match = re.search(pattern, url)
         if match:
-            return re.sub(r"[^A-Za-z0-9_.-]", "_", match.group(1))[:80]
-    return hashlib.md5(url.encode("utf-8")).hexdigest()[:16]
+            base = re.sub(r"[^A-Za-z0-9_.-]", "_", match.group(1))[:72]
+            return f"{base}{suffix}"[:80]
+    return f"{hashlib.md5(url.encode('utf-8')).hexdigest()[:16]}{suffix}"[:80]
 
 
 def _client_video_id_from_url(url: str) -> str:
@@ -173,9 +187,36 @@ def _detect_system_proxy() -> str:
     return http_proxy
 
 
+def _youtube_cookie_file() -> Path:
+    configured = os.environ.get("V2S_YOUTUBE_COOKIES", "").strip()
+    return Path(configured).expanduser() if configured else SERVER_DIR / "cookies.txt"
+
+
+def _has_youtube_cookies(cookie_file: Optional[Path] = None) -> bool:
+    path = cookie_file or _youtube_cookie_file()
+    if not path.exists() or path.stat().st_size <= 0:
+        return False
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return False
+    return bool(re.search(r"(^|\n)\.?(youtube|google)\.com\t", text, re.I))
+
+
 def _classify_ytdlp_error(stderr: str) -> str:
     if "LOGIN_REQUIRED" in stderr or "Sign in to confirm" in stderr or "Sign in" in stderr:
-        return "需要登录 YouTube。请更新 cookies.txt（在浏览器中登录 YouTube 后用插件导出 Netscape 格式的 cookies）"
+        cookie_file = _youtube_cookie_file()
+        if cookie_file.exists() and cookie_file.stat().st_size > 0:
+            if _has_youtube_cookies(cookie_file):
+                return (
+                    "YouTube 拒绝了当前 cookies.txt（可能已过期、未包含可用登录态或账号触发风控）。"
+                    "请重新从已登录 YouTube 的浏览器导出 Netscape 格式 cookies。"
+                )
+            return (
+                "当前 cookies.txt 不包含 YouTube/Google 登录 cookies。"
+                "请在浏览器中登录 YouTube 后重新导出 Netscape 格式 cookies。"
+            )
+        return "需要登录 YouTube。请在浏览器中登录 YouTube 后导出 Netscape 格式 cookies.txt"
     if "Video unavailable" in stderr:
         return "视频不可用（可能已删除、私密或地区限制）"
     if "Private video" in stderr:
@@ -193,8 +234,8 @@ def _classify_ytdlp_error(stderr: str) -> str:
 
 def _extra_ytdlp_args() -> list[str]:
     """Common yt-dlp arguments to handle YouTube anti-bot measures."""
-    cookie_file = SERVER_DIR / "cookies.txt"
-    has_cookies = cookie_file.exists() and cookie_file.stat().st_size > 0
+    cookie_file = _youtube_cookie_file()
+    has_cookies = _has_youtube_cookies(cookie_file)
     player_client = "default" if has_cookies else "android,tv"
     args = [
         "--extractor-args", f"youtube:player_client={player_client}",
@@ -264,6 +305,158 @@ def _run_ytdlp(cmd: list[str]) -> None:
     except FileNotFoundError:
         cmd = [sys.executable, "-m", "yt_dlp", *cmd[1:]]
         subprocess.run(cmd, **run_kwargs)
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or str(exc))[-1600:].strip()
+        sys.stderr.write(f"[yt-dlp] command failed: {' '.join(cmd[:8])}...\n")
+        sys.stderr.write(f"[yt-dlp] stderr tail:\n{detail}\n")
+        raise
+
+
+def _is_youtube_url(url: str) -> bool:
+    return bool(re.search(r"(youtube\.com|youtu\.be|youtube-nocookie\.com)", url or "", re.I))
+
+
+def _caption_language_candidates(language: str) -> list[str]:
+    lang = _clean_language(language).lower()
+    if lang in {"auto", ""}:
+        return []
+    if lang in {"zh", "zh-cn", "zh-hans", "chinese"}:
+        return ["zh-Hans", "zh-CN", "zh", "zh-Hant"]
+    if lang in {"zh-tw", "zh-hk", "zh-hant"}:
+        return ["zh-Hant", "zh-TW", "zh", "zh-Hans"]
+    base = lang.split("-", 1)[0]
+    return [language, lang, base]
+
+
+def _youtube_info_options() -> dict[str, Any]:
+    opts: dict[str, Any] = {
+        "quiet": True,
+        "skip_download": True,
+        "no_warnings": True,
+    }
+    proxy = _detect_system_proxy()
+    if proxy:
+        opts["proxy"] = proxy
+    cookie_file = _youtube_cookie_file()
+    if _has_youtube_cookies(cookie_file):
+        opts["cookiefile"] = str(cookie_file)
+    return opts
+
+
+def _select_caption_track(info: dict[str, Any], language: str) -> tuple[Optional[dict[str, Any]], str]:
+    candidates = _caption_language_candidates(language)
+    if not candidates:
+        return None, ""
+    for bucket_name in ("subtitles", "automatic_captions"):
+        bucket = info.get(bucket_name) or {}
+        for lang in candidates:
+            tracks = bucket.get(lang)
+            if not tracks:
+                continue
+            for ext in ("json3", "vtt"):
+                for track in tracks:
+                    if track.get("ext") == ext and track.get("url"):
+                        return track, lang
+            for track in tracks:
+                if track.get("url"):
+                    return track, lang
+    return None, ""
+
+
+def _parse_youtube_json3(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    subtitles: list[dict[str, Any]] = []
+    for event in payload.get("events") or []:
+        if "tStartMs" not in event:
+            continue
+        text = "".join(
+            str(seg.get("utf8", ""))
+            for seg in event.get("segs") or []
+        ).replace("\n", " ").strip()
+        if not text:
+            continue
+        start = float(event.get("tStartMs") or 0) / 1000.0
+        duration = float(event.get("dDurationMs") or 0) / 1000.0
+        end = start + max(duration, 0.1)
+        subtitles.append({
+            "start": round(start, 2),
+            "end": round(end + 0.1, 2),
+            "text": text,
+        })
+    return subtitles
+
+
+def _parse_youtube_vtt(text: str) -> list[dict[str, Any]]:
+    subtitles: list[dict[str, Any]] = []
+    blocks = re.split(r"\n\s*\n", text or "")
+    time_re = re.compile(
+        r"(?:(\d+):)?(\d+):(\d+)\.(\d+)\s+-->\s+(?:(\d+):)?(\d+):(\d+)\.(\d+)"
+    )
+
+    def to_seconds(match: re.Match[str], offset: int) -> float:
+        hours = int(match.group(offset) or 0)
+        minutes = int(match.group(offset + 1))
+        seconds = int(match.group(offset + 2))
+        millis = int(match.group(offset + 3).ljust(3, "0")[:3])
+        return hours * 3600 + minutes * 60 + seconds + millis / 1000
+
+    for block in blocks:
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        if not lines or lines[0].startswith("WEBVTT"):
+            continue
+        time_index = next((i for i, line in enumerate(lines) if "-->" in line), -1)
+        if time_index < 0:
+            continue
+        match = time_re.search(lines[time_index])
+        if not match:
+            continue
+        text_lines = [
+            re.sub(r"<[^>]+>", "", line)
+            for line in lines[time_index + 1:]
+        ]
+        caption = " ".join(line for line in text_lines if line).strip()
+        if not caption:
+            continue
+        subtitles.append({
+            "start": round(to_seconds(match, 1), 2),
+            "end": round(to_seconds(match, 5) + 0.1, 2),
+            "text": caption,
+        })
+    return subtitles
+
+
+def _fetch_youtube_captions(video_url: str, language: str, task_id: str) -> tuple[list[dict[str, Any]], str]:
+    if not _is_youtube_url(video_url):
+        return [], ""
+    import urllib.request
+    import yt_dlp
+
+    _update_task(task_id, "downloading", 6, "正在检查 YouTube 字幕...")
+    with yt_dlp.YoutubeDL(_youtube_info_options()) as ydl:
+        info = ydl.extract_info(video_url, download=False)
+    track, caption_lang = _select_caption_track(info, language)
+    if not track:
+        return [], ""
+
+    _update_task(task_id, "downloading", 10, f"正在下载 YouTube 字幕 ({caption_lang})...")
+    req = urllib.request.Request(
+        track["url"],
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+            ),
+            "Referer": video_url,
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        raw = resp.read().decode("utf-8", errors="replace")
+
+    if track.get("ext") == "json3":
+        subtitles = _parse_youtube_json3(json.loads(raw))
+    else:
+        subtitles = _parse_youtube_vtt(raw)
+    return subtitles, caption_lang if subtitles else ""
 
 
 def _download_audio(video_url: str, task_id: str) -> Path:
@@ -502,6 +695,7 @@ def _process_task(
     keep_video: bool = True,
 ) -> None:
     try:
+        language = _clean_language(language)
         download_mode = _clean_download_mode(download_mode)
         download_quality = _clean_download_quality(download_quality)
         cached = _load_cache(task_id)
@@ -539,7 +733,21 @@ def _process_task(
                 f"不支持的文件格式 '{media_path.suffix}'，仅支持音视频文件: {', '.join(sorted(MEDIA_EXTS))}"
             )
 
-        subtitles, detected_lang = _transcribe_file(media_path, task_id, language)
+        subtitles: list[dict[str, Any]] = []
+        detected_lang = ""
+        caption_error: Optional[Exception] = None
+        if video_url:
+            try:
+                subtitles, detected_lang = _fetch_youtube_captions(video_url, language, task_id)
+            except Exception as exc:
+                caption_error = exc
+                subtitles, detected_lang = [], ""
+        if not subtitles:
+            if caption_error is not None and _caption_language_candidates(language):
+                raise RuntimeError(
+                    f"YouTube {language} 字幕下载失败，未回退为其他语言字幕: {caption_error}"
+                ) from caption_error
+            subtitles, detected_lang = _transcribe_file(media_path, task_id, language)
         if not subtitles:
             raise RuntimeError("未识别到有效语音内容")
 
@@ -612,7 +820,8 @@ def health():
 def transcribe(request: TranscribeRequest, auth: str = Depends(verify_api_key)):
     if not request.video_url:
         raise HTTPException(status_code=400, detail="video_url is required")
-    task_id = _task_id_from_url(request.video_url)
+    language = _clean_language(request.language)
+    task_id = _task_id_from_url(request.video_url, language)
     existing = _get_task(task_id)
     if existing and existing.get("status") in {"pending", "downloading", "transcribing", "completed"}:
         return existing
@@ -629,7 +838,7 @@ def transcribe(request: TranscribeRequest, auth: str = Depends(verify_api_key)):
         download_mode=download_mode,
         download_quality=download_quality,
     )
-    _start_background(task_id, None, request.video_url, request.language, download_mode, download_quality, keep_video)
+    _start_background(task_id, None, request.video_url, language, download_mode, download_quality, keep_video)
     return {"task_id": task_id, "status": "pending"}
 
 

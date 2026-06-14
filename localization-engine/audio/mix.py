@@ -70,6 +70,8 @@ def mix_audio(
     if not tts_segments:
         return {"success": False, "error": "no TTS segments"}
 
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
     # Build filter graph
     input_files = [str(video_path)]
     filter_parts = []
@@ -110,7 +112,7 @@ def mix_audio(
                 f.write(f"[mix] stderr: {result.stderr[-500:]}\n")
 
         if result.returncode != 0:
-            return {"success": False, "error": result.stderr[:500]}
+            return {"success": False, "error": result.stderr[-1200:].strip()}
 
         if not output_path.exists():
             return {"success": False, "error": "output file not created"}

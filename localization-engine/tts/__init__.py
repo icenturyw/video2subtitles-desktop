@@ -5,6 +5,7 @@ from typing import Optional
 
 from tts.base import TTSProvider, TTSCache, TTSResult
 from tts.edge_tts import EdgeTTSProvider
+from tts.qwen3_tts import Qwen3TTSProvider
 
 _PROVIDER_CACHE: dict = {}
 _DEFAULT_EDGE_CACHE: Optional[TTSCache] = None
@@ -31,11 +32,25 @@ def get_provider(name: str = "edge-tts",
 
     if name == "edge-tts":
         provider = EdgeTTSProvider(cache=_get_edge_cache(cache_dir))
+    elif name in ("qwen3-tts", "qwen3_tts", "qwen3"):
+        from tts.qwen3_tts import Qwen3TTSProvider
+        provider = Qwen3TTSProvider(cache=_get_edge_cache(cache_dir))
     else:
         raise ValueError(f"Unknown TTS provider: {name}")
 
     _PROVIDER_CACHE[key] = provider
     return provider
+
+
+def _check_qwen3_healthy() -> bool:
+    try:
+        import urllib.request
+        with urllib.request.urlopen(
+            "http://127.0.0.1:8767/health", timeout=2
+        ) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
 
 
 def list_available_providers() -> list[dict]:
@@ -45,4 +60,18 @@ def list_available_providers() -> list[dict]:
         providers.append({"name": "edge-tts", "available": True})
     except ImportError:
         providers.append({"name": "edge-tts", "available": False})
+    qwen3_ok = _check_qwen3_healthy()
+    try:
+        import qwen_tts
+        providers.append({
+            "name": "qwen3-tts",
+            "available": qwen3_ok,
+            "service_running": qwen3_ok,
+        })
+    except ImportError:
+        providers.append({
+            "name": "qwen3-tts",
+            "available": False,
+            "service_running": False,
+        })
     return providers

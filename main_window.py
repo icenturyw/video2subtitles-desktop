@@ -30,7 +30,8 @@ from local_whisper import LocalWhisperTranscriber, WHISPER_SERVER
 from history import HistoryManager
 from subtitle_utils import format_subtitle_time, sanitize_filename
 from localization_client import LocalizationClient
-from ui.localization_dialog import LocalizationDialog
+from client_settings import get_effective_settings
+from ui.localization_dialog import LocalizationDialog, localization_runtime_config
 
 
 THEME = {
@@ -1133,7 +1134,7 @@ class LocalizationWorker(QThread):
             self.progress_updated.emit(self.file_path, 0, "准备本地化工作空间...", "processing")
 
             workspace = self.srt_path.parent / "localization_workspace"
-            for d in ["source", "subtitles", "translation", "render", "audio", "audio/tts", "checkpoints", "logs", "temp"]:
+            for d in ["source", "subtitles", "translation", "rendered", "audio", "audio/tts", "checkpoints", "logs", "temp"]:
                 (workspace / d).mkdir(parents=True, exist_ok=True)
 
             import shutil
@@ -1233,6 +1234,7 @@ class MainWindow(QMainWindow):
         self.output_dir = Path(WHISPER_SERVER) / "output" if WHISPER_SERVER.exists() else Path.cwd() / "output"
         self.history = HistoryManager(self.output_dir / "history.json")
         self._setup_ui()
+        self._refresh_localization_config_from_settings()
         self._check_server()
 
     def _setup_ui(self):
@@ -1573,6 +1575,7 @@ class MainWindow(QMainWindow):
     def _start_processing(self, specific_files=None):
         try:
             self._stopped = False
+            self._refresh_localization_config_from_settings()
             if specific_files is None:
                 pending = [(p, d.get("is_url", False)) for p, d in self.video_items.items()
                            if d["widget"].status in ("pending", "error")]
@@ -1600,7 +1603,11 @@ class MainWindow(QMainWindow):
             self.add_files_btn.setEnabled(False)
             self.add_folder_btn.setEnabled(False)
 
-            self.worker = WorkerThread(items, language="auto", service="local")
+            language = "auto"
+            if hasattr(self, "lang_combo"):
+                language_text = self.lang_combo.currentText().strip()
+                language = language_text.split("(", 1)[0].strip() or "auto"
+            self.worker = WorkerThread(items, language=language, service="local")
             self.worker.progress_updated.connect(self._on_progress)
             self.worker.task_completed.connect(self._on_completed)
             self.worker.task_error.connect(self._on_error)
@@ -2321,13 +2328,38 @@ class MainWindow(QMainWindow):
             else:
                 self.status_label.setText("字幕模式（不翻译）")
 
+    def _refresh_localization_config_from_settings(self):
+        try:
+            self._localization_config = localization_runtime_config(get_effective_settings())
+        except Exception as exc:
+            print(f"load localization config failed: {exc}")
+            self._localization_config = None
+
     def _start_localization(self, file_path, srt_path):
         is_url = self.video_items.get(file_path, {}).get("is_url", False)
         if is_url:
-            self.video_items[file_path]["widget"].update_status(
-                "completed", 100, "翻译暂不支持 URL 视频"
+            srt_path_obj = Path(srt_path)
+            video_file = None
+            for ext in ['.mp4', '.mkv', '.webm']:
+                candidate = srt_path_obj.with_suffix(ext)
+                if candidate.exists():
+                    video_file = candidate
+                    break
+            if not video_file:
+                self.video_items[file_path]["widget"].update_status(
+                    "completed", 100, "翻译暂不支持 URL 视频（找不到视频文件）"
+                )
+                self._update_progress()
+                return
+            worker = LocalizationWorker(
+                file_path, srt_path, str(video_file),
+                self._localization_config, self.output_dir,
             )
-            self._update_progress()
+            worker.progress_updated.connect(self._on_localization_progress)
+            worker.task_completed.connect(self._on_localization_completed)
+            worker.task_error.connect(self._on_localization_error)
+            self._localization_worker = worker
+            worker.start()
             return
         if not Path(file_path).exists():
             self.video_items[file_path]["widget"].update_status("error", 0, "源视频文件不存在")

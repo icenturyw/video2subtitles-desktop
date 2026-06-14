@@ -1,17 +1,24 @@
 """Localization settings dialog for translation and rendering configuration."""
 from __future__ import annotations
 
+import asyncio
+import json
 import os
+import tempfile
+import threading
+import urllib.request
 from pathlib import Path
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer, QUrl, pyqtSignal
+from PyQt5.QtGui import QDesktopServices
 from PyQt5.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
-    QGroupBox, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSpinBox,
-    QVBoxLayout,
+    QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton,
+    QSpinBox, QRadioButton, QVBoxLayout, QWidget,
 )
+from PyQt5.QtWidgets import QButtonGroup
 
-from client_settings import get_effective_settings, save_settings
+from client_settings import apply_settings_to_env, get_effective_settings, save_settings
 from job_models import SubtitleStyle, TranslationConfig
 
 try:
@@ -57,12 +64,131 @@ QLineEdit, QSpinBox, QComboBox {{
     color: {_THEME["text_primary"]};
     font-size: 12px;
 }}
-QCheckBox {{ color: {_THEME["text_primary"]}; spacing: 6px; }}
+QCheckBox, QRadioButton {{ color: {_THEME["text_primary"]}; spacing: 6px; }}
 """
+
+_EDGE_DEFAULT_VOICES = {
+    "zh": "zh-CN-XiaoxiaoNeural",
+    "zh-cn": "zh-CN-XiaoxiaoNeural",
+    "zh-tw": "zh-TW-HsiaoChenNeural",
+    "en": "en-US-JennyNeural",
+    "ja": "ja-JP-NanamiNeural",
+    "ko": "ko-KR-SunHiNeural",
+    "fr": "fr-FR-DeniseNeural",
+    "de": "de-DE-KatjaNeural",
+    "es": "es-ES-ElviraNeural",
+}
+
+_QWEN_DEFAULT_VOICES = [
+    "Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric",
+    "Ryan", "Aiden", "Ono_Anna", "Sohee",
+]
+
+_PREVIEW_TEXTS = {
+    "zh": "你好，这是当前配音音色的试听。",
+    "en": "Hello, this is a preview of the selected dubbing voice.",
+    "ja": "こんにちは。これは選択した音声のプレビューです。",
+    "ko": "안녕하세요. 선택한 음색의 미리 듣기입니다.",
+    "fr": "Bonjour, voici un aperçu de la voix sélectionnée.",
+    "de": "Hallo, dies ist eine Vorschau der ausgewählten Stimme.",
+    "es": "Hola, esta es una vista previa de la voz seleccionada.",
+}
+
+
+def _language_code(text: str, default: str) -> str:
+    """Return the language code prefix from combo text like 'zh-CN (简体中文)'."""
+    code = str(text or "").split("(", 1)[0].strip()
+    return code or default
+
+
+def _provider_key(text: str) -> str:
+    return "qwen3-tts" if "qwen3-tts" in str(text or "") else "edge-tts"
+
+
+def _language_base(language: str) -> str:
+    return str(language or "").strip().lower().split("-", 1)[0] or "zh"
+
+
+def _default_tts_voice(provider: str, language: str) -> str:
+    if provider == "qwen3-tts":
+        return _QWEN_DEFAULT_VOICES[0]
+    lower = str(language or "").strip().lower()
+    return _EDGE_DEFAULT_VOICES.get(
+        lower,
+        _EDGE_DEFAULT_VOICES.get(_language_base(lower), "zh-CN-XiaoxiaoNeural"),
+    )
+
+
+def _preview_text(language: str) -> str:
+    return _PREVIEW_TEXTS.get(_language_base(language), _PREVIEW_TEXTS["zh"])
+
+
+def _format_voice_label(voice: dict) -> str:
+    name = str(voice.get("name") or "").strip()
+    locale = str(voice.get("locale") or voice.get("language") or "").strip()
+    gender = str(voice.get("gender") or "").strip()
+    parts = [p for p in (locale, gender) if p]
+    return f"{name} ({' · '.join(parts)})" if parts else name
+
+
+def localization_runtime_config(settings: dict) -> dict | None:
+    """Convert persisted localization settings into the config used by workers."""
+    mode = str(settings.get("localization_mode", "subtitle") or "subtitle").strip()
+    if mode not in {"translate", "dub"}:
+        return None
+
+    target_language = _language_code(
+        settings.get("target_language_dialog", settings.get("default_target_language", "zh-CN")),
+        settings.get("default_target_language", "zh-CN") or "zh-CN",
+    )
+    source_language = _language_code(
+        settings.get("source_language_dialog", "auto"),
+        "auto",
+    )
+    subtitle_mode = settings.get("subtitle_mode_dialog", "bilingual")
+    if "translated" in subtitle_mode:
+        subtitle_mode_value = "translated"
+    elif "source" in subtitle_mode:
+        subtitle_mode_value = "source"
+    else:
+        subtitle_mode_value = "bilingual"
+
+    tts_provider = settings.get("tts_provider", "edge-tts")
+    if "qwen3-tts" in tts_provider:
+        tts_provider = "qwen3-tts"
+    else:
+        tts_provider = "edge-tts"
+
+    return {
+        "is_translate_mode": True,
+        "is_dub_mode": mode == "dub",
+        "source_language": source_language,
+        "target_language": target_language,
+        "subtitle_mode": subtitle_mode_value,
+        "export_srt": str(settings.get("export_srt", "true")).lower() == "true",
+        "export_ass": str(settings.get("export_ass", "true")).lower() == "true",
+        "burn_subtitles": str(settings.get("burn_subtitles", "true")).lower() == "true",
+        "embed_soft_subtitles": str(settings.get("embed_soft_subtitles", "false")).lower() == "true",
+        "dubbing_enabled": mode == "dub",
+        "tts_provider": tts_provider,
+        "tts_voice": settings.get("tts_voice", ""),
+        "original_volume": int(settings.get("original_audio_volume_display", "30")) / 100.0,
+        "translation_config": {
+            "provider": settings.get("translation_provider", "openai_compatible"),
+            "base_url": settings.get("translation_base_url", ""),
+            "model": settings.get("translation_model", ""),
+            "api_key_env": "V2S_TRANSLATION_API_KEY",
+            "api_key": settings.get("translation_api_key", ""),
+            "timeout": int(settings.get("translation_timeout", "60") or 60),
+        },
+    }
 
 
 class LocalizationDialog(QDialog):
     """Settings dialog for translation and subtitle rendering options."""
+
+    _voices_loaded = pyqtSignal(int, object, str)
+    _preview_done = pyqtSignal(bool, str, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -70,7 +196,12 @@ class LocalizationDialog(QDialog):
         self.setMinimumSize(520, 600)
         self.setStyleSheet(_STYLE_SHEET)
         self._settings = get_effective_settings()
+        self._voice_request_id = 0
+        self._preferred_tts_voice = self._settings.get("tts_voice", "")
+        self._voices_loaded.connect(self._on_tts_voices_loaded)
+        self._preview_done.connect(self._on_tts_preview_done)
         self._setup_ui()
+        self._load_settings_to_ui()
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -85,13 +216,13 @@ class LocalizationDialog(QDialog):
         mode_group = QGroupBox("处理模式")
         mode_layout = QHBoxLayout(mode_group)
 
-        self.mode_subtitle = QCheckBox("快速字幕（现有流程）")
+        self.mode_subtitle = QRadioButton("快速字幕（现有流程）")
         self.mode_subtitle.setChecked(True)
 
-        self.mode_translate = QCheckBox("翻译字幕成片")
+        self.mode_translate = QRadioButton("翻译字幕成片")
         self.mode_translate.setChecked(False)
 
-        self.mode_dub = QCheckBox("指定语言配音")
+        self.mode_dub = QRadioButton("指定语言配音")
         self.mode_dub.setChecked(False)
 
         mode_layout.addWidget(self.mode_subtitle)
@@ -99,8 +230,16 @@ class LocalizationDialog(QDialog):
         mode_layout.addWidget(self.mode_dub)
         layout.addWidget(mode_group)
 
-        self.mode_translate.toggled.connect(self._on_mode_changed)
-        self.mode_dub.toggled.connect(self._on_mode_changed)
+        self._mode_group = QButtonGroup(self)
+        self._mode_group.addButton(self.mode_subtitle, 0)
+        self._mode_group.addButton(self.mode_translate, 1)
+        self._mode_group.addButton(self.mode_dub, 2)
+        self._mode_group.setExclusive(True)
+        self._mode_group.buttonClicked.connect(self._on_mode_changed)
+
+        self._qwen3_status_timer = QTimer()
+        self._qwen3_status_timer.timeout.connect(self._refresh_qwen3_status)
+        self._qwen3_status_timer.start(5000)
 
         # Translation settings
         self.trans_group = QGroupBox("翻译设置")
@@ -116,10 +255,11 @@ class LocalizationDialog(QDialog):
         self.target_lang = QComboBox()
         self.target_lang.addItems(["zh-CN (简体中文)", "en (英文)", "ja (日文)",
                                     "ko (韩文)", "fr (法文)", "de (德文)", "es (西班牙文)"])
+        self.target_lang.currentIndexChanged.connect(self._on_tts_language_changed)
         trans_form.addRow("目标语言:", self.target_lang)
 
         self.trans_provider = QComboBox()
-        self.trans_provider.addItems(["openai_compatible", "custom"])
+        self.trans_provider.addItems(["openai_compatible"])
         trans_form.addRow("翻译服务:", self.trans_provider)
 
         self.trans_base_url = QLineEdit(
@@ -132,8 +272,8 @@ class LocalizationDialog(QDialog):
         )
         trans_form.addRow("模型:", self.trans_model)
 
-        # API key is loaded from env, show masked
-        api_key = os.environ.get("V2S_TRANSLATION_API_KEY", "")
+        # API key: prefer saved setting, fall back to env var
+        api_key = self._settings.get("translation_api_key", "") or os.environ.get("V2S_TRANSLATION_API_KEY", "")
         self.trans_api_key = QLineEdit(api_key)
         self.trans_api_key.setEchoMode(QLineEdit.Password)
         self.trans_api_key.setPlaceholderText("设置 V2S_TRANSLATION_API_KEY 环境变量")
@@ -153,14 +293,47 @@ class LocalizationDialog(QDialog):
         self.tts_group.setEnabled(False)
 
         self.tts_provider = QComboBox()
-        self.tts_provider.addItems(["edge-tts"])
+        self.tts_provider.addItems(["edge-tts", "qwen3-tts（本地 Qwen3-TTS）"])
         if not _EDGE_TTS_AVAILABLE:
             self.tts_provider.setItemData(0, "需要安装: pip install edge-tts")
+        self.tts_provider.currentIndexChanged.connect(self._on_tts_provider_changed)
         tts_form.addRow("TTS 服务:", self.tts_provider)
 
-        self.tts_voice_label = QLabel("zh-CN-XiaoxiaoNeural")
-        self.tts_voice_label.setStyleSheet(f"color: {_THEME['text_primary']}; font-size: 12px;")
-        tts_form.addRow("音色:", self.tts_voice_label)
+        self.tts_manage_btn = QPushButton("管理 Qwen3-TTS")
+        self.tts_manage_btn.clicked.connect(self._open_qwen3_tts_setup)
+        self.tts_manage_btn.setVisible(False)
+        tts_form.addRow("", self.tts_manage_btn)
+
+        self.tts_qwen3_status = QLabel("")
+        self.tts_qwen3_status.setStyleSheet(
+            f"color: {_THEME['text_muted']}; font-size: 11px;"
+        )
+        self.tts_qwen3_status.setVisible(False)
+        tts_form.addRow("", self.tts_qwen3_status)
+
+        voice_row = QWidget()
+        voice_layout = QHBoxLayout(voice_row)
+        voice_layout.setContentsMargins(0, 0, 0, 0)
+        voice_layout.setSpacing(6)
+
+        self.tts_voice = QComboBox()
+        self.tts_voice.setMinimumWidth(250)
+        voice_layout.addWidget(self.tts_voice, 1)
+
+        self.tts_voice_refresh_btn = QPushButton("刷新")
+        self.tts_voice_refresh_btn.clicked.connect(self._refresh_tts_voices)
+        voice_layout.addWidget(self.tts_voice_refresh_btn)
+
+        self.tts_preview_btn = QPushButton("试听")
+        self.tts_preview_btn.clicked.connect(self._preview_tts_voice)
+        voice_layout.addWidget(self.tts_preview_btn)
+        tts_form.addRow("音色:", voice_row)
+
+        self.tts_voice_status = QLabel("")
+        self.tts_voice_status.setStyleSheet(
+            f"color: {_THEME['text_muted']}; font-size: 11px;"
+        )
+        tts_form.addRow("", self.tts_voice_status)
 
         self.orig_volume = QSpinBox()
         self.orig_volume.setRange(0, 100)
@@ -211,29 +384,367 @@ class LocalizationDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-    def _on_mode_changed(self, checked: bool):
-        trans = self.mode_translate.isChecked()
-        dub = self.mode_dub.isChecked()
-        self.trans_group.setEnabled(trans or dub)
+    def _on_mode_changed(self):
+        btn = self._mode_group.checkedButton()
+        if btn is None:
+            btn = self.mode_subtitle
+        trans = btn in (self.mode_translate, self.mode_dub)
+        dub = btn is self.mode_dub
+        self.trans_group.setEnabled(trans)
         self.tts_group.setEnabled(dub)
-        if trans or dub:
-            self.mode_subtitle.setChecked(False)
+        if dub and self.tts_voice.count() == 0:
+            self._refresh_tts_voices()
+
+    def _load_settings_to_ui(self):
+        s = self._settings
+        mode = s.get("localization_mode", "subtitle")
+
+        mode_ids = {"subtitle": 0, "translate": 1, "dub": 2}
+        btn = self._mode_group.button(mode_ids.get(mode, 0))
+        if btn:
+            btn.setChecked(True)
+        self.trans_group.setEnabled(mode in ("translate", "dub"))
+        self.tts_group.setEnabled(mode == "dub")
+
+        src = s.get("source_language_dialog", "auto (自动检测)")
+        idx = self.source_lang.findText(src)
+        if idx >= 0:
+            self.source_lang.setCurrentIndex(idx)
+
+        tgt = s.get("target_language_dialog", "zh-CN (简体中文)")
+        idx = self.target_lang.findText(tgt)
+        if idx >= 0:
+            self.target_lang.setCurrentIndex(idx)
+
+        trans_provider = s.get("translation_provider", "openai_compatible")
+        idx = self.trans_provider.findText(trans_provider)
+        if idx >= 0:
+            self.trans_provider.setCurrentIndex(idx)
+
+        self.trans_base_url.setText(
+            s.get("translation_base_url", "https://api.openai.com/v1")
+        )
+        self.trans_model.setText(s.get("translation_model", "gpt-4o-mini"))
+        self.trans_timeout.setValue(int(s.get("translation_timeout", 60)))
+
+        saved_key = s.get("translation_api_key", "")
+        if saved_key:
+            self.trans_api_key.setText(saved_key)
+
+        sub_mode = s.get("subtitle_mode_dialog", "bilingual (双语)")
+        idx = self.subtitle_mode.findText(sub_mode)
+        if idx >= 0:
+            self.subtitle_mode.setCurrentIndex(idx)
+
+        self.export_srt.setChecked(s.get("export_srt", "true") == "true")
+        self.export_ass.setChecked(s.get("export_ass", "true") == "true")
+        self.burn_subtitles.setChecked(s.get("burn_subtitles", "true") == "true")
+        self.embed_soft.setChecked(s.get("embed_soft_subtitles", "false") == "true")
+
+        self.orig_volume.setValue(int(s.get("original_audio_volume_display", "30")))
+
+        tts = s.get("tts_provider", "")
+        if "qwen3-tts" in tts:
+            self.tts_provider.setCurrentIndex(1)
         else:
-            self.mode_subtitle.setChecked(True)
+            self.tts_provider.setCurrentIndex(0)
+        self._refresh_tts_voices()
+
+    def _on_tts_provider_changed(self, index: int):
+        is_qwen3 = self._current_tts_provider() == "qwen3-tts"
+        self.tts_manage_btn.setVisible(is_qwen3)
+        self.tts_qwen3_status.setVisible(is_qwen3)
+        if is_qwen3:
+            self._refresh_qwen3_status()
+        self._refresh_tts_voices()
+
+    def _on_tts_language_changed(self, index: int):
+        if hasattr(self, "tts_voice"):
+            self._refresh_tts_voices()
+
+    def _current_tts_provider(self) -> str:
+        return _provider_key(self.tts_provider.currentText())
+
+    def _selected_tts_voice(self) -> str:
+        data = self.tts_voice.currentData()
+        text = data if data is not None else self.tts_voice.currentText()
+        return str(text or "").strip()
+
+    def _set_voice_loading(self, message: str):
+        self.tts_voice.clear()
+        self.tts_voice.addItem("加载中...", "")
+        self.tts_voice.setEnabled(False)
+        self.tts_preview_btn.setEnabled(False)
+        self.tts_voice_status.setText(message)
+
+    def _refresh_tts_voices(self):
+        if not hasattr(self, "tts_voice"):
+            return
+        provider = self._current_tts_provider()
+        language = self.target_language
+        preferred = self._selected_tts_voice() or self._preferred_tts_voice
+        if not preferred:
+            preferred = _default_tts_voice(provider, language)
+
+        self._voice_request_id += 1
+        request_id = self._voice_request_id
+        self._set_voice_loading("正在加载音色...")
+
+        def _run():
+            voices, error = self._load_tts_voices(provider, language)
+            self._voices_loaded.emit(request_id, voices, error)
+
+        threading.Thread(target=_run, daemon=True).start()
+        self._preferred_tts_voice = preferred
+
+    def _load_tts_voices(self, provider: str, language: str) -> tuple[list[dict], str]:
+        if provider == "qwen3-tts":
+            try:
+                url = "http://127.0.0.1:8767/voices"
+                with urllib.request.urlopen(url, timeout=3) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                voices = []
+                for voice in data.get("voices", []):
+                    name = str(voice.get("name") or "").strip()
+                    if name:
+                        voices.append({
+                            "name": name,
+                            "locale": language,
+                            "gender": voice.get("gender", ""),
+                        })
+                if voices:
+                    return voices, ""
+            except Exception:
+                pass
+            return [
+                {"name": name, "locale": language, "gender": ""}
+                for name in _QWEN_DEFAULT_VOICES
+            ], "Qwen3-TTS 服务未运行，已显示预设音色"
+
+        if not _EDGE_TTS_AVAILABLE:
+            voice = _default_tts_voice(provider, language)
+            return [{"name": voice, "locale": language, "gender": ""}], "edge-tts 未安装，无法试听"
+
+        try:
+            voices = asyncio.run(edge_tts.list_voices())
+            filtered = []
+            lang = str(language or "").lower()
+            for voice in voices:
+                locale = str(voice.get("Locale") or "")
+                if lang and not locale.lower().startswith(lang):
+                    continue
+                name = str(voice.get("ShortName") or "").strip()
+                if name:
+                    filtered.append({
+                        "name": name,
+                        "locale": locale,
+                        "gender": voice.get("Gender", ""),
+                    })
+            if filtered:
+                return filtered, ""
+            fallback = _default_tts_voice(provider, language)
+            return [{"name": fallback, "locale": language, "gender": ""}], "未找到匹配音色，已使用默认音色"
+        except Exception as exc:
+            fallback = _default_tts_voice(provider, language)
+            return [{"name": fallback, "locale": language, "gender": ""}], f"音色加载失败: {exc}"
+
+    def _on_tts_voices_loaded(self, request_id: int, voices: object, error: str):
+        if request_id != self._voice_request_id:
+            return
+        voice_items = [v for v in voices if isinstance(v, dict) and v.get("name")]
+        if not voice_items:
+            provider = self._current_tts_provider()
+            language = self.target_language
+            voice_items = [{"name": _default_tts_voice(provider, language), "locale": language}]
+
+        preferred = self._preferred_tts_voice or voice_items[0]["name"]
+        self.tts_voice.blockSignals(True)
+        self.tts_voice.clear()
+        for voice in voice_items:
+            self.tts_voice.addItem(_format_voice_label(voice), voice["name"])
+        index = self.tts_voice.findData(preferred)
+        if index < 0:
+            index = self.tts_voice.findText(preferred)
+        self.tts_voice.setCurrentIndex(index if index >= 0 else 0)
+        self.tts_voice.blockSignals(False)
+        self.tts_voice.setEnabled(True)
+        self.tts_preview_btn.setEnabled(True)
+        if error:
+            self.tts_voice_status.setText(error)
+            self.tts_voice_status.setStyleSheet(f"color: #fbbf24; font-size: 11px;")
+        else:
+            self.tts_voice_status.setText(f"已加载 {len(voice_items)} 个音色")
+            self.tts_voice_status.setStyleSheet(f"color: {_THEME['text_muted']}; font-size: 11px;")
+
+    def _preview_tts_voice(self):
+        provider = self._current_tts_provider()
+        language = self.target_language
+        voice = self._selected_tts_voice() or _default_tts_voice(provider, language)
+        if not voice:
+            QMessageBox.warning(self, "无法试听", "请先选择一个音色。")
+            return
+
+        self.tts_preview_btn.setEnabled(False)
+        self.tts_preview_btn.setText("生成中...")
+        self.tts_voice_status.setText("正在生成试听音频...")
+
+        def _run():
+            try:
+                path = self._generate_tts_preview(provider, language, voice)
+                self._preview_done.emit(True, f"试听音频已生成: {path}", str(path))
+            except Exception as exc:
+                self._preview_done.emit(False, f"试听失败: {exc}", "")
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _generate_tts_preview(self, provider: str, language: str, voice: str) -> Path:
+        text = _preview_text(language)
+        preview_dir = Path(tempfile.gettempdir()) / "video2subtitles_tts_preview"
+        preview_dir.mkdir(parents=True, exist_ok=True)
+
+        if provider == "qwen3-tts":
+            return self._generate_qwen3_preview(text, language, voice, preview_dir)
+
+        if not _EDGE_TTS_AVAILABLE:
+            raise RuntimeError("edge-tts 未安装，请执行 pip install edge-tts")
+
+        output_path = preview_dir / f"edge_{voice}.mp3"
+        communicate = edge_tts.Communicate(text, voice)
+        asyncio.run(communicate.save(str(output_path)))
+        return output_path
+
+    def _generate_qwen3_preview(self, text: str, language: str, voice: str,
+                                preview_dir: Path) -> Path:
+        base_url = "http://127.0.0.1:8767"
+        with urllib.request.urlopen(f"{base_url}/health", timeout=5) as resp:
+            health = json.loads(resp.read().decode("utf-8"))
+        if health.get("status") != "ok" or not health.get("loaded_model"):
+            raise RuntimeError("Qwen3-TTS 服务未运行或尚未加载模型")
+
+        caps = health.get("capabilities") or {}
+        if caps.get("custom_voice"):
+            endpoint = "/synthesize/custom-voice"
+            body = {"text": text, "speaker": voice, "language": language}
+        elif caps.get("voice_clone"):
+            endpoint = "/synthesize/voice-clone"
+            body = {"text": text, "language": language}
+        elif caps.get("voice_design"):
+            endpoint = "/synthesize/voice-design"
+            body = {
+                "text": text,
+                "instruct": f"A natural voice speaking {_language_base(language)}",
+                "language": language,
+            }
+        else:
+            raise RuntimeError("当前 Qwen3-TTS 模型不支持语音合成")
+
+        req = urllib.request.Request(
+            f"{base_url}{endpoint}",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            output_path = preview_dir / f"qwen3_{voice}.wav"
+            output_path.write_bytes(resp.read())
+        return output_path
+
+    def _on_tts_preview_done(self, ok: bool, message: str, path: str):
+        self.tts_preview_btn.setText("试听")
+        self.tts_preview_btn.setEnabled(True)
+        if ok and path:
+            self.tts_voice_status.setText("试听音频已打开")
+            self.tts_voice_status.setStyleSheet(f"color: #4ade80; font-size: 11px;")
+            opened = QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+            if not opened:
+                QMessageBox.information(self, "试听音频", message)
+        else:
+            self.tts_voice_status.setText(message)
+            self.tts_voice_status.setStyleSheet(f"color: #f87171; font-size: 11px;")
+            QMessageBox.warning(self, "试听失败", message)
+
+    def _refresh_qwen3_status(self):
+        if "qwen3-tts" not in self.tts_provider.currentText():
+            return
+        try:
+            import json
+            import urllib.request
+            with urllib.request.urlopen(
+                "http://127.0.0.1:8767/health", timeout=2
+            ) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                model = data.get("loaded_model", "未加载")
+                device = data.get("device", "?")
+                self.tts_qwen3_status.setText(
+                    f"● 运行中 | 设备: {device} | 模型: {model}"
+                )
+                self.tts_qwen3_status.setStyleSheet(
+                    "color: #4ade80; font-size: 11px;"
+                )
+        except Exception:
+            self.tts_qwen3_status.setText("○ 未运行，请点击「管理 Qwen3-TTS」启动")
+            self.tts_qwen3_status.setStyleSheet(
+                f"color: #f87171; font-size: 11px;"
+            )
+
+    def _open_qwen3_tts_setup(self):
+        from ui.qwen_tts_setup_dialog import QwenTTSInstallDialog
+        dlg = QwenTTSInstallDialog(self)
+        dlg.exec_()
+        self._refresh_qwen3_status()
+        self._refresh_tts_voices()
 
     def _on_accept(self):
-        # Save settings
+        # Save all dialog state
+        if self.mode_translate.isChecked():
+            self._settings["localization_mode"] = "translate"
+        elif self.mode_dub.isChecked():
+            self._settings["localization_mode"] = "dub"
+        else:
+            self._settings["localization_mode"] = "subtitle"
+
+        self._settings["source_language_dialog"] = self.source_lang.currentText()
+        self._settings["target_language_dialog"] = self.target_lang.currentText()
+        self._settings["translation_provider"] = self.trans_provider.currentText()
         self._settings["translation_base_url"] = self.trans_base_url.text().strip()
         self._settings["translation_model"] = self.trans_model.text().strip()
         self._settings["translation_timeout"] = str(self.trans_timeout.value())
-        save_settings(self._settings)
-
-        # Set env var for API key
-        key = self.trans_api_key.text().strip()
-        if key:
-            os.environ["V2S_TRANSLATION_API_KEY"] = key
+        self._settings["translation_api_key"] = self.trans_api_key.text().strip()
+        self._settings["subtitle_mode_dialog"] = self.subtitle_mode.currentText()
+        self._settings["export_srt"] = "true" if self.export_srt.isChecked() else "false"
+        self._settings["export_ass"] = "true" if self.export_ass.isChecked() else "false"
+        self._settings["burn_subtitles"] = "true" if self.burn_subtitles.isChecked() else "false"
+        self._settings["embed_soft_subtitles"] = "true" if self.embed_soft.isChecked() else "false"
+        self._settings["original_audio_volume_display"] = str(self.orig_volume.value())
+        self._settings["tts_provider"] = "qwen3-tts" if "qwen3-tts" in self.tts_provider.currentText() else "edge-tts"
+        self._settings["tts_voice"] = self._selected_tts_voice()
+        saved = save_settings(self._settings)
+        apply_settings_to_env(saved, overwrite=True)
+        self._sync_translation_runtime_env(saved)
 
         self.accept()
+
+    def _sync_translation_runtime_env(self, settings: dict) -> None:
+        """Apply the saved translation key to a running Localization Engine."""
+        key = str(settings.get("translation_api_key", "") or "").strip()
+        if not key:
+            return
+        engine_url = str(
+            settings.get("localization_engine_url", "http://127.0.0.1:8766")
+            or "http://127.0.0.1:8766"
+        ).rstrip("/")
+        try:
+            body = json.dumps({"api_key": key}).encode("utf-8")
+            req = urllib.request.Request(
+                f"{engine_url}/config/translation-api-key",
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=3):
+                pass
+        except Exception:
+            pass
 
     @property
     def is_translate_mode(self) -> bool:
@@ -246,14 +757,12 @@ class LocalizationDialog(QDialog):
     @property
     def source_language(self) -> str:
         text = self.source_lang.currentText()
-        if text.startswith("auto"):
-            return "auto"
-        return text.split("(")[1].rstrip(")").strip() if "(" in text else "en"
+        return _language_code(text, "auto")
 
     @property
     def target_language(self) -> str:
         text = self.target_lang.currentText()
-        return text.split("(")[1].rstrip(")").strip() if "(" in text else "zh-CN"
+        return _language_code(text, "zh-CN")
 
     @property
     def subtitle_mode_value(self) -> str:
@@ -274,26 +783,24 @@ class LocalizationDialog(QDialog):
         )
 
     def get_settings(self) -> dict:
-        tc = self.get_translation_config()
-        return {
-            "is_translate_mode": self.is_translate_mode or self.is_dub_mode,
-            "is_dub_mode": self.is_dub_mode,
-            "source_language": self.source_language,
-            "target_language": self.target_language,
-            "subtitle_mode": self.subtitle_mode_value,
-            "export_srt": self.export_srt.isChecked(),
-            "export_ass": self.export_ass.isChecked(),
-            "burn_subtitles": self.burn_subtitles.isChecked(),
-            "embed_soft_subtitles": self.embed_soft.isChecked(),
-            "dubbing_enabled": self.is_dub_mode,
-            "tts_provider": self.tts_provider.currentText(),
-            "tts_voice": self.tts_voice_label.text(),
-            "original_volume": self.orig_volume.value() / 100.0,
-            "translation_config": {
-                "provider": tc.provider,
-                "base_url": tc.base_url,
-                "model": tc.model,
-                "api_key_env": tc.api_key_env,
-                "timeout": tc.timeout,
-            },
+        self._settings["localization_mode"] = (
+            "dub" if self.is_dub_mode else "translate" if self.is_translate_mode else "subtitle"
+        )
+        self._settings["source_language_dialog"] = self.source_lang.currentText()
+        self._settings["target_language_dialog"] = self.target_lang.currentText()
+        self._settings["subtitle_mode_dialog"] = self.subtitle_mode.currentText()
+        self._settings["export_srt"] = "true" if self.export_srt.isChecked() else "false"
+        self._settings["export_ass"] = "true" if self.export_ass.isChecked() else "false"
+        self._settings["burn_subtitles"] = "true" if self.burn_subtitles.isChecked() else "false"
+        self._settings["embed_soft_subtitles"] = "true" if self.embed_soft.isChecked() else "false"
+        self._settings["original_audio_volume_display"] = str(self.orig_volume.value())
+        self._settings["translation_provider"] = self.trans_provider.currentText()
+        self._settings["translation_base_url"] = self.trans_base_url.text().strip()
+        self._settings["translation_model"] = self.trans_model.text().strip()
+        self._settings["translation_timeout"] = str(self.trans_timeout.value())
+        self._settings["tts_provider"] = "qwen3-tts" if "qwen3-tts" in self.tts_provider.currentText() else "edge-tts"
+        self._settings["tts_voice"] = self._selected_tts_voice()
+        return localization_runtime_config(self._settings) or {
+            "is_translate_mode": False,
+            "is_dub_mode": False,
         }

@@ -30,6 +30,84 @@ _DEFAULT_MAX_RETRIES = 3
 _DEFAULT_CONCURRENCY = 2
 
 
+_LANGUAGE_NAMES = {
+    "auto": "the source language detected from the subtitle text",
+    "zh": "Simplified Chinese",
+    "zh-cn": "Simplified Chinese",
+    "zh-hans": "Simplified Chinese",
+    "zh-tw": "Traditional Chinese",
+    "zh-hant": "Traditional Chinese",
+    "en": "English",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "fr": "French",
+    "de": "German",
+    "es": "Spanish",
+    "cs": "Czech",
+}
+
+
+def _language_name(language: str) -> str:
+    text = str(language or "auto").strip()
+    return _LANGUAGE_NAMES.get(text.lower(), text or "auto")
+
+
+def _extract_response_content(result: Any) -> str:
+    """Extract assistant content from OpenAI-compatible or local LLM responses."""
+    if isinstance(result, list):
+        return json.dumps(result, ensure_ascii=False)
+    if not isinstance(result, dict):
+        raise InvalidResponseError(f"Expected JSON object response, got {type(result).__name__}")
+
+    wrapped_data = result.get("data")
+    if isinstance(wrapped_data, dict):
+        return _extract_response_content(wrapped_data)
+
+    choices = result.get("choices")
+    if isinstance(choices, list) and choices:
+        first = choices[0]
+        if isinstance(first, dict):
+            message = first.get("message")
+            if isinstance(message, dict):
+                content = message.get("content")
+                if isinstance(content, list):
+                    parts = []
+                    for item in content:
+                        if isinstance(item, dict):
+                            parts.append(str(item.get("text", "")))
+                        else:
+                            parts.append(str(item))
+                    return "".join(parts)
+                if content is not None:
+                    return str(content)
+            if first.get("text") is not None:
+                return str(first.get("text"))
+
+    for key in ("content", "text", "response", "output_text"):
+        value = result.get(key)
+        if value is not None:
+            return str(value)
+
+    for key in ("translations", "items", "segments", "result", "data"):
+        value = result.get(key)
+        if isinstance(value, list):
+            return json.dumps({key: value}, ensure_ascii=False)
+
+    safe = sanitize_for_log(json.dumps(result, ensure_ascii=False))
+    raise InvalidResponseError(f"Response missing assistant content/choices: {safe}")
+
+
+def _response_error_detail(response: httpx.Response) -> str:
+    """Return a useful, sanitized error detail from an HTTP response."""
+    prefix = f"HTTP {response.status_code}"
+    try:
+        payload = response.json()
+        return f"{prefix}: {sanitize_for_log(json.dumps(payload, ensure_ascii=False), 800)}"
+    except Exception:
+        text = sanitize_for_log(response.text or "", 800)
+        return f"{prefix}: {text}" if text else prefix
+
+
 class OpenAICompatibleProvider(TranslationProvider):
     """Translates subtitles via any OpenAI-compatible chat completions API."""
 
@@ -51,16 +129,23 @@ class OpenAICompatibleProvider(TranslationProvider):
                         glossary: Optional[str] = None) -> List[Dict]:
         """Translate a single batch of segments."""
         base_url = config.base_url.rstrip("/")
+        if not base_url.startswith(("http://", "https://")):
+            raise TranslationError(
+                "Translation API address must start with http:// or https://",
+                recoverable=False,
+            )
         api_key = os.environ.get(config.api_key_env, "")
         model = config.model or "gpt-4o-mini"
         temperature = config.temperature
 
         segments_json = json.dumps(segments, ensure_ascii=False)
-        system_prompt = build_system_prompt(source_lang, target_lang)
+        source_prompt_lang = _language_name(source_lang)
+        target_prompt_lang = _language_name(target_lang)
+        system_prompt = build_system_prompt(source_prompt_lang, target_prompt_lang)
         user_prompt = build_translate_prompt(
             segments_json=segments_json,
-            source_lang=source_lang,
-            target_lang=target_lang,
+            source_lang=source_prompt_lang,
+            target_lang=target_prompt_lang,
             count=len(segments),
             glossary_text=glossary or "",
         )
@@ -78,7 +163,7 @@ class OpenAICompatibleProvider(TranslationProvider):
                 {"role": "user", "content": user_prompt},
             ],
             "temperature": temperature,
-            "response_format": {"type": "json_object"},
+            # Note: response_format removed - not supported by all OpenAI-compatible servers
         }
 
         last_error: Optional[Exception] = None
@@ -91,21 +176,32 @@ class OpenAICompatibleProvider(TranslationProvider):
                     timeout=config.timeout,
                 )
 
-                if response.status_code == 401:
-                    raise AuthError()
+                if response.status_code in (401, 403):
+                    raise AuthError(_response_error_detail(response))
                 elif response.status_code == 429:
                     retry_after = int(response.headers.get("Retry-After", "30"))
                     raise RateLimitError(retry_after=retry_after)
-                elif response.status_code >= 500:
+                elif response.status_code >= 400:
+                    error_detail = _response_error_detail(response)
+                    if response.status_code == 400:
+                        logger.error("Translation API returned 400 Bad Request: %s", error_detail)
                     raise TranslationError(
-                        f"Server error: {response.status_code}",
-                        recoverable=True,
+                        error_detail,
+                        recoverable=response.status_code >= 500,
                     )
 
                 response.raise_for_status()
-                result = response.json()
+                try:
+                    result = response.json()
+                except json.JSONDecodeError as exc:
+                    content_type = response.headers.get("content-type", "")
+                    body = sanitize_for_log(response.text or "", 800)
+                    raise InvalidResponseError(
+                        f"Translation API returned non-JSON response "
+                        f"(content-type={content_type}): {body}"
+                    ) from exc
 
-                content = result["choices"][0]["message"]["content"]
+                content = _extract_response_content(result)
                 expected_ids = [s["id"] for s in segments]
 
                 translations, errors = parse_translation_response(content, expected_ids)
@@ -127,6 +223,14 @@ class OpenAICompatibleProvider(TranslationProvider):
                 logger.warning("Translation attempt %d failed: %s; retrying in %ds",
                                attempt + 1, e, wait)
                 time.sleep(wait)
+            except TranslationError as e:
+                if not e.recoverable:
+                    raise
+                last_error = e
+                wait = min(2 ** attempt * 5, 60)
+                logger.warning("Translation attempt %d failed: %s; retrying in %ds",
+                               attempt + 1, e, wait)
+                time.sleep(wait)
             except httpx.TimeoutException as e:
                 last_error = TimeoutError_(str(e))
                 wait = min(2 ** attempt * 5, 60)
@@ -134,8 +238,19 @@ class OpenAICompatibleProvider(TranslationProvider):
             except httpx.HTTPStatusError as e:
                 if e.response.status_code in (401,):
                     raise AuthError()
+
+                # Log detailed error info for 400 Bad Request
+                error_detail = f"HTTP {e.response.status_code}"
+                if e.response.status_code == 400:
+                    try:
+                        error_body = e.response.json()
+                        error_detail = f"HTTP 400: {json.dumps(error_body, ensure_ascii=False)[:500]}"
+                    except:
+                        error_detail = f"HTTP 400: {e.response.text[:500]}"
+                    logger.error("Translation API returned 400 Bad Request: %s", error_detail)
+
                 last_error = TranslationError(
-                    f"HTTP error: {e.response.status_code}",
+                    error_detail,
                     recoverable=e.response.status_code >= 500,
                 )
                 wait = min(2 ** attempt * 5, 60)

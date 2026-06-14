@@ -21,6 +21,7 @@ whisper-server/.venv/
 whisper-server/cache/
 whisper-server/temp/
 whisper-server/cookies.txt
+whisper-server/cookie_backups/
 
 # Localization Engine
 localization-engine/.venv/

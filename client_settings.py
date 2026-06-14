@@ -49,6 +49,17 @@ DEFAULT_SETTINGS = {
     "tts_provider": "",
     "tts_voice": "",
     "original_audio_volume": "0.2",
+    # Localization dialog persistent settings
+    "translation_api_key": "",
+    "localization_mode": "subtitle",
+    "source_language_dialog": "auto (自动检测)",
+    "target_language_dialog": "zh-CN (简体中文)",
+    "subtitle_mode_dialog": "bilingual (双语)",
+    "export_srt": "true",
+    "export_ass": "true",
+    "burn_subtitles": "true",
+    "embed_soft_subtitles": "false",
+    "original_audio_volume_display": "30",
 }
 
 ENV_BY_KEY = {
@@ -64,6 +75,7 @@ ENV_BY_KEY = {
     "localization_engine_url": "LOCALIZATION_ENGINE_URL",
     "translation_base_url": "V2S_TRANSLATION_BASE_URL",
     "translation_model": "V2S_TRANSLATION_MODEL",
+    "translation_api_key": "V2S_TRANSLATION_API_KEY",
     "default_target_language": "V2S_TARGET_LANGUAGE",
 }
 
