@@ -59,6 +59,7 @@ DEFAULT_SETTINGS = {
     "tts_qwen_temperature": "",
     "tts_qwen_top_p": "",
     "tts_qwen_max_new_tokens": "",
+    "tts_consistency_mode": "stable",
     "tts_segment_gap": "0.04",
     "low_vram_mode": "true",
     "original_audio_volume": "0.0",

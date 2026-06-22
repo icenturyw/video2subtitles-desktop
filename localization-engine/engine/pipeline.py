@@ -34,6 +34,20 @@ from engine.workspace import (
     write_log,
 )
 
+try:
+    from tts.voice_profile import TtsVoiceProfile, voice_profile_hash, profile_to_log_dict
+    from tts.chunking import build_tts_chunks, TtsChunk
+    from audio.normalize import normalize_tts_audio
+    _HAS_VOICE_PROFILE = True
+except ImportError:
+    _HAS_VOICE_PROFILE = False
+    TtsVoiceProfile = None
+    voice_profile_hash = None
+    profile_to_log_dict = None
+    build_tts_chunks = None
+    TtsChunk = None
+    normalize_tts_audio = None
+
 logger = logging.getLogger("engine.pipeline")
 _PIPELINE_LOG = "localization.log"
 _QWEN3_DEFAULT_STABLE_SEED = 42
@@ -653,6 +667,54 @@ class PipelineRunner:
 
         return artifacts
 
+    def _build_voice_profile(self, request: Dict[str, Any],
+                              target_lang: str) -> Optional[Dict]:
+        """Build a frozen voice profile snapshot from request options.
+
+        Returns dict with 'profile' (TtsVoiceProfile) and 'hash' (str),
+        or None if voice_profile module unavailable.
+        """
+        if not _HAS_VOICE_PROFILE:
+            return None
+
+        tts_options = request.get("tts_options", {}) or {}
+        tts_provider_name = request.get("tts_provider", "edge-tts")
+        tts_voice = request.get("tts_voice", "")
+        if not tts_voice:
+            tts_voice = self._default_tts_voice(target_lang)
+
+        consistency_mode = str(
+            request.get("tts_consistency_mode",
+                        tts_options.get("tts_consistency_mode", "stable"))
+            or "stable"
+        ).lower()
+        if consistency_mode not in ("fast", "stable", "strict"):
+            consistency_mode = "stable"
+
+        model = str(
+            tts_options.get("qwen_model", "")
+            or tts_options.get("model", "")
+            or os.environ.get("V2S_QWEN3_TTS_MODEL", "")
+            or ""
+        )
+        profile = TtsVoiceProfile(
+            provider=tts_provider_name,
+            model=model,
+            voice=tts_voice,
+            prompt_audio_path=str(tts_options.get("ref_audio", "") or "").strip() or None,
+            prompt_audio_hash=str(tts_options.get("ref_audio", "") or "").strip() or None,
+            language=target_lang,
+            style=str(tts_options.get("instruct", "") or "").strip() or None,
+            seed=tts_options.get("seed"),
+            temperature=tts_options.get("temperature"),
+            top_p=tts_options.get("top_p"),
+            sample_rate=24000,
+            consistency_mode=consistency_mode,
+        )
+        profile_hash = voice_profile_hash(profile)
+        return {"profile": profile, "hash": profile_hash,
+                "consistency_mode": consistency_mode}
+
     def _run_tts(self, job_id: str, ws: Path,
                   segments: List[SubtitleSegment],
                   request: Dict[str, Any],
@@ -667,6 +729,19 @@ class PipelineRunner:
         tts_options = dict(request.get("tts_options", {}) or {})
         if not tts_voice:
             tts_voice = self._default_tts_voice(target_lang)
+
+        import json as _json_module
+
+        voice_profile_info = self._build_voice_profile(request, target_lang)
+        consistency_mode = "fast"
+        profile_hash = ""
+        if voice_profile_info is not None:
+            consistency_mode = voice_profile_info["consistency_mode"]
+            profile_hash = voice_profile_info["hash"]
+            log_profile = profile_to_log_dict(
+                voice_profile_info["profile"], profile_hash
+            )
+            write_log(ws, f"  Voice profile frozen: {_json_module.dumps(log_profile, ensure_ascii=False)}")
 
         try:
             from tts import get_provider as get_tts_provider
@@ -747,30 +822,47 @@ class PipelineRunner:
 
         report_rows: List[Dict[str, Any]] = []
 
-        def synthesize_segment(seg: SubtitleSegment) -> Dict[str, Any]:
-            if cancel_token.is_cancelled():
-                return {"cancelled": True}
+        # ------------------------------------------------------------------
+        # Build TTS chunks for stable/strict modes (merge short segments)
+        # ------------------------------------------------------------------
+        use_chunking = consistency_mode in ("stable", "strict") and _HAS_VOICE_PROFILE and callable(build_tts_chunks)
+        chunks: List[Any] = []
+        chunk_to_segments: Dict[int, List[SubtitleSegment]] = {}
 
-            seg_path = tts_dir / f"seg_{seg.index:04d}.wav"
-            temp_path = tts_dir / f"seg_{seg.index:04d}_raw.wav"
-            text = seg.translation or seg.text
-            if not text.strip():
-                seg_path.unlink(missing_ok=True)
-                temp_path.unlink(missing_ok=True)
-                return {"skipped": True, "index": seg.index, "start": seg.start,
-                        "target_duration": target_dur, "reason": "empty text"}
-            target_dur = target_durations.get(seg.index, seg.end - seg.start)
-            if target_dur <= 0:
-                seg_path.unlink(missing_ok=True)
-                temp_path.unlink(missing_ok=True)
-                return {
-                    "skipped": True,
-                    "index": seg.index,
-                    "start": seg.start,
-                    "target_duration": target_dur,
-                    "warning": "timing_warning: skipped, no safe gap before next segment",
-                }
+        if use_chunking:
+            raw_chunks = build_tts_chunks(candidates)
+            write_log(ws, f"  TTS chunks: {len(candidates)} segments -> {len(raw_chunks)} chunks (mode={consistency_mode})")
+            for c in raw_chunks:
+                c_segs = [seg for seg in candidates if seg.index in c.segment_indexes]
+                chunk_to_segments[c.chunk_index] = c_segs
+                chunks.append(c)
+        else:
+            write_log(ws, f"  TTS mode: per-segment (consistency={consistency_mode})")
 
+        # ------------------------------------------------------------------
+        # Shared helpers
+        # ------------------------------------------------------------------
+        def record_report(result: Dict[str, Any]) -> None:
+            if not result.get("index"):
+                return
+            report_rows.append({
+                "index": result.get("index"),
+                "start": result.get("start"),
+                "mode": result.get("mode", options.get("qwen_mode", "")),
+                "cached": bool(result.get("cached", False)),
+                "target_duration": result.get("target_duration"),
+                "actual_duration": result.get("actual_duration"),
+                "adjusted_duration": result.get("adjusted_duration"),
+                "speed": result.get("speed"),
+                "warning": result.get("warning", ""),
+                "error": result.get("error", ""),
+                "skipped": bool(result.get("skipped", False)),
+                "reason": result.get("reason", ""),
+            })
+
+        def _synthesize_and_time(seg: SubtitleSegment, text: str,
+                                 temp_path: Path, seg_path: Path,
+                                 target_dur: float) -> Dict[str, Any]:
             try:
                 result = provider.synthesize(
                     text.strip(), target_lang, tts_voice, temp_path, options,
@@ -793,14 +885,17 @@ class PipelineRunner:
             speed = None
             warning = ""
 
+            result_path = normalize_tts_audio(temp_path) if callable(normalize_tts_audio) else None
+            normalized_path = Path(result_path) if result_path else temp_path
+
             if actual_dur > 0 and target_dur > 0:
                 adj_dur, warning, speed = adjust_timing(
-                    temp_path, seg_path, actual_dur, target_dur,
+                    normalized_path, seg_path, actual_dur, target_dur,
                 )
                 if not seg_path.exists():
-                    shutil.copy2(str(temp_path), str(seg_path))
+                    shutil.copy2(str(normalized_path), str(seg_path))
             else:
-                shutil.copy2(str(temp_path), str(seg_path))
+                shutil.copy2(str(normalized_path), str(seg_path))
 
             return {
                 "index": seg.index,
@@ -815,26 +910,181 @@ class PipelineRunner:
                 "mode": getattr(result, "mode", options.get("qwen_mode", "")),
             }
 
-        def record_report(result: Dict[str, Any]) -> None:
-            if not result.get("index"):
-                return
-            report_rows.append({
-                "index": result.get("index"),
-                "start": result.get("start"),
-                "mode": result.get("mode", options.get("qwen_mode", "")),
-                "cached": bool(result.get("cached", False)),
-                "target_duration": result.get("target_duration"),
-                "actual_duration": result.get("actual_duration"),
-                "adjusted_duration": result.get("adjusted_duration"),
-                "speed": result.get("speed"),
-                "warning": result.get("warning", ""),
-                "error": result.get("error", ""),
-                "skipped": bool(result.get("skipped", False)),
-                "reason": result.get("reason", ""),
-            })
+        def _extract_segment_from_chunk(chunk_audio: Path,
+                                        chunk_text: str,
+                                        seg_text: str,
+                                        seg_target_dur: float) -> Tuple[float, float]:
+            """Return (start_offset, duration) within chunk audio for a segment."""
+            chunk_len = len(chunk_text)
+            seg_len = len(seg_text)
+            if chunk_len <= 0 or seg_len <= 0:
+                return 0.0, seg_target_dur
+            if seg_len >= chunk_len:
+                return 0.0, seg_target_dur
 
+            chunk_dur = _get_wav_duration_cached(chunk_audio)
+            if chunk_dur <= 0:
+                return 0.0, seg_target_dur
+
+            ratio = seg_len / chunk_len
+            seg_dur = chunk_dur * ratio
+            return 0.0, seg_dur
+
+        _wav_dur_cache: Dict[str, float] = {}
+
+        def _get_wav_duration_cached(path: Path) -> float:
+            key = str(path.resolve())
+            if key not in _wav_dur_cache:
+                from tts.qwen3_tts import _get_wav_duration
+                _wav_dur_cache[key] = _get_wav_duration(path)
+            return _wav_dur_cache[key]
+
+        # ------------------------------------------------------------------
+        # Per-segment synthesis (fast mode)
+        # ------------------------------------------------------------------
+        def synthesize_segment(seg: SubtitleSegment) -> Dict[str, Any]:
+            if cancel_token.is_cancelled():
+                return {"cancelled": True}
+
+            seg_path = tts_dir / f"seg_{seg.index:04d}.wav"
+            temp_path = tts_dir / f"seg_{seg.index:04d}_raw.wav"
+            text = seg.translation or seg.text
+            if not text.strip():
+                seg_path.unlink(missing_ok=True)
+                temp_path.unlink(missing_ok=True)
+                return {"skipped": True, "index": seg.index, "start": seg.start,
+                        "target_duration": 0, "reason": "empty text"}
+            target_dur_val = target_durations.get(seg.index, seg.end - seg.start)
+            if target_dur_val <= 0:
+                seg_path.unlink(missing_ok=True)
+                temp_path.unlink(missing_ok=True)
+                return {
+                    "skipped": True, "index": seg.index, "start": seg.start,
+                    "target_duration": target_dur_val,
+                    "warning": "timing_warning: skipped, no safe gap before next segment",
+                }
+            return _synthesize_and_time(seg, text, temp_path, seg_path, target_dur_val)
+
+        # ------------------------------------------------------------------
+        # Chunk-based synthesis (stable / strict mode)
+        # ------------------------------------------------------------------
+        def synthesize_chunk(chunk: Any) -> List[Dict[str, Any]]:
+            results: List[Dict[str, Any]] = []
+            csegs = chunk_to_segments.get(chunk.chunk_index, [])
+            if not csegs:
+                return results
+
+            chunk_path = tts_dir / f"chunk_{chunk.chunk_index:04d}.wav"
+            chunk_temp = tts_dir / f"chunk_{chunk.chunk_index:04d}_raw.wav"
+
+            try:
+                result = provider.synthesize(
+                    chunk.text.strip(), target_lang, tts_voice, chunk_temp, options,
+                )
+            except Exception as e:
+                import traceback
+                tb = traceback.format_exc()
+                write_log(ws,
+                    f"  TTS chunk {chunk.chunk_index} failed | "
+                    f"segs={chunk.segment_indexes} "
+                    f"text_preview={chunk.text.strip()[:100]} "
+                    f"error={e}")
+                write_log(ws, f"  TTS traceback:\n{tb}")
+                for seg in csegs:
+                    seg_path = tts_dir / f"seg_{seg.index:04d}.wav"
+                    seg_path.unlink(missing_ok=True)
+                    results.append({
+                        "error": str(e), "index": seg.index, "start": seg.start,
+                        "target_duration": target_durations.get(seg.index, seg.end - seg.start),
+                    })
+                return results
+
+            normalize_result = normalize_tts_audio(chunk_temp) if callable(normalize_tts_audio) else None
+            normalized_chunk = Path(normalize_result) if normalize_result else chunk_temp
+            if normalized_chunk != chunk_path:
+                shutil.copy2(str(normalized_chunk), str(chunk_path))
+
+            chunk_dur = result.duration_seconds
+            if chunk_dur <= 0:
+                chunk_dur = _get_wav_duration_cached(chunk_path)
+            total_chars = sum(len(seg.translation or seg.text) for seg in csegs)
+
+            for seg in csegs:
+                seg_text = seg.translation or seg.text
+                seg_len = len(seg_text) if seg_text else 1
+                seg_path = tts_dir / f"seg_{seg.index:04d}.wav"
+                seg_target = target_durations.get(seg.index, seg.end - seg.start)
+
+                if chunk_dur > 0 and total_chars > 0:
+                    ratio = seg_len / total_chars
+                    estimated_dur = chunk_dur * ratio
+                else:
+                    estimated_dur = seg_target
+
+                if estimated_dur <= 0:
+                    seg_path.unlink(missing_ok=True)
+                    results.append({
+                        "skipped": True, "index": seg.index, "start": seg.start,
+                        "target_duration": seg_target,
+                        "warning": "estimated duration zero",
+                    })
+                    continue
+
+                if seg_target > 0 and estimated_dur > 0:
+                    adj_dur, warning, speed = adjust_timing(
+                        chunk_path, seg_path, estimated_dur, seg_target,
+                    )
+                    if not seg_path.exists():
+                        shutil.copy2(str(chunk_path), str(seg_path))
+                else:
+                    shutil.copy2(str(chunk_path), str(seg_path))
+                    warning = ""
+                    speed = None
+                    adj_dur = estimated_dur
+
+                results.append({
+                    "index": seg.index,
+                    "path": seg_path,
+                    "start": seg.start,
+                    "target_duration": seg_target,
+                    "actual_duration": estimated_dur,
+                    "adjusted_duration": adj_dur if seg_target > 0 else estimated_dur,
+                    "speed": speed,
+                    "warning": warning,
+                    "cached": getattr(result, "cached", False),
+                    "mode": getattr(result, "mode", options.get("qwen_mode", "")),
+                })
+
+            return results
+
+        # ------------------------------------------------------------------
+        # Main synthesis loop
+        # ------------------------------------------------------------------
         if tts_concurrency > 1:
             write_log(ws, f"  TTS concurrency: {tts_concurrency}")
+
+        if use_chunking:
+            for chunk in chunks:
+                if cancel_token.is_cancelled():
+                    self._mark_cancelled(job_id, ws)
+                    return False
+                chunk_results = synthesize_chunk(chunk)
+                for result in chunk_results:
+                    record_report(result)
+                    if result.get("error"):
+                        write_log(ws, f"  TTS failed for seg {result.get('index')}: {result['error']}")
+                    elif result.get("skipped") and result.get("warning"):
+                        write_log(ws, f"  TTS timing [{result.get('index')}]: {result['warning']}")
+                    elif result.get("path"):
+                        tts_segments.append((result["index"], result["path"], result["start"]))
+                        if result.get("warning"):
+                            write_log(ws, f"  TTS timing [{result['index']}]: {result['warning']}")
+                        if result.get("speed") is not None:
+                            speed_ratios[result["index"]] = result["speed"]
+                completed += len(chunk_results)
+                pct = int((completed / total) * 100) if total else 100
+                self._progress.update(job_id, "tts", pct, f"TTS synthesis {completed}/{total}")
+        elif tts_concurrency > 1:
             with ThreadPoolExecutor(max_workers=tts_concurrency) as executor:
                 futures = [executor.submit(synthesize_segment, seg) for seg in candidates]
                 for future in as_completed(futures):
@@ -853,7 +1103,7 @@ class PipelineRunner:
                     elif result.get("path"):
                         tts_segments.append((result["index"], result["path"], result["start"]))
                         if result.get("warning"):
-                            write_log(ws, f"  TTS timing [{result['index']}]: {result['warning']}")
+                            write_log(ws, f"  TTS timing [{result.get('index')}]: {result['warning']}")
                         if result.get("speed") is not None:
                             speed_ratios[result["index"]] = result["speed"]
                     completed += 1
@@ -910,18 +1160,18 @@ class PipelineRunner:
         if zero_byte_files:
             write_log(ws, f"  Warning: {len(zero_byte_files)} zero-byte TTS audio files detected")
 
-        import json
         index_path = tts_dir / "index.json"
         tts_segments.sort(key=lambda item: item[2])
         index_data = [{"index": idx, "path": str(p), "start": s}
                       for idx, p, s in tts_segments]
-        index_path.write_text(json.dumps(index_data, ensure_ascii=False), encoding="utf-8")
+        index_path.write_text(_json_module.dumps(index_data, ensure_ascii=False), encoding="utf-8")
 
         if speed_ratios:
             save_timing_report(speed_ratios, tts_dir / "timing_report.json")
 
         report_artifact = self._write_tts_control_report(
-            ws, report_rows, tts_provider_name, tts_voice, options
+            ws, report_rows, tts_provider_name, tts_voice, options,
+            consistency_mode=consistency_mode, profile_hash=profile_hash,
         )
         if report_artifact:
             self._store.add_artifact(job_id, report_artifact)
@@ -975,7 +1225,9 @@ class PipelineRunner:
 
     def _write_tts_control_report(self, ws: Path, rows: List[Dict[str, Any]],
                                   provider: str, voice: str,
-                                  options: Dict[str, Any]) -> Optional[Dict]:
+                                  options: Dict[str, Any],
+                                  consistency_mode: str = "",
+                                  profile_hash: str = "") -> Optional[Dict]:
         report_path = ws / "audio" / "tts" / "tts_control_report.json"
         report_path.parent.mkdir(parents=True, exist_ok=True)
         public_options = {
@@ -986,6 +1238,8 @@ class PipelineRunner:
             "provider": provider,
             "voice": voice,
             "options": public_options,
+            "consistency_mode": consistency_mode,
+            "voice_profile_hash": profile_hash,
             "total_segments": len(rows),
             "cached_segments": sum(1 for row in rows if row.get("cached")),
             "skipped_segments": sum(1 for row in rows if row.get("skipped")),

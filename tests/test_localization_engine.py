@@ -524,11 +524,11 @@ class TestPipelineTTSConcurrency(unittest.TestCase):
 
         with patch("tts.get_provider", return_value=FakeTTSProvider()), \
              patch("tts.timing.adjust_timing", return_value=(0.5, "", 1.0)):
-            ok = runner._run_tts(
+             ok = runner._run_tts(
                 "job-tts",
                 ws,
                 segments,
-                {"tts_provider": "fake", "tts_voice": "voice", "tts_concurrency": 3},
+                {"tts_provider": "fake", "tts_voice": "voice", "tts_concurrency": 3, "tts_consistency_mode": "fast"},
                 "zh-CN",
                 CancellationToken(),
             )
@@ -607,7 +607,7 @@ class TestPipelineTTSConcurrency(unittest.TestCase):
                 "job-tts",
                 ws,
                 segments,
-                {"tts_provider": "fake", "tts_voice": "voice", "tts_concurrency": 1},
+                {"tts_provider": "fake", "tts_voice": "voice", "tts_concurrency": 1, "tts_consistency_mode": "fast"},
                 "zh-CN",
                 CancellationToken(),
             )

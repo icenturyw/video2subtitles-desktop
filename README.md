@@ -88,6 +88,16 @@ python -m unittest discover -s tests
 
 ## 维护记录 / Maintenance Notes
 
+### 2026-06 — Qwen3-TTS 音色一致性修复
+
+- **TTS Voice Profile 冻结**：新增 `TtsVoiceProfile` 统一配置对象（`localization-engine/tts/voice_profile.py`），每个任务开始时将所有 TTS 参数（voice、model、seed、temperature、top_p、参考音频等）冻结为一个 profile，所有调用共用该 profile，杜绝逐句独立生成时参数漂移。
+- **字幕段合并（Chunking）**：新增 `buildTtsChunks`（`localization-engine/tts/chunking.py`），在 stable/strict 模式下自动将短字幕合并为较长 chunk（默认 500 字符 / 45 秒），大幅减少 TTS 独立调用次数，从源头解决音色不一致。
+- **三种一致性模式**：新增「音色一致性模式」下拉选择器，支持 `fast`（逐句生成，固定参数，速度优先）、`stable`（合并 chunk 生成，默认推荐）、`strict`（合并生成 + 详细日志 + 失败重试）。
+- **音频后处理统一**：新增 `normalize_tts_audio`（`localization-engine/audio/normalize.py`），所有 TTS 输出在合并前统一采样率（24kHz）、声道（mono）、响度（loudnorm）并去除首尾静音。
+- **错误码**：新增 `TTS_VOICE_PROFILE_MISMATCH`、`TTS_PROMPT_AUDIO_INVALID`、`TTS_TIMBRE_INCONSISTENT`、`TTS_CHUNK_GENERATION_FAILED`、`TTS_AUDIO_NORMALIZE_FAILED`。
+- **日志增强**：日志和 `tts_control_report.json` 中记录 voice_profile_hash、consistency_mode 等字段，支持事后排查音色不一致问题。
+- **测试**：新增 `tests/test_tts_voice_profile.py`，覆盖 profile hash 一致性、chunk 合并逻辑、空文本处理。
+
 ### 2026-06 — 本地化、翻译 API 与 Qwen3-TTS 增强
 
 - **TTS 音色选择与试听**：本地化设置的配音模式新增音色下拉、刷新和试听按钮；Edge-TTS 会按目标语言过滤音色，Qwen3-TTS 会优先读取本地 sidecar `/voices`，服务未启动时回退到预设音色。

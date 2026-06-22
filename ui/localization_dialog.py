@@ -234,12 +234,19 @@ def localization_runtime_config(settings: dict) -> dict | None:
         subtitle_mode_value = "bilingual"
 
     tts_provider = _provider_key(settings.get("tts_provider", "edge-tts"))
+    consistency_mode = str(
+        settings.get("tts_consistency_mode", "stable") or "stable"
+    ).lower()
+    if consistency_mode not in ("fast", "stable", "strict"):
+        consistency_mode = "stable"
+
     tts_options = {
         "qwen_mode": settings.get("tts_qwen_mode", "auto") or "auto",
         "instruct": settings.get("tts_qwen_instruct", ""),
         "ref_audio": settings.get("tts_qwen_ref_audio", ""),
         "ref_text": settings.get("tts_qwen_ref_text", ""),
         "tts_segment_gap": float(settings.get("tts_segment_gap", "0.04") or 0.04),
+        "tts_consistency_mode": consistency_mode,
     }
     for source_key, option_key, cast in [
         ("tts_qwen_seed", "seed", int),
@@ -275,6 +282,7 @@ def localization_runtime_config(settings: dict) -> dict | None:
         "tts_provider": tts_provider,
         "tts_voice": settings.get("tts_voice", ""),
         "tts_concurrency": int(settings.get("tts_concurrency", "1") or 1),
+        "tts_consistency_mode": consistency_mode,
         "tts_options": tts_options,
         "low_vram_mode": _bool_setting(settings.get("low_vram_mode"), True),
         "mute_original_audio": mute_original_audio,
@@ -503,6 +511,20 @@ class LocalizationDialog(QDialog):
         self.tts_concurrency.setValue(int(self._settings.get("tts_concurrency", 1)))
         tts_form.addRow("TTS 并发线程数:", self.tts_concurrency)
 
+        self.tts_consistency_mode = QComboBox()
+        self.tts_consistency_mode.setMinimumWidth(360)
+        self.tts_consistency_mode.addItems([
+            "stable (稳定 - 默认推荐)",
+            "fast (快速 - 逐句生成)",
+            "strict (严格 - 含校验重试)",
+        ])
+        self.tts_consistency_mode.setToolTip(
+            "快速：逐句生成，速度更快，但可能出现轻微音色漂移\n"
+            "稳定：合并多句生成，音色更一致，默认推荐\n"
+            "严格：稳定生成基础上增加校验和失败重试"
+        )
+        tts_form.addRow("音色一致性模式:", self.tts_consistency_mode)
+
         self.qwen_mode = QComboBox()
         self.qwen_mode.setMinimumWidth(360)
         self.qwen_mode.addItems([
@@ -696,6 +718,11 @@ class LocalizationDialog(QDialog):
         self.mute_original_audio.setChecked(mute_original_audio)
         self._on_mute_original_audio_changed(mute_original_audio)
         self.tts_concurrency.setValue(int(s.get("tts_concurrency", 1)))
+        consistency_mode = str(s.get("tts_consistency_mode", "stable") or "stable").lower()
+        for i in range(self.tts_consistency_mode.count()):
+            if self.tts_consistency_mode.itemText(i).startswith(consistency_mode):
+                self.tts_consistency_mode.setCurrentIndex(i)
+                break
         qwen_mode = s.get("tts_qwen_mode", "auto")
         for i in range(self.qwen_mode.count()):
             if self.qwen_mode.itemText(i).startswith(qwen_mode):
@@ -1069,6 +1096,7 @@ class LocalizationDialog(QDialog):
         self._settings["mute_original_audio"] = "true" if self.mute_original_audio.isChecked() else "false"
         self._settings["original_audio_volume_display"] = str(self.orig_volume.value())
         self._settings["tts_concurrency"] = str(self.tts_concurrency.value())
+        self._settings["tts_consistency_mode"] = self.tts_consistency_mode.currentText().split(" ", 1)[0]
         self._settings["tts_provider"] = self._current_tts_provider()
         self._settings["tts_voice"] = self._selected_tts_voice()
         ref_audio = self.qwen_ref_audio.text().strip()
@@ -1172,6 +1200,7 @@ class LocalizationDialog(QDialog):
         self._settings["translation_concurrency"] = str(self.trans_concurrency.value())
         self._settings["tts_provider"] = self._current_tts_provider()
         self._settings["tts_voice"] = self._selected_tts_voice()
+        self._settings["tts_consistency_mode"] = self.tts_consistency_mode.currentText().split(" ", 1)[0]
         self._settings["tts_qwen_mode"] = self.qwen_mode.currentText().split(" ", 1)[0]
         self._settings["tts_qwen_instruct"] = self.qwen_instruct.text().strip()
         self._settings["tts_qwen_ref_audio"] = self.qwen_ref_audio.text().strip()
