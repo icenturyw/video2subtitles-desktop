@@ -728,6 +728,10 @@ class PipelineRunner:
             else:
                 target_durations[seg.index] = nominal
 
+        write_log(ws, f"  TTS engine: {tts_provider_name}, voice: {tts_voice}, language: {target_lang}")
+        write_log(ws, f"  TTS segments: {total}, concurrency: {tts_concurrency}")
+        write_log(ws, f"  TTS output_dir: {tts_dir}")
+
         options = {
             "rate": "+0%",
             "pitch": "+0Hz",
@@ -772,6 +776,14 @@ class PipelineRunner:
                     text.strip(), target_lang, tts_voice, temp_path, options,
                 )
             except Exception as e:
+                import traceback
+                tb = traceback.format_exc()
+                write_log(ws,
+                    f"  TTS segment failed | index={seg.index} "
+                    f"start={seg.start} end={seg.end} "
+                    f"text_preview={text.strip()[:100]} "
+                    f"error={e}")
+                write_log(ws, f"  TTS traceback:\n{tb}")
                 seg_path.unlink(missing_ok=True)
                 temp_path.unlink(missing_ok=True)
                 return {"error": str(e), "index": seg.index, "start": seg.start,
@@ -875,8 +887,28 @@ class PipelineRunner:
                 self._progress.update(job_id, "tts", pct, f"TTS synthesis {completed}/{total}")
 
         if not tts_segments:
-            self._fail(job_id, ws, "TTS_NO_OUTPUT", "No TTS audio was generated")
+            if not candidates:
+                self._fail(job_id, ws, "TTS_EMPTY_INPUT",
+                           "没有可用于 TTS 的字幕文本，转写或翻译结果为空")
+            else:
+                audio_files = list(tts_dir.glob("seg_*.wav")) if tts_dir.exists() else []
+                if not audio_files:
+                    self._fail(job_id, ws, "TTS_NO_AUDIO_OUTPUT",
+                               "TTS 执行结束，但没有发现任何音频文件")
+                else:
+                    valid = [f for f in audio_files if f.stat().st_size > 0]
+                    if not valid:
+                        self._fail(job_id, ws, "TTS_ZERO_BYTE_AUDIO",
+                                   "TTS 生成了音频文件，但所有文件大小均为 0")
+                    else:
+                        self._fail(job_id, ws, "TTS_GENERATION_FAILED",
+                                   "TTS 语音合成执行异常")
             return False
+
+        audio_files = list(tts_dir.glob("seg_*.wav")) if tts_dir.exists() else []
+        zero_byte_files = [f for f in audio_files if f.stat().st_size == 0]
+        if zero_byte_files:
+            write_log(ws, f"  Warning: {len(zero_byte_files)} zero-byte TTS audio files detected")
 
         import json
         index_path = tts_dir / "index.json"

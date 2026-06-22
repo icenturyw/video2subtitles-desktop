@@ -724,6 +724,125 @@ class TestPipelineTTSConcurrency(unittest.TestCase):
         self.assertEqual(payload["options"]["seed"], 42)
         self.assertEqual(payload["options"]["seed_policy"], "default_stable")
 
+    def test_tts_empty_input_returns_specific_error(self):
+        from job_models import SubtitleSegment
+
+        ws = Path(self.tmpdir)
+        runner = PipelineRunner(TaskStore(ws / "data"), ProgressTracker())
+        runner._store.create("job-empty-tts", {"workspace_dir": str(ws)})
+
+        with patch("tts.get_provider") as mock_get:
+            ok = runner._run_tts(
+                "job-empty-tts", ws, [],
+                {"tts_provider": "edge-tts", "tts_voice": "voice"},
+                "zh-CN", CancellationToken(),
+            )
+
+        self.assertFalse(ok)
+        rec = runner._store.get("job-empty-tts")
+        self.assertEqual(rec.error_code, "TTS_EMPTY_INPUT")
+
+    def test_tts_blank_text_segments_returns_empty_input(self):
+        from job_models import SubtitleSegment
+
+        ws = Path(self.tmpdir)
+        runner = PipelineRunner(TaskStore(ws / "data"), ProgressTracker())
+        runner._store.create("job-blank-tts", {"workspace_dir": str(ws)})
+        segments = [
+            SubtitleSegment(index=1, start=0.0, end=1.0, text="   ", translation=""),
+            SubtitleSegment(index=2, start=1.0, end=2.0, text="", translation=""),
+        ]
+
+        with patch("tts.get_provider") as mock_get:
+            ok = runner._run_tts(
+                "job-blank-tts", ws, segments,
+                {"tts_provider": "edge-tts", "tts_voice": "voice"},
+                "zh-CN", CancellationToken(),
+            )
+
+        self.assertFalse(ok)
+        rec = runner._store.get("job-blank-tts")
+        self.assertEqual(rec.error_code, "TTS_EMPTY_INPUT")
+
+    def test_tts_engine_exception_returns_generation_failed(self):
+        from job_models import SubtitleSegment
+
+        class BrokenProvider:
+            def synthesize(self, text, language, voice, output_path, options):
+                raise RuntimeError("model crashed")
+            def list_voices(self, language=None):
+                return []
+
+        ws = Path(self.tmpdir)
+        runner = PipelineRunner(TaskStore(ws / "data"), ProgressTracker())
+        runner._store.create("job-broken-tts", {"workspace_dir": str(ws)})
+        segments = [SubtitleSegment(index=1, start=0.0, end=1.0, text="hello", translation="你好")]
+
+        with patch("tts.get_provider", return_value=BrokenProvider()):
+            ok = runner._run_tts(
+                "job-broken-tts", ws, segments,
+                {"tts_provider": "broken", "tts_voice": "v", "tts_concurrency": 1},
+                "zh-CN", CancellationToken(),
+            )
+
+        self.assertFalse(ok)
+        rec = runner._store.get("job-broken-tts")
+        self.assertIn(rec.error_code, ("TTS_GENERATION_FAILED", "TTS_NO_AUDIO_OUTPUT"))
+
+    def test_tts_no_audio_files_returns_no_audio_output(self):
+        from job_models import SubtitleSegment
+
+        class BrokenProvider:
+            def synthesize(self, text, language, voice, output_path, options):
+                raise RuntimeError("silent failure")
+            def list_voices(self, language=None):
+                return []
+
+        ws = Path(self.tmpdir)
+        runner = PipelineRunner(TaskStore(ws / "data"), ProgressTracker())
+        runner._store.create("job-no-out", {"workspace_dir": str(ws)})
+        segments = [SubtitleSegment(index=1, start=0.0, end=1.0, text="hello", translation="你好")]
+
+        with patch("tts.get_provider", return_value=BrokenProvider()):
+            ok = runner._run_tts(
+                "job-no-out", ws, segments,
+                {"tts_provider": "broken", "tts_voice": "v", "tts_concurrency": 1},
+                "zh-CN", CancellationToken(),
+            )
+
+        self.assertFalse(ok)
+        rec = runner._store.get("job-no-out")
+        self.assertEqual(rec.error_code, "TTS_NO_AUDIO_OUTPUT")
+
+    def test_tts_zero_byte_files_returns_zero_byte_audio(self):
+        from job_models import SubtitleSegment
+
+        class BrokenProvider:
+            def synthesize(self, text, language, voice, output_path, options):
+                raise RuntimeError("fail")
+            def list_voices(self, language=None):
+                return []
+
+        ws = Path(self.tmpdir)
+        tts_dir = ws / "audio" / "tts"
+        tts_dir.mkdir(parents=True)
+        (tts_dir / "seg_9999.wav").write_bytes(b"")
+        (tts_dir / "seg_9998.wav").write_bytes(b"")
+        runner = PipelineRunner(TaskStore(ws / "data"), ProgressTracker())
+        runner._store.create("job-zero", {"workspace_dir": str(ws)})
+        segments = [SubtitleSegment(index=1, start=0.0, end=1.0, text="hello", translation="你好")]
+
+        with patch("tts.get_provider", return_value=BrokenProvider()):
+            ok = runner._run_tts(
+                "job-zero", ws, segments,
+                {"tts_provider": "broken", "tts_voice": "v", "tts_concurrency": 1},
+                "zh-CN", CancellationToken(),
+            )
+
+        self.assertFalse(ok)
+        rec = runner._store.get("job-zero")
+        self.assertEqual(rec.error_code, "TTS_ZERO_BYTE_AUDIO")
+
     def test_qwen3_tts_fails_with_service_down(self):
         from job_models import SubtitleSegment
         from tts.base import TTSResult

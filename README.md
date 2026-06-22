@@ -408,6 +408,26 @@ whisper-server/cookies.txt
 
 `whisper-server/cookie_backups/` 和 cookies 文件不会提交到仓库。替换 cookies 后重新处理任务即可。
 
+### TTS 配音失败 / TTS Dubbing Failed
+
+如果生成任务提示 `TTS_EMPTY_INPUT`、`TTS_NO_AUDIO_OUTPUT`、`TTS_ZERO_BYTE_AUDIO` 或 `TTS_GENERATION_FAILED`，表示转写/翻译已经完成，但 TTS 阶段没有生成有效音频。
+
+常见原因：
+
+1. **TTS_EMPTY_INPUT**：字幕或翻译文本全为空，TTS 没有可朗读的内容。
+2. **TTS_NO_AUDIO_OUTPUT**：TTS 执行完成但输出目录无任何音频文件，可能是 TTS 模型未正确安装或引擎异常。
+3. **TTS_ZERO_BYTE_AUDIO**：TTS 生成了文件但全部为 0 字节，通常是引擎写文件失败或磁盘空间/权限问题。
+4. **TTS_GENERATION_FAILED**：引擎调用异常（如 Qwen3-TTS 服务未运行、voice 配置不存在）。
+5. **TTS 参数配置**：确保已选择有效的 voice、目标语言与 voice 匹配。
+
+排查命令：
+
+```powershell
+Select-String -Path "D:\software\video_2_subtitles\.cache\whisper-service.log" -Pattern "tts|TTS|Traceback|Exception|Error|audio|wav|mp3|voice|cuda|ffmpeg"
+```
+
+> 如果字幕已生成但 TTS 失败，程序会保留字幕结果，用户可以先导出字幕。
+
 ### pythonw 未找到 / pythonw Not Found
 
 启动脚本 `start.bat` / `start_debug.bat` 现在会自动查找可用的 Python 解释器：

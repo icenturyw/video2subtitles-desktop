@@ -36,6 +36,10 @@ class ErrorCode:
     TTS_NOT_INSTALLED = "TTS_NOT_INSTALLED"
     TTS_AUTH_FAILED = "TTS_AUTH_FAILED"
     TTS_FAILED = "TTS_FAILED"
+    TTS_EMPTY_INPUT = "TTS_EMPTY_INPUT"
+    TTS_GENERATION_FAILED = "TTS_GENERATION_FAILED"
+    TTS_NO_AUDIO_OUTPUT = "TTS_NO_AUDIO_OUTPUT"
+    TTS_ZERO_BYTE_AUDIO = "TTS_ZERO_BYTE_AUDIO"
     AUDIO_MIX_FAILED = "AUDIO_MIX_FAILED"
     TASK_CANCELLED = "TASK_CANCELLED"
     TASK_INTERRUPTED = "TASK_INTERRUPTED"
@@ -62,6 +66,10 @@ _ERROR_MESSAGES = {
     ErrorCode.TTS_NOT_INSTALLED: "TTS 服务未安装",
     ErrorCode.TTS_AUTH_FAILED: "TTS 认证失败",
     ErrorCode.TTS_FAILED: "语音合成失败",
+    ErrorCode.TTS_EMPTY_INPUT: "没有可用于 TTS 的字幕文本，转写或翻译结果为空",
+    ErrorCode.TTS_GENERATION_FAILED: "TTS 语音合成执行异常",
+    ErrorCode.TTS_NO_AUDIO_OUTPUT: "TTS 执行结束，但没有发现任何有效音频文件",
+    ErrorCode.TTS_ZERO_BYTE_AUDIO: "TTS 生成了音频文件，但文件大小均为 0",
     ErrorCode.AUDIO_MIX_FAILED: "音频混合失败",
     ErrorCode.TASK_CANCELLED: "任务已取消",
     ErrorCode.TASK_INTERRUPTED: "任务被中断（服务重启或崩溃）",

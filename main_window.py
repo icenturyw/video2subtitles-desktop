@@ -1128,7 +1128,7 @@ class ChatGPTPackageWorker(QThread):
 class LocalizationWorker(QThread):
     progress_updated = pyqtSignal(str, int, str, str)
     task_completed = pyqtSignal(str, str)
-    task_error = pyqtSignal(str, str)
+    task_error = pyqtSignal(str, str, str, str)  # file_path, error_code, message, error_detail
 
     def __init__(self, file_path, srt_path, source_video, config, output_dir):
         super().__init__()
@@ -1286,7 +1286,12 @@ class LocalizationWorker(QThread):
             elif status == "cancelled":
                 pass
             else:
-                self.task_error.emit(self.file_path, final.get("message", "处理失败"))
+                self.task_error.emit(
+                    self.file_path,
+                    final.get("error_code", ""),
+                    final.get("message", "处理失败"),
+                    final.get("error_detail", ""),
+                )
 
         except Exception as e:
             import traceback
@@ -2500,9 +2505,12 @@ class MainWindow(QMainWindow):
             widget.update_status("completed", 100, f"ASR 完成（翻译输出未找到）")
         self._update_progress()
 
-    def _on_localization_error(self, file_path, error_msg):
+    def _on_localization_error(self, file_path, error_code, error_msg, error_detail):
         if file_path in self.video_items:
-            self.video_items[file_path]["widget"].update_status("error", 0, error_msg[:80])
+            display = error_msg[:80]
+            if error_code:
+                display = f"[{error_code}] {display}"
+            self.video_items[file_path]["widget"].update_status("error", 0, display)
             self._update_progress()
 
 
