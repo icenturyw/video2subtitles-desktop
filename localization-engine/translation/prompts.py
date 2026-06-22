@@ -14,7 +14,9 @@ Requirements:
 5. Do not add, remove, or reorder segments.
 6. Adapt idioms and cultural references appropriately for {target_lang} audience.
 7. For Chinese output, use Simplified Chinese characters.
-8. Keep character names and proper nouns in their original form unless a well-known translation exists."""
+8. Keep character names and proper nouns in their original form unless a well-known translation exists.
+9. Copy every input "id" exactly as an integer. Never invent, skip, translate, or modify id values.
+10. Translate only the provided segments and stop after the final requested id."""
 
 TRANSLATE_PROMPT = """Translate the following subtitle segments from {source_lang} to {target_lang}.
 

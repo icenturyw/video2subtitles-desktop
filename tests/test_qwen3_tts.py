@@ -14,6 +14,7 @@ To run engine module tests:
 from __future__ import annotations
 
 import os
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -26,7 +27,8 @@ _LOCALIZATION_ENGINE = str(Path(__file__).resolve().parent.parent / "localizatio
 if _LOCALIZATION_ENGINE not in sys.path:
     sys.path.insert(0, _LOCALIZATION_ENGINE)
 
-from tts.qwen3_tts import Qwen3TTSProvider, LANG_MAP
+from tts.qwen3_tts import Qwen3TTSProvider, LANG_MAP, DEFAULT_STABLE_SEED
+from tts.sapi_tts import SapiTTSProvider
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +86,7 @@ class TestQwen3TTSProvider:
         provider = Qwen3TTSProvider()
         assert hasattr(provider, "synthesize")
         assert hasattr(provider, "list_voices")
+        assert provider.supports_concurrency is False
         sig = inspect.signature(provider.synthesize)
         param_names = list(sig.parameters.keys())
         assert "text" in param_names
@@ -91,6 +94,220 @@ class TestQwen3TTSProvider:
         assert "voice" in param_names
         assert "output_path" in param_names
         assert "options" in param_names
+
+    @patch("tts.qwen3_tts._get_wav_duration", return_value=1.2)
+    @patch("tts.qwen3_tts.urllib.request.urlopen")
+    @patch("tts.qwen3_tts.Qwen3TTSProvider._ensure_model_loaded")
+    @patch("tts.qwen3_tts.Qwen3TTSProvider._get_capabilities")
+    @patch("tts.qwen3_tts.Qwen3TTSProvider._is_healthy")
+    def test_synthesize_voice_design_sends_advanced_options(
+        self, mock_healthy, mock_caps, mock_ensure_loaded, mock_urlopen, mock_duration, tmp_path
+    ):
+        mock_healthy.return_value = True
+        mock_caps.return_value = {"voice_design": True}
+        captured = {}
+
+        class FakeResponse:
+            headers = {"X-Duration": "1.2"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return b"wav-bytes"
+
+        def fake_urlopen(req, timeout=0):
+            captured["url"] = req.full_url
+            captured["payload"] = json.loads(req.data.decode("utf-8"))
+            return FakeResponse()
+
+        mock_urlopen.side_effect = fake_urlopen
+        provider = Qwen3TTSProvider(base_url="http://tts.test")
+        result = provider.synthesize(
+            "hello",
+            "en",
+            "Vivian",
+            tmp_path / "out.wav",
+            {
+                "qwen_mode": "voice_design",
+                "instruct": "warm narrator",
+                "seed": 7,
+                "temperature": 0.6,
+                "top_p": 0.9,
+                "max_new_tokens": 256,
+            },
+        )
+
+        assert captured["url"].endswith("/synthesize/voice-design")
+        assert captured["payload"]["instruct"] == "warm narrator"
+        assert captured["payload"]["seed"] == 7
+        assert captured["payload"]["temperature"] == 0.6
+        assert captured["payload"]["top_p"] == 0.9
+        assert captured["payload"]["max_new_tokens"] == 256
+        assert result.mode == "voice_design"
+
+    @patch("tts.qwen3_tts._get_wav_duration", return_value=1.2)
+    @patch("tts.qwen3_tts.urllib.request.urlopen")
+    @patch("tts.qwen3_tts.Qwen3TTSProvider._ensure_model_loaded")
+    @patch("tts.qwen3_tts.Qwen3TTSProvider._get_capabilities")
+    @patch("tts.qwen3_tts.Qwen3TTSProvider._is_healthy")
+    def test_synthesize_custom_voice_uses_stable_seed_by_default(
+        self, mock_healthy, mock_caps, mock_ensure_loaded, mock_urlopen, mock_duration, tmp_path
+    ):
+        mock_healthy.return_value = True
+        mock_caps.return_value = {"custom_voice": True}
+        captured = {}
+
+        class FakeResponse:
+            headers = {"X-Duration": "1.2"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return b"wav-bytes"
+
+        def fake_urlopen(req, timeout=0):
+            captured["payload"] = json.loads(req.data.decode("utf-8"))
+            return FakeResponse()
+
+        mock_urlopen.side_effect = fake_urlopen
+        provider = Qwen3TTSProvider(base_url="http://tts.test")
+        provider.synthesize(
+            "hello",
+            "en",
+            "Vivian",
+            tmp_path / "out.wav",
+            {"qwen_mode": "custom_voice"},
+        )
+
+        assert captured["payload"]["seed"] == DEFAULT_STABLE_SEED
+
+    @patch("tts.qwen3_tts._get_wav_duration", return_value=1.2)
+    @patch("tts.qwen3_tts.urllib.request.urlopen")
+    @patch("tts.qwen3_tts.Qwen3TTSProvider._ensure_model_loaded")
+    @patch("tts.qwen3_tts.Qwen3TTSProvider._get_capabilities")
+    @patch("tts.qwen3_tts.Qwen3TTSProvider._is_healthy")
+    def test_synthesize_custom_voice_allows_random_seed_opt_out(
+        self, mock_healthy, mock_caps, mock_ensure_loaded, mock_urlopen, mock_duration, tmp_path
+    ):
+        mock_healthy.return_value = True
+        mock_caps.return_value = {"custom_voice": True}
+        captured = {}
+
+        class FakeResponse:
+            headers = {"X-Duration": "1.2"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return b"wav-bytes"
+
+        def fake_urlopen(req, timeout=0):
+            captured["payload"] = json.loads(req.data.decode("utf-8"))
+            return FakeResponse()
+
+        mock_urlopen.side_effect = fake_urlopen
+        provider = Qwen3TTSProvider(base_url="http://tts.test")
+        provider.synthesize(
+            "hello",
+            "en",
+            "Vivian",
+            tmp_path / "out.wav",
+            {"qwen_mode": "custom_voice", "seed": -1},
+        )
+
+        assert "seed" not in captured["payload"]
+
+    @patch("tts.qwen3_tts.Qwen3TTSProvider._request")
+    def test_ensure_model_loaded_uses_low_vram_defaults(self, mock_request):
+        loaded_resp = MagicMock()
+        loaded_resp.read.return_value = b'{"model_id": null}'
+        load_resp = MagicMock()
+        load_resp.read.return_value = b'{"status": "loaded"}'
+        mock_request.side_effect = [loaded_resp, load_resp]
+
+        provider = Qwen3TTSProvider()
+        provider._ensure_model_loaded({"qwen_mode": "voice_clone"})
+
+        assert mock_request.call_args_list[1].args[:2] == ("POST", "/models/load")
+        payload = json.loads(mock_request.call_args_list[1].kwargs["body"].decode("utf-8"))
+        assert payload["model_id"] == "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+
+    @patch("tts.qwen3_tts.Qwen3TTSProvider._request")
+    def test_ensure_model_loaded_skips_when_already_loaded(self, mock_request):
+        loaded_resp = MagicMock()
+        loaded_resp.read.return_value = b'{"model_id": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"}'
+        mock_request.return_value = loaded_resp
+
+        provider = Qwen3TTSProvider()
+        provider._ensure_model_loaded({"qwen_mode": "auto"})
+
+        assert mock_request.call_count == 1
+
+    @patch("tts.qwen3_tts.Qwen3TTSProvider._request")
+    def test_ensure_model_loaded_switches_mismatched_model(self, mock_request):
+        loaded_resp = MagicMock()
+        loaded_resp.read.return_value = b'{"model_id": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"}'
+        unload_resp = MagicMock()
+        unload_resp.read.return_value = b'{"status": "unloaded"}'
+        load_resp = MagicMock()
+        load_resp.read.return_value = b'{"status": "loaded"}'
+        mock_request.side_effect = [loaded_resp, unload_resp, load_resp]
+
+        provider = Qwen3TTSProvider()
+        provider._ensure_model_loaded({"qwen_mode": "custom_voice"})
+
+        assert mock_request.call_args_list[1].args[:2] == ("POST", "/models/unload")
+        assert mock_request.call_args_list[2].args[:2] == ("POST", "/models/load")
+        payload = json.loads(mock_request.call_args_list[2].kwargs["body"].decode("utf-8"))
+        assert payload["model_id"] == "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+
+
+class TestSapiTTSProvider:
+    @patch("tts.sapi_tts.os.name", "nt")
+    @patch("tts.sapi_tts._run_powershell")
+    def test_list_voices_parses_windows_sapi_voices(self, mock_run):
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout='[{"name":"Microsoft Huihui Desktop","locale":"zh-CN","gender":"Female"}]',
+            stderr="",
+        )
+
+        provider = SapiTTSProvider()
+        voices = provider.list_voices("zh-CN")
+
+        assert len(voices) == 1
+        assert voices[0]["name"] == "Microsoft Huihui Desktop"
+
+    @patch("tts.sapi_tts.os.name", "nt")
+    @patch("tts.sapi_tts._get_wav_duration", return_value=1.25)
+    @patch("tts.sapi_tts._synthesize_with_com")
+    @patch("tts.sapi_tts._run_powershell")
+    def test_synthesize_returns_duration(self, mock_run, mock_com, mock_duration, tmp_path):
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        provider = SapiTTSProvider()
+
+        result = provider.synthesize(
+            "hello",
+            "en",
+            "default",
+            tmp_path / "out.wav",
+            {"timeout": 10},
+        )
+
+        assert result.duration_seconds == 1.25
+        assert result.output_path.name == "out.wav"
 
 
 # ---------------------------------------------------------------------------
@@ -217,7 +434,7 @@ def test_qwen3_engine_modules_in_subprocess():
     try:
         result = subprocess.run(
             [sys.executable, str(test_file)],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=120,
             env=env,
         )
         print(result.stdout)

@@ -224,6 +224,22 @@ def main():
     except Exception as exc:
         _set_localization_status("error", f"启动失败: {exc}")
 
+    # Auto-start Qwen3-TTS sidecar when dub + qwen3-tts is configured.
+    try:
+        _settings = get_effective_settings()
+        if (
+            str(_settings.get("localization_mode", "") or "").strip() == "dub"
+            and "qwen3-tts" in str(_settings.get("tts_provider", "") or "").lower()
+        ):
+            import threading as _threading
+            _threading.Thread(
+                target=lambda: ensure_qwen3_tts_engine(),
+                daemon=True,
+                name="qwen3-tts-autostart",
+            ).start()
+    except Exception:
+        pass  # Do not block app startup
+
     window = MainWindow()
     window.show()
 

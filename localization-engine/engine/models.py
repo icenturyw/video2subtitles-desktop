@@ -16,7 +16,15 @@ class TranslationRequest(BaseModel):
     base_url: str = ""
     model: str = ""
     api_key_env: str = "V2S_TRANSLATION_API_KEY"
+    api_type: str = "auto"
     api_key: str = ""
+    temperature: float = 0.3
+    timeout: int = 60
+    max_batch_chars: int = 4000
+    max_batch_items: int = 10
+    retry_count: int = 3
+    concurrency: int = 2
+    quality_mode: str = "fast"
 
 
 class TranslationApiKeyRequest(BaseModel):
@@ -48,6 +56,10 @@ class CreateJobRequest(BaseModel):
     dubbing_enabled: bool = False
     tts_provider: str = "edge-tts"
     tts_voice: str = ""
+    tts_concurrency: int = 1
+    tts_options: Dict[str, Any] = Field(default_factory=dict)
+    original_volume: float = 0.0
+    low_vram_mode: bool = True
     translation: Optional[TranslationRequest] = None
     style: Optional[StyleRequest] = None
 

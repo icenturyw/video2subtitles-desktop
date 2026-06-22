@@ -6,6 +6,7 @@ from typing import Optional
 from tts.base import TTSProvider, TTSCache, TTSResult
 from tts.edge_tts import EdgeTTSProvider
 from tts.qwen3_tts import Qwen3TTSProvider
+from tts.sapi_tts import SapiTTSProvider
 
 _PROVIDER_CACHE: dict = {}
 _DEFAULT_EDGE_CACHE: Optional[TTSCache] = None
@@ -35,6 +36,8 @@ def get_provider(name: str = "edge-tts",
     elif name in ("qwen3-tts", "qwen3_tts", "qwen3"):
         from tts.qwen3_tts import Qwen3TTSProvider
         provider = Qwen3TTSProvider(cache=_get_edge_cache(cache_dir))
+    elif name in ("sapi", "windows-sapi", "windows_sapi"):
+        provider = SapiTTSProvider(cache=_get_edge_cache(cache_dir))
     else:
         raise ValueError(f"Unknown TTS provider: {name}")
 
@@ -74,4 +77,9 @@ def list_available_providers() -> list[dict]:
             "available": False,
             "service_running": False,
         })
+    providers.append({
+        "name": "sapi",
+        "available": __import__("os").name == "nt",
+        "local": True,
+    })
     return providers

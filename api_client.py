@@ -51,6 +51,17 @@ class WhisperApiClient:
             pass
         return None
 
+    def unload_model(self):
+        """Ask the local Whisper service to release its resident model."""
+        for path in ("/model/unload", "/models/unload"):
+            try:
+                r = self.session.post(f"{self.base_url}{path}", headers=self._headers(), timeout=5)
+                if r.status_code == 200:
+                    return True
+            except Exception:
+                pass
+        return False
+
     def transcribe_video(self, video_path, language=None, service="local", api_key=None):
         task_id = Path(video_path).stem.replace(" ", "_")
         payload = {

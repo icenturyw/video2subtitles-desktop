@@ -2,9 +2,10 @@
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
-from PyQt5.QtCore import QProcess, QProcessEnvironment
+from PyQt5.QtCore import pyqtSignal
 from PyQt5.QtWidgets import (
     QFileDialog,
     QFormLayout,
@@ -28,6 +29,7 @@ from client_settings import (
     get_effective_settings,
     save_settings,
 )
+from process_utils import hidden_subprocess_kwargs
 from whisper_config import find_python_executable
 
 
@@ -107,8 +109,7 @@ def _runtime_has_faster_whisper():
             "stderr": subprocess.DEVNULL,
             "timeout": 3,
         }
-        if os.name == "nt":
-            run_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        run_kwargs = hidden_subprocess_kwargs(run_kwargs)
         result = subprocess.run(
             [find_python_executable(), "-c", "import faster_whisper"],
             **run_kwargs,
@@ -160,11 +161,18 @@ def _combo_select_data(combo, value):
 class SettingsDialog(OriginalSettingsDialog):
     """Existing settings dialog plus model, download and diagnostics controls."""
 
+    _model_install_status_update = pyqtSignal(str, str)
+    _model_install_finished_signal = pyqtSignal(int)
+    _model_install_error_signal = pyqtSignal(str)
+
     def __init__(self, parent=None, current_output_dir=None):
         super().__init__(parent, current_output_dir)
         self.setFixedSize(700, 840)
         self.model_settings = get_effective_settings()
         self._model_install_process = None
+        self._model_install_status_update.connect(self._set_model_status)
+        self._model_install_finished_signal.connect(self._on_model_install_finished)
+        self._model_install_error_signal.connect(self._on_model_install_error)
         self._append_model_group()
 
     def _append_model_group(self):
@@ -335,24 +343,40 @@ class SettingsDialog(OriginalSettingsDialog):
         self.save_model_btn.setEnabled(False)
         self._set_model_status("正在安装/检查模型，请保持网络连接；窗口可以先放着。", "info")
 
-        env = QProcessEnvironment.systemEnvironment()
-        env.insert("WHISPER_MODEL_DIR", settings["whisper_model_dir"])
-        env.insert("MODEL_SIZE", settings["model_size"])
+        env = os.environ.copy()
+        env["WHISPER_MODEL_DIR"] = settings["whisper_model_dir"]
+        env["MODEL_SIZE"] = settings["model_size"]
         if settings.get("whisper_model_path"):
-            env.insert("WHISPER_MODEL_PATH", settings["whisper_model_path"])
+            env["WHISPER_MODEL_PATH"] = settings["whisper_model_path"]
         else:
-            env.remove("WHISPER_MODEL_PATH")
-        env.insert("DEVICE", os.environ.get("DEVICE", "cpu"))
-        env.insert("COMPUTE_TYPE", os.environ.get("COMPUTE_TYPE", "int8"))
+            env.pop("WHISPER_MODEL_PATH", None)
+        env["DEVICE"] = os.environ.get("DEVICE", "cpu")
+        env["COMPUTE_TYPE"] = os.environ.get("COMPUTE_TYPE", "int8")
+        env["PYTHONIOENCODING"] = "utf-8"
 
-        self._model_install_process = QProcess(self)
-        self._model_install_process.setProcessEnvironment(env)
-        self._model_install_process.setProcessChannelMode(QProcess.SeparateChannels)
-        self._model_install_process.readyReadStandardOutput.connect(self._read_model_install_stdout)
-        self._model_install_process.readyReadStandardError.connect(self._read_model_install_stderr)
-        self._model_install_process.finished.connect(self._on_model_install_finished)
-        self._model_install_process.errorOccurred.connect(self._on_model_install_error)
-        self._model_install_process.start(find_python_executable(), ["-c", INSTALL_MODEL_CODE])
+        def _run():
+            try:
+                process = subprocess.Popen(
+                    [find_python_executable(), "-c", INSTALL_MODEL_CODE],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    env=env,
+                    **hidden_subprocess_kwargs(),
+                )
+                self._model_install_process = process
+                output, _ = process.communicate()
+                if output:
+                    line = output.strip().splitlines()[-1][-220:]
+                    if line:
+                        self._model_install_status_update.emit(line, "info")
+                self._model_install_finished_signal.emit(process.returncode)
+            except Exception as exc:
+                self._model_install_error_signal.emit(str(exc))
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _read_model_install_stdout(self):
         if not self._model_install_process:
@@ -368,7 +392,7 @@ class SettingsDialog(OriginalSettingsDialog):
         if output:
             self._set_model_status(output.splitlines()[-1][-220:], "warning")
 
-    def _on_model_install_finished(self, exit_code, exit_status):
+    def _on_model_install_finished(self, exit_code, exit_status=None):
         self.install_model_btn.setEnabled(True)
         self.save_model_btn.setEnabled(True)
         if exit_code == 0:

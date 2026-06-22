@@ -92,6 +92,11 @@ python -m unittest discover -s tests
 
 - **TTS 音色选择与试听**：本地化设置的配音模式新增音色下拉、刷新和试听按钮；Edge-TTS 会按目标语言过滤音色，Qwen3-TTS 会优先读取本地 sidecar `/voices`，服务未启动时回退到预设音色。
 - **Qwen3-TTS sidecar**：新增 `qwen3-tts-engine/` 和 `ui/qwen_tts_setup_dialog.py`，支持本地 Qwen3-TTS 服务状态检测、模型加载、语音合成能力探测，以及与本地化引擎的 TTS provider 对接。
+- **Qwen3-TTS 服务生命周期修复**：此前 Qwen3-TTS sidecar 仅能通过手动对话框启动且 auto-start 函数从未被调用（死代码），导致 TTS 阶段服务未运行时报笼统 `No TTS audio was generated`。本次修复包括：
+  - `localization-engine/engine/pipeline.py`：TTS 合成前增加 `/health` 预检，服务不可用时立即以 `TTS_SERVICE_DOWN` 终止任务并给出明确操作指引（"请在设置→Qwen3-TTS 管理中启动服务"），替代逐段失败后笼统的 `TTS_NO_OUTPUT`。
+  - `main_window.py`：发起配音任务前探测 Qwen3-TTS 健康状态，不可用时尝试自动启动；仍失败时弹框阻止任务发出。
+  - `app.py main()`：当保存设置 `tts_provider == qwen3‑tts` 且 `localization_mode == dub` 时，后台 daemon 线程自动 `ensure_qwen3_tts_engine()`（仅起 HTTP 进程，不预加载模型，首请求按 `qwen_mode` 自动按需加载）。
+  - `tests/test_localization_engine.py`：新增 `test_qwen3_tts_fails_with_service_down` 回归测试，mock `/health` 返回连接拒绝，断言 pipeline 以 `TTS_SERVICE_DOWN` 失败；同时为既有稳定 seed 测试补上健康检查 mock。
 - **翻译设置保存修复**：`LocalizationDialog` 点击 OK 后会保存 `translation_base_url`、`translation_model`、`translation_api_key`，并调用 `apply_settings_to_env(..., overwrite=True)` 覆盖旧 `V2S_TRANSLATION_*` 运行时变量，避免旧环境变量反向覆盖新设置。
 - **翻译 Key 热更新**：本地化引擎新增 `/config/translation-api-key`，新任务也会把当前 Key 传给引擎但不会写入任务记录，避免重启前后继续使用旧 Key。
 - **OpenAI 兼容响应增强**：翻译客户端兼容 NewAPI 风格的 `data.choices` 响应；401/403/404/400 会保留服务端 JSON 错误详情，不可恢复错误不再重复重试，日志会继续脱敏 API Key。

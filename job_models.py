@@ -337,9 +337,11 @@ class TranslationConfig:
     base_url: str = ""
     model: str = ""
     api_key_env: str = "V2S_TRANSLATION_API_KEY"
+    api_type: Literal["auto", "responses", "chat_completions", "anthropic_messages"] = "auto"
     temperature: float = 0.3
     timeout: int = 60
     max_batch_chars: int = 4000
+    max_batch_items: int = 10
     retry_count: int = 3
     concurrency: int = 2
     quality_mode: Literal["fast", "quality"] = "fast"

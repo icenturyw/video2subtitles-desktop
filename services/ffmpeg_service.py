@@ -16,6 +16,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from process_utils import hidden_subprocess_kwargs
+
 logger = logging.getLogger("services.ffmpeg")
 
 
@@ -54,7 +56,7 @@ def get_ffmpeg_version() -> str:
         result = subprocess.run(
             [ffmpeg, "-version"],
             capture_output=True, text=True, timeout=10,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            **hidden_subprocess_kwargs(),
         )
         first_line = result.stdout.splitlines()[0] if result.stdout else ""
         return first_line.strip()
@@ -117,7 +119,7 @@ def probe_video(video_path: str | Path) -> Dict[str, Any]:
                 escape_path(video_path),
             ],
             capture_output=True, text=True, timeout=30,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            **hidden_subprocess_kwargs(),
         )
         import json
         data = json.loads(result.stdout)
@@ -156,17 +158,11 @@ class FFmpegProcess:
 
     def start(self) -> None:
         """Start the FFmpeg process."""
-        startupinfo = None
-        if os.name == "nt":
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-
         self._process = subprocess.Popen(
             self._cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            startupinfo=startupinfo,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            **hidden_subprocess_kwargs(),
         )
 
     def wait(self, timeout: Optional[float] = None) -> Tuple[bool, str, str]:
@@ -264,7 +260,7 @@ def render_hardsub(
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Write to .partial first, then rename atomically
-    partial_path = out_path.with_suffix(out_path.suffix + ".partial")
+    partial_path = out_path.with_name(f"{out_path.stem}.partial{out_path.suffix}")
 
     filter_str = _build_hardsub_filter(subtitle_path)
 
@@ -343,9 +339,9 @@ def render_softsub(
 
     out_path = Path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    partial_path = out_path.with_suffix(out_path.suffix + ".partial")
+    partial_path = out_path.with_name(f"{out_path.stem}.partial{out_path.suffix}")
 
-    codec_map = {"srt": "mov_text", "ass": "mov_text", "vtt": "mov_text"}
+    codec_map = {".srt": "mov_text", ".ass": "mov_text", ".vtt": "mov_text"}
     sub_codec = codec_map.get(ext, "mov_text")
 
     cmd = [
@@ -354,8 +350,8 @@ def render_softsub(
         "-i", escape_path(subtitle_path),
         "-c:v", "copy",
         "-c:a", "copy",
-        f"-c:s:{sub_codec}",
-        "-metadata:s:s:0", f"language={sub_codec}",
+        "-c:s", sub_codec,
+        "-metadata:s:s:0", "language=und",
         "-disposition:s:0", "default",
         escape_path(partial_path),
     ]

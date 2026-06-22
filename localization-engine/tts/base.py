@@ -10,6 +10,8 @@ from typing import Dict, List, Optional, Protocol
 class TTSResult:
     output_path: Path
     duration_seconds: float
+    cached: bool = False
+    mode: str = ""
 
 
 class TTSProvider(Protocol):
@@ -39,8 +41,8 @@ class TTSUnavailableError(TTSError):
     pass
 
 
-def _text_hash(text: str, voice: str, lang: str) -> str:
-    raw = f"{lang}|{voice}|{text}"
+def _text_hash(text: str, voice: str, lang: str, variant: str = "") -> str:
+    raw = f"{lang}|{voice}|{variant}|{text}"
     return hashlib.md5(raw.encode("utf-8")).hexdigest()[:16]
 
 
@@ -49,12 +51,12 @@ class TTSCache:
         self._cache_dir = cache_dir
         self._cache_dir.mkdir(parents=True, exist_ok=True)
 
-    def get(self, text: str, voice: str, language: str) -> Optional[Path]:
-        path = self._cache_dir / f"{_text_hash(text, voice, language)}.wav"
+    def get(self, text: str, voice: str, language: str, variant: str = "") -> Optional[Path]:
+        path = self._cache_dir / f"{_text_hash(text, voice, language, variant)}.wav"
         return path if path.exists() else None
 
-    def put(self, text: str, voice: str, language: str, audio_path: Path) -> Path:
-        dst = self._cache_dir / f"{_text_hash(text, voice, language)}.wav"
+    def put(self, text: str, voice: str, language: str, audio_path: Path, variant: str = "") -> Path:
+        dst = self._cache_dir / f"{_text_hash(text, voice, language, variant)}.wav"
         if not dst.exists():
             import shutil
             shutil.copy2(str(audio_path), str(dst))

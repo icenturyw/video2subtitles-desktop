@@ -4,6 +4,10 @@ import subprocess
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+from process_utils import hidden_subprocess_kwargs
+
+_MAX_DIRECT_SEGMENTS = 40
+
 
 def extract_audio(video_path: Path, output_path: Path) -> bool:
     """Extract original audio from video as WAV."""
@@ -17,6 +21,7 @@ def extract_audio(video_path: Path, output_path: Path) -> bool:
             ],
             capture_output=True, text=True, timeout=300,
             check=True,
+            **hidden_subprocess_kwargs(),
         )
         return output_path.exists()
     except Exception:
@@ -34,6 +39,7 @@ def get_audio_duration(audio_path: Path) -> float:
                 str(audio_path),
             ],
             capture_output=True, text=True, timeout=30,
+            **hidden_subprocess_kwargs(),
         )
         if result.returncode == 0 and result.stdout.strip():
             return float(result.stdout.strip())
@@ -47,7 +53,7 @@ def mix_audio(
     tts_segments: List[Tuple[Path, float]],
     output_path: Path,
     *,
-    original_volume: float = 0.3,
+    original_volume: float = 0.0,
     cancel_checker=None,
     log_path: Optional[Path] = None,
 ) -> dict:
@@ -57,7 +63,7 @@ def mix_audio(
         video_path: Source video file.
         tts_segments: List of (wav_path, start_time_seconds).
         output_path: Output video path with mixed audio.
-        original_volume: Volume multiplier for original audio (0.0-1.0).
+        original_volume: Volume multiplier for original audio (0.0 disables it).
         cancel_checker: Optional callable returning True if cancelled.
         log_path: Optional path for FFmpeg log output.
     
@@ -71,11 +77,25 @@ def mix_audio(
         return {"success": False, "error": "no TTS segments"}
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    tts_segments = [(Path(p), float(start)) for p, start in tts_segments if Path(p).exists()]
+    if not tts_segments:
+        return {"success": False, "error": "no existing TTS segment files"}
+
+    if len(tts_segments) > _MAX_DIRECT_SEGMENTS:
+        return _mix_audio_chunked(
+            video_path=video_path,
+            tts_segments=tts_segments,
+            output_path=output_path,
+            original_volume=original_volume,
+            cancel_checker=cancel_checker,
+            log_path=log_path,
+        )
 
     # Build filter graph
     input_files = [str(video_path)]
     filter_parts = []
     audio_input_idx = 1
+    has_original_audio = original_volume > 0 and _video_has_audio(video_path)
 
     for i, (wav_path, _) in enumerate(tts_segments):
         input_files.append(str(wav_path))
@@ -87,13 +107,17 @@ def mix_audio(
 
     all_labels = "".join(f"[s{i}]" for i in range(len(tts_segments)))
     filter_parts.append(f"{all_labels}amix=inputs={len(tts_segments)}:normalize=0[tts_mix]")
-    filter_parts.append(f"[0:a]volume={original_volume:.2f}[orig]")
-    filter_parts.append("[orig][tts_mix]amix=inputs=2:duration=first[out]")
+    if has_original_audio:
+        filter_parts.append(f"[0:a]volume={original_volume:.2f}[orig]")
+        filter_parts.append("[orig][tts_mix]amix=inputs=2:duration=first[out]")
+        audio_map = "[out]"
+    else:
+        audio_map = "[tts_mix]"
 
     filter_complex = ";".join(filter_parts)
-    cmd = ["ffmpeg", "-y"] + sum((["-i", f] for f in input_files), []) + [
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning"] + sum((["-i", f] for f in input_files), []) + [
         "-filter_complex", filter_complex,
-        "-map", "0:v", "-map", "[out]",
+        "-map", "0:v", "-map", audio_map,
         "-c:v", "copy",
         "-c:a", "aac", "-b:a", "128k",
         str(output_path),
@@ -103,6 +127,7 @@ def mix_audio(
         result = subprocess.run(
             cmd,
             capture_output=True, text=True, timeout=600,
+            **hidden_subprocess_kwargs(),
         )
         if log_path:
             log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -125,12 +150,175 @@ def mix_audio(
         return {"success": False, "error": str(e)}
 
 
+def _mix_audio_chunked(
+    video_path: Path,
+    tts_segments: List[Tuple[Path, float]],
+    output_path: Path,
+    *,
+    original_volume: float,
+    cancel_checker=None,
+    log_path: Optional[Path] = None,
+) -> dict:
+    """Mix many TTS clips without exceeding Windows command-line limits."""
+    work_dir = output_path.parent / f"{output_path.stem}_audio_chunks"
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    chunk_outputs: List[Path] = []
+    try:
+        for chunk_index, start in enumerate(range(0, len(tts_segments), _MAX_DIRECT_SEGMENTS), 1):
+            if cancel_checker and cancel_checker():
+                return {"success": False, "cancelled": True}
+            chunk = tts_segments[start:start + _MAX_DIRECT_SEGMENTS]
+            chunk_output = work_dir / f"tts_chunk_{chunk_index:04d}.wav"
+            result = _mix_tts_chunk(chunk, chunk_output, log_path=log_path)
+            if not result.get("success"):
+                return result
+            chunk_outputs.append(chunk_output)
+
+        if cancel_checker and cancel_checker():
+            return {"success": False, "cancelled": True}
+
+        tts_mix = work_dir / "tts_mix.wav"
+        result = _mix_chunk_outputs(chunk_outputs, tts_mix, log_path=log_path)
+        if not result.get("success"):
+            return result
+
+        return _mux_tts_with_video(
+            video_path=video_path,
+            tts_audio=tts_mix,
+            output_path=output_path,
+            original_volume=original_volume,
+            log_path=log_path,
+        )
+    finally:
+        pass
+
+
+def _mix_tts_chunk(
+    tts_segments: List[Tuple[Path, float]],
+    output_path: Path,
+    *,
+    log_path: Optional[Path] = None,
+) -> dict:
+    input_files = [str(path) for path, _ in tts_segments]
+    filter_parts = []
+    for i, (_, start_sec) in enumerate(tts_segments):
+        delay_ms = max(0, int(start_sec * 1000))
+        filter_parts.append(f"[{i}:a]adelay={delay_ms}|{delay_ms}[s{i}]")
+    all_labels = "".join(f"[s{i}]" for i in range(len(tts_segments)))
+    filter_parts.append(f"{all_labels}amix=inputs={len(tts_segments)}:normalize=0[out]")
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning"]
+    for file in input_files:
+        cmd.extend(["-i", file])
+    cmd.extend([
+        "-filter_complex", ";".join(filter_parts),
+        "-map", "[out]",
+        "-ac", "2",
+        "-ar", "44100",
+        str(output_path),
+    ])
+    return _run_ffmpeg(cmd, output_path, log_path=log_path, label="mix-chunk")
+
+
+def _mix_chunk_outputs(
+    chunk_outputs: List[Path],
+    output_path: Path,
+    *,
+    log_path: Optional[Path] = None,
+) -> dict:
+    if len(chunk_outputs) == 1:
+        import shutil
+        shutil.copy2(str(chunk_outputs[0]), str(output_path))
+        return {"success": True}
+
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning"]
+    for path in chunk_outputs:
+        cmd.extend(["-i", str(path)])
+    labels = "".join(f"[{i}:a]" for i in range(len(chunk_outputs)))
+    cmd.extend([
+        "-filter_complex", f"{labels}amix=inputs={len(chunk_outputs)}:normalize=0[out]",
+        "-map", "[out]",
+        "-ac", "2",
+        "-ar", "44100",
+        str(output_path),
+    ])
+    return _run_ffmpeg(cmd, output_path, log_path=log_path, label="mix-tts")
+
+
+def _mux_tts_with_video(
+    video_path: Path,
+    tts_audio: Path,
+    output_path: Path,
+    *,
+    original_volume: float,
+    log_path: Optional[Path] = None,
+) -> dict:
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+        "-i", str(video_path),
+        "-i", str(tts_audio),
+    ]
+    if original_volume > 0 and _video_has_audio(video_path):
+        cmd.extend([
+            "-filter_complex",
+            f"[0:a]volume={original_volume:.2f}[orig];[orig][1:a]amix=inputs=2:duration=first[out]",
+            "-map", "0:v",
+            "-map", "[out]",
+        ])
+    else:
+        cmd.extend(["-map", "0:v", "-map", "1:a"])
+    cmd.extend([
+        "-c:v", "copy",
+        "-c:a", "aac", "-b:a", "128k",
+        str(output_path),
+    ])
+    return _run_ffmpeg(cmd, output_path, log_path=log_path, label="mux-video")
+
+
+def _run_ffmpeg(cmd: List[str], output_path: Path, *, log_path: Optional[Path], label: str) -> dict:
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=1800,
+        **hidden_subprocess_kwargs(),
+    )
+    if log_path:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"[{label}] cmd inputs={cmd.count('-i')} output={output_path}\n")
+            f.write(f"[{label}] stderr: {result.stderr[-1200:]}\n")
+    if result.returncode != 0:
+        return {"success": False, "error": result.stderr[-2000:].strip()}
+    if not output_path.exists():
+        return {"success": False, "error": "output file not created"}
+    return {"success": True}
+
+
+def _video_has_audio(video_path: Path) -> bool:
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "a:0",
+                "-show_entries", "stream=codec_type",
+                "-of", "csv=p=0",
+                str(video_path),
+            ],
+            capture_output=True, text=True, timeout=30,
+            **hidden_subprocess_kwargs(),
+        )
+        return result.returncode == 0 and bool(result.stdout.strip())
+    except Exception:
+        return False
+
+
 def mix_simple_audio(
     video_path: Path,
     dubbed_audio: Path,
     output_path: Path,
     *,
-    original_volume: float = 0.3,
+    original_volume: float = 0.0,
     cancel_checker=None,
 ) -> dict:
     """Simpler mix: overlay a single dubbed audio track onto video.
@@ -145,16 +333,30 @@ def mix_simple_audio(
             "ffmpeg", "-y",
             "-i", str(video_path),
             "-i", str(dubbed_audio),
-            "-filter_complex",
-            f"[0:a]volume={original_volume:.2f}[orig];"
-            f"[orig][1:a]amix=inputs=2:duration=first[out]",
-            "-map", "0:v",
-            "-map", "[out]",
+        ]
+        if original_volume > 0 and _video_has_audio(video_path):
+            cmd.extend([
+                "-filter_complex",
+                f"[0:a]volume={original_volume:.2f}[orig];"
+                f"[orig][1:a]amix=inputs=2:duration=first[out]",
+                "-map", "0:v",
+                "-map", "[out]",
+            ])
+        else:
+            cmd.extend(["-map", "0:v", "-map", "1:a"])
+        cmd.extend([
             "-c:v", "copy",
             "-c:a", "aac", "-b:a", "128k",
             str(output_path),
-        ]
-        subprocess.run(cmd, capture_output=True, text=True, timeout=600, check=True)
+        ])
+        subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=600,
+            check=True,
+            **hidden_subprocess_kwargs(),
+        )
         return {"success": True} if output_path.exists() else {"success": False, "error": "output not created"}
     except subprocess.TimeoutExpired:
         return {"success": False, "error": "FFmpeg timed out"}

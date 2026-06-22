@@ -6,7 +6,7 @@ import webbrowser
 from pathlib import Path
 
 from PyQt5.QtCore import (
-    Qt, QObject, QThread, QProcess, pyqtSignal, QTimer, QSize, QRectF,
+    Qt, QObject, QThread, pyqtSignal, QTimer, QSize, QRectF,
     QPropertyAnimation, QEasingCurve, pyqtProperty,
 )
 from PyQt5.QtGui import (
@@ -31,6 +31,7 @@ from history import HistoryManager
 from subtitle_utils import format_subtitle_time, sanitize_filename
 from localization_client import LocalizationClient
 from client_settings import get_effective_settings
+from process_utils import hidden_subprocess_kwargs
 from ui.localization_dialog import LocalizationDialog, localization_runtime_config
 
 
@@ -707,10 +708,30 @@ class TitleFetcher(QObject):
         self._proc = None
 
     def start(self):
-        self._proc = QProcess(self)
-        self._proc.setProcessChannelMode(QProcess.MergedChannels)
-        self._proc.finished.connect(self._on_finished)
-        self._proc.start('yt-dlp', ['--print', 'title', '--no-playlist', self.url])
+        import subprocess
+
+        cmd = ["yt-dlp", "--print", "title", "--no-playlist", self.url]
+
+        def _run():
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=90,
+                    **hidden_subprocess_kwargs(),
+                )
+                if proc.returncode == 0:
+                    raw = (proc.stdout or "").strip()
+                    if raw:
+                        self.title_ready.emit(self.url, raw[:100])
+            except Exception:
+                pass
+
+        self._proc = None
+        threading.Thread(target=_run, daemon=True).start()
 
     def _on_finished(self, exit_code):
         if exit_code == 0 and self._proc:
@@ -990,8 +1011,7 @@ class ChatGPTPackageWorker(QThread):
 
         try:
             run_kwargs = {"check": True}
-            if os.name == "nt":
-                run_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            run_kwargs = hidden_subprocess_kwargs(run_kwargs)
 
             ffmpeg = shutil.which("ffmpeg")
             if not ffmpeg:
@@ -1129,6 +1149,56 @@ class LocalizationWorker(QThread):
             except Exception:
                 pass
 
+    def _resolve_output_srt(self, workspace: Path, final: dict) -> Path | None:
+        target_lang = str(self.config.get("target_language", "zh-CN") or "zh-CN")
+        artifacts = final.get("artifacts") or []
+
+        def artifact_path(kind: str) -> Path | None:
+            for artifact in artifacts:
+                if artifact.get("kind") != kind:
+                    continue
+                path = artifact.get("path") or ""
+                candidate = workspace / path
+                if candidate.exists():
+                    return candidate
+            return None
+
+        # The final "_translated.srt" should contain target-language subtitles.
+        for kind in ("translated_srt", "bilingual_srt"):
+            candidate = artifact_path(kind)
+            if candidate:
+                return candidate
+
+        subs_dir = workspace / "subtitles"
+        fallback_names = [
+            f"{target_lang}.srt",
+            f"bilingual_{target_lang}.srt",
+            f"{target_lang.lower()}.srt",
+            f"bilingual_{target_lang.lower()}.srt",
+        ]
+        for name in fallback_names:
+            candidate = subs_dir / name
+            if candidate.exists():
+                return candidate
+
+        legacy_dir = workspace / "translation"
+        legacy_names = [
+            f"{self.srt_path.stem}_translated.srt",
+            self.srt_path.name,
+        ]
+        for name in legacy_names:
+            candidate = legacy_dir / name
+            if candidate.exists():
+                return candidate
+
+        for directory in (subs_dir, legacy_dir):
+            if directory.exists():
+                srt_files = sorted(directory.glob("*.srt"))
+                if srt_files:
+                    return srt_files[0]
+
+        return None
+
     def run(self):
         try:
             self.progress_updated.emit(self.file_path, 0, "准备本地化工作空间...", "processing")
@@ -1158,6 +1228,12 @@ class LocalizationWorker(QThread):
                 self.task_error.emit(self.file_path, "本地化引擎未启动，请先启动服务")
                 return
 
+            self.progress_updated.emit(self.file_path, 8, "释放 Whisper 显存，准备翻译/配音...", "processing")
+            try:
+                WhisperApiClient().unload_model()
+            except Exception:
+                pass
+
             self.progress_updated.emit(self.file_path, 10, "提交翻译任务...", "processing")
             cfg = self.config
             result = self._client.create_job(
@@ -1172,6 +1248,10 @@ class LocalizationWorker(QThread):
                 dubbing_enabled=cfg.get("dubbing_enabled", False),
                 tts_provider=cfg.get("tts_provider", "edge-tts"),
                 tts_voice=cfg.get("tts_voice", ""),
+                tts_concurrency=cfg.get("tts_concurrency", 1),
+                tts_options=cfg.get("tts_options", {}),
+                original_volume=cfg.get("original_volume", 0.0),
+                low_vram_mode=cfg.get("low_vram_mode", True),
                 translation=cfg.get("translation_config"),
             )
 
@@ -1196,15 +1276,8 @@ class LocalizationWorker(QThread):
 
             status = final.get("status")
             if status == "completed":
-                trans_dir = workspace / "translation"
-                output_srt = trans_dir / f"{self.srt_path.stem}_translated.srt"
-                if not output_srt.exists():
-                    output_srt = trans_dir / source_srt_name
-                if not output_srt.exists():
-                    srt_files = list(trans_dir.glob("*.srt"))
-                    if srt_files:
-                        output_srt = srt_files[0]
-                if output_srt.exists():
+                output_srt = self._resolve_output_srt(workspace, final)
+                if output_srt and output_srt.exists():
                     dst = self.srt_path.parent / f"{self.srt_path.stem}_translated.srt"
                     shutil.copy2(str(output_srt), str(dst))
                     self.task_completed.emit(self.file_path, str(dst))
@@ -1840,7 +1913,7 @@ class MainWindow(QMainWindow):
             self.file_list.setItemWidget(item, widget)
             self.video_items[url] = {"item": item, "widget": widget, "is_url": True, "title": None}
 
-            # Fetch title asynchronously via QProcess (no threading issues)
+            # Fetch title asynchronously without flashing a helper console window.
             fetcher = TitleFetcher(url, self)
             fetcher.title_ready.connect(self._on_title_fetched)
             if not hasattr(self, '_fetchers'):
@@ -2336,6 +2409,34 @@ class MainWindow(QMainWindow):
             self._localization_config = None
 
     def _start_localization(self, file_path, srt_path):
+        # Preflight: ensure Qwen3-TTS sidecar is running before launching a dub job
+        cfg = self._localization_config or {}
+        if cfg.get("is_dub_mode") and "qwen3-tts" in str(cfg.get("tts_provider", "") or ""):
+            import json as _json
+            import urllib.request as _urllib
+            _healthy = False
+            try:
+                with _urllib.urlopen("http://127.0.0.1:8767/health", timeout=2) as _r:
+                    _healthy = _json.loads(_r.read().decode("utf-8")).get("status") == "ok"
+            except Exception:
+                _healthy = False
+            if not _healthy:
+                # Attempt to auto-start the sidecar
+                try:
+                    from app import ensure_qwen3_tts_engine
+                    if ensure_qwen3_tts_engine():
+                        _healthy = True
+                except Exception:
+                    _healthy = False
+                if not _healthy:
+                    from PyQt5.QtWidgets import QMessageBox
+                    QMessageBox.warning(
+                        self, "Qwen3-TTS 服务未运行",
+                        "当前使用配音模式 + Qwen3-TTS，但本地服务未运行。\n\n"
+                        "请先在 设置 → Qwen3-TTS 管理 中点击「启动服务」后重试。",
+                    )
+                    return
+
         is_url = self.video_items.get(file_path, {}).get("is_url", False)
         if is_url:
             srt_path_obj = Path(srt_path)

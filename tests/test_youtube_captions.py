@@ -21,6 +21,17 @@ def test_caption_language_candidates_prefers_simplified_chinese():
     assert server._caption_language_candidates("auto") == []
 
 
+def test_unload_model_clears_resident_whisper_model(monkeypatch):
+    server = _load_whisper_server()
+    monkeypatch.setattr(server, "MODEL", object())
+    monkeypatch.setattr(server, "MODEL_KEY", ("base", "cuda"))
+
+    assert server._unload_model() is True
+    assert server.MODEL is None
+    assert server.MODEL_KEY is None
+    assert server._unload_model() is False
+
+
 def test_select_caption_track_prefers_manual_then_json3():
     server = _load_whisper_server()
     info = {

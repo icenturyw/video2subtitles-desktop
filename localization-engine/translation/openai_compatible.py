@@ -63,6 +63,19 @@ def _extract_response_content(result: Any) -> str:
     if isinstance(wrapped_data, dict):
         return _extract_response_content(wrapped_data)
 
+    anthropic_content = result.get("content")
+    if isinstance(anthropic_content, list):
+        parts = []
+        for item in anthropic_content:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if text is not None:
+                    parts.append(str(text))
+            else:
+                parts.append(str(item))
+        if parts:
+            return "".join(parts)
+
     choices = result.get("choices")
     if isinstance(choices, list) and choices:
         first = choices[0]
@@ -88,6 +101,26 @@ def _extract_response_content(result: Any) -> str:
         if value is not None:
             return str(value)
 
+    output = result.get("output")
+    if isinstance(output, list):
+        parts = []
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    if part.get("text") is not None:
+                        parts.append(str(part.get("text")))
+                    elif part.get("type") in ("output_text", "text") and part.get("content") is not None:
+                        parts.append(str(part.get("content")))
+            elif item.get("text") is not None:
+                parts.append(str(item.get("text")))
+        if parts:
+            return "".join(parts)
+
     for key in ("translations", "items", "segments", "result", "data"):
         value = result.get(key)
         if isinstance(value, list):
@@ -109,7 +142,7 @@ def _response_error_detail(response: httpx.Response) -> str:
 
 
 class OpenAICompatibleProvider(TranslationProvider):
-    """Translates subtitles via any OpenAI-compatible chat completions API."""
+    """Translates subtitles via OpenAI-compatible or Anthropic-compatible APIs."""
 
     def __init__(self):
         self._client: Optional[httpx.Client] = None
@@ -123,6 +156,107 @@ class OpenAICompatibleProvider(TranslationProvider):
     @classmethod
     def provider_name(cls) -> str:
         return "openai_compatible"
+
+    def _endpoint_order(self, api_type: str) -> List[str]:
+        value = str(api_type or "auto").strip().lower()
+        if value in {"responses", "response", "openai_responses"}:
+            return ["responses"]
+        if value in {"chat", "chat_completions", "chat-completions"}:
+            return ["chat_completions"]
+        if value in {"anthropic", "anthropic_messages", "messages", "claude"}:
+            return ["anthropic_messages"]
+        return ["responses", "chat_completions", "anthropic_messages"]
+
+    def _auto_endpoint_order(self, api_type: str, model: str, base_url: str) -> List[str]:
+        explicit = self._endpoint_order(api_type)
+        value = str(api_type or "auto").strip().lower()
+        if value not in {"", "auto"}:
+            return explicit
+
+        model_lower = str(model or "").lower()
+        base_lower = str(base_url or "").lower()
+        if "claude" in model_lower or "anthropic" in base_lower:
+            return ["anthropic_messages", "responses", "chat_completions"]
+        return explicit
+
+    def _build_payload(self, endpoint: str, model: str, system_prompt: str,
+                       user_prompt: str, temperature: float) -> Dict[str, Any]:
+        if endpoint == "responses":
+            return {
+                "model": model,
+                "instructions": system_prompt,
+                "input": user_prompt,
+            }
+        if endpoint == "anthropic_messages":
+            return {
+                "model": model,
+                "max_tokens": 4096,
+                "system": system_prompt,
+                "messages": [
+                    {"role": "user", "content": user_prompt},
+                ],
+            }
+        return {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": temperature,
+            # Note: response_format removed - not supported by all OpenAI-compatible servers
+        }
+
+    def _endpoint_url(self, base_url: str, endpoint: str) -> str:
+        if endpoint == "responses":
+            return f"{base_url}/responses"
+        if endpoint == "anthropic_messages":
+            if base_url.endswith("/v1"):
+                return f"{base_url}/messages"
+            return f"{base_url}/v1/messages"
+        return f"{base_url}/chat/completions"
+
+    def _is_endpoint_fallback_error(self, response: httpx.Response) -> bool:
+        if response.status_code in (404, 405):
+            return True
+        if response.status_code != 400:
+            return False
+        detail = _response_error_detail(response).lower()
+        markers = (
+            "responses", "chat/completions", "unsupported endpoint",
+            "unknown endpoint", "unknown url", "not found", "not supported",
+            "messages",
+        )
+        return any(marker in detail for marker in markers)
+
+    def _can_fallback_endpoint(self, api_type: str, endpoint_index: int,
+                               endpoints: List[str]) -> bool:
+        value = str(api_type or "auto").strip().lower()
+        return value in {"", "auto"} and endpoint_index < len(endpoints) - 1
+
+    def _post_endpoint(self, endpoint: str, base_url: str,
+                       payload: Dict[str, Any], headers: Dict[str, str],
+                       timeout: int) -> httpx.Response:
+        endpoint_headers = dict(headers)
+        if endpoint == "anthropic_messages":
+            endpoint_headers["anthropic-beta"] = "context-1m-2025-08-07"
+        response = self.client.post(
+            self._endpoint_url(base_url, endpoint),
+            json=payload,
+            headers=endpoint_headers,
+            timeout=timeout,
+        )
+        if response.status_code == 400 and "temperature" in payload:
+            detail = _response_error_detail(response).lower()
+            if "temperature" in detail and ("unsupported" in detail or "unknown" in detail):
+                slim_payload = dict(payload)
+                slim_payload.pop("temperature", None)
+                response = self.client.post(
+                    self._endpoint_url(base_url, endpoint),
+                    json=slim_payload,
+                    headers=endpoint_headers,
+                    timeout=timeout,
+                )
+        return response
 
     def translate_batch(self, segments: List[Dict], config: TranslationConfig,
                         source_lang: str, target_lang: str,
@@ -155,110 +289,145 @@ class OpenAICompatibleProvider(TranslationProvider):
         }
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
+            headers["x-api-key"] = api_key
+        headers["anthropic-version"] = "2023-06-01"
 
-        payload = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "temperature": temperature,
-            # Note: response_format removed - not supported by all OpenAI-compatible servers
-        }
+        endpoints = self._auto_endpoint_order(
+            getattr(config, "api_type", "auto"), model, base_url
+        )
 
         last_error: Optional[Exception] = None
-        for attempt in range(max(1, config.retry_count + 1)):
-            try:
-                response = self.client.post(
-                    f"{base_url}/chat/completions",
-                    json=payload,
-                    headers=headers,
-                    timeout=config.timeout,
+        max_attempts = max(1, config.retry_count + 1)
+        for attempt in range(max_attempts):
+            for endpoint_index, endpoint in enumerate(endpoints):
+                payload = self._build_payload(
+                    endpoint, model, system_prompt, user_prompt, temperature
                 )
-
-                if response.status_code in (401, 403):
-                    raise AuthError(_response_error_detail(response))
-                elif response.status_code == 429:
-                    retry_after = int(response.headers.get("Retry-After", "30"))
-                    raise RateLimitError(retry_after=retry_after)
-                elif response.status_code >= 400:
-                    error_detail = _response_error_detail(response)
-                    if response.status_code == 400:
-                        logger.error("Translation API returned 400 Bad Request: %s", error_detail)
-                    raise TranslationError(
-                        error_detail,
-                        recoverable=response.status_code >= 500,
+                try:
+                    response = self._post_endpoint(
+                        endpoint, base_url, payload, headers, config.timeout
                     )
 
-                response.raise_for_status()
-                try:
-                    result = response.json()
-                except json.JSONDecodeError as exc:
-                    content_type = response.headers.get("content-type", "")
-                    body = sanitize_for_log(response.text or "", 800)
-                    raise InvalidResponseError(
-                        f"Translation API returned non-JSON response "
-                        f"(content-type={content_type}): {body}"
-                    ) from exc
-
-                content = _extract_response_content(result)
-                expected_ids = [s["id"] for s in segments]
-
-                translations, errors = parse_translation_response(content, expected_ids)
-                if errors:
-                    logger.warning("Translation parse issues: %s; response: %s",
-                                   errors, sanitize_for_log(content))
-                    if not translations:
-                        raise InvalidResponseError(
-                            f"Empty translations after validation: {errors}"
+                    if response.status_code in (401, 403):
+                        raise AuthError(_response_error_detail(response))
+                    elif response.status_code == 429:
+                        retry_after = int(response.headers.get("Retry-After", "30"))
+                        raise RateLimitError(retry_after=retry_after)
+                    elif response.status_code >= 400:
+                        error_detail = _response_error_detail(response)
+                        if self._is_endpoint_fallback_error(response):
+                            last_error = TranslationError(error_detail, recoverable=False)
+                            logger.warning("%s endpoint unavailable: %s", endpoint, error_detail)
+                            continue
+                        if response.status_code == 400:
+                            logger.error("Translation API returned 400 Bad Request: %s", error_detail)
+                        raise TranslationError(
+                            error_detail,
+                            recoverable=response.status_code >= 500,
                         )
 
-                return translations
-
-            except (AuthError, InvalidResponseError) as e:
-                raise
-            except (RateLimitError, TimeoutError_) as e:
-                last_error = e
-                wait = min(2 ** attempt * 5, 120)
-                logger.warning("Translation attempt %d failed: %s; retrying in %ds",
-                               attempt + 1, e, wait)
-                time.sleep(wait)
-            except TranslationError as e:
-                if not e.recoverable:
-                    raise
-                last_error = e
-                wait = min(2 ** attempt * 5, 60)
-                logger.warning("Translation attempt %d failed: %s; retrying in %ds",
-                               attempt + 1, e, wait)
-                time.sleep(wait)
-            except httpx.TimeoutException as e:
-                last_error = TimeoutError_(str(e))
-                wait = min(2 ** attempt * 5, 60)
-                time.sleep(wait)
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code in (401,):
-                    raise AuthError()
-
-                # Log detailed error info for 400 Bad Request
-                error_detail = f"HTTP {e.response.status_code}"
-                if e.response.status_code == 400:
+                    response.raise_for_status()
                     try:
-                        error_body = e.response.json()
-                        error_detail = f"HTTP 400: {json.dumps(error_body, ensure_ascii=False)[:500]}"
-                    except:
-                        error_detail = f"HTTP 400: {e.response.text[:500]}"
-                    logger.error("Translation API returned 400 Bad Request: %s", error_detail)
+                        result = response.json()
+                    except json.JSONDecodeError as exc:
+                        content_type = response.headers.get("content-type", "")
+                        body = sanitize_for_log(response.text or "", 800)
+                        if self._can_fallback_endpoint(
+                            getattr(config, "api_type", "auto"), endpoint_index, endpoints
+                        ):
+                            last_error = InvalidResponseError(
+                                f"{endpoint} endpoint returned non-JSON response "
+                                f"(content-type={content_type}): {body}"
+                            )
+                            logger.warning("%s endpoint returned non-JSON response; "
+                                           "trying next endpoint: %s",
+                                           endpoint, body)
+                            continue
+                        raise InvalidResponseError(
+                            f"Translation API returned non-JSON response "
+                            f"(content-type={content_type}): {body}"
+                        ) from exc
 
-                last_error = TranslationError(
-                    error_detail,
-                    recoverable=e.response.status_code >= 500,
-                )
-                wait = min(2 ** attempt * 5, 60)
-                time.sleep(wait)
-            except Exception as e:
-                last_error = TranslationError(str(e), recoverable=True)
-                wait = min(2 ** attempt * 5, 30)
-                time.sleep(wait)
+                    content = _extract_response_content(result)
+                    expected_ids = [s["id"] for s in segments]
+
+                    translations, errors = parse_translation_response(content, expected_ids)
+                    if errors:
+                        logger.warning("Translation parse issues: %s; response: %s",
+                                       errors, sanitize_for_log(content))
+                        if not translations:
+                            if self._can_fallback_endpoint(
+                                getattr(config, "api_type", "auto"), endpoint_index, endpoints
+                            ):
+                                last_error = InvalidResponseError(
+                                    f"{endpoint} endpoint returned invalid translation JSON: {errors}"
+                                )
+                                logger.warning("%s endpoint returned invalid translation JSON; "
+                                               "trying next endpoint", endpoint)
+                                continue
+                            raise InvalidResponseError(
+                                f"Empty translations after validation: {errors}"
+                            )
+
+                    return translations
+
+                except (AuthError, InvalidResponseError) as e:
+                    raise
+                except (RateLimitError, TimeoutError_) as e:
+                    last_error = e
+                    if attempt < max_attempts - 1:
+                        wait = min(2 ** attempt * 5, 120)
+                        logger.warning("Translation attempt %d failed: %s; retrying in %ds",
+                                       attempt + 1, e, wait)
+                        time.sleep(wait)
+                    break
+                except TranslationError as e:
+                    if not e.recoverable:
+                        raise
+                    last_error = e
+                    if attempt < max_attempts - 1:
+                        wait = min(2 ** attempt * 5, 60)
+                        logger.warning("Translation attempt %d failed: %s; retrying in %ds",
+                                       attempt + 1, e, wait)
+                        time.sleep(wait)
+                    break
+                except httpx.TimeoutException as e:
+                    last_error = TimeoutError_(str(e))
+                    if attempt < max_attempts - 1:
+                        wait = min(2 ** attempt * 5, 60)
+                        time.sleep(wait)
+                    break
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code in (401,):
+                        raise AuthError()
+
+                    # Log detailed error info for 400 Bad Request
+                    error_detail = f"HTTP {e.response.status_code}"
+                    if e.response.status_code == 400:
+                        try:
+                            error_body = e.response.json()
+                            error_detail = f"HTTP 400: {json.dumps(error_body, ensure_ascii=False)[:500]}"
+                        except:
+                            error_detail = f"HTTP 400: {e.response.text[:500]}"
+                        logger.error("Translation API returned 400 Bad Request: %s", error_detail)
+
+                    last_error = TranslationError(
+                        error_detail,
+                        recoverable=e.response.status_code >= 500,
+                    )
+                    if attempt < max_attempts - 1:
+                        wait = min(2 ** attempt * 5, 60)
+                        time.sleep(wait)
+                    break
+                except Exception as e:
+                    last_error = TranslationError(str(e), recoverable=True)
+                    if attempt < max_attempts - 1:
+                        wait = min(2 ** attempt * 5, 30)
+                        time.sleep(wait)
+                    break
+
+            if isinstance(last_error, TranslationError) and not last_error.recoverable:
+                raise last_error
 
         raise TranslationError(
             f"All retries exhausted: {last_error}",

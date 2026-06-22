@@ -595,6 +595,27 @@ def _get_model():
         return MODEL
 
 
+def _unload_model() -> bool:
+    global MODEL, MODEL_KEY
+    with MODEL_LOCK:
+        had_model = MODEL is not None
+        MODEL = None
+        MODEL_KEY = None
+    if had_model:
+        try:
+            import gc
+            gc.collect()
+        except Exception:
+            pass
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+    return had_model
+
+
 def _split_text(text: str, max_len: int = 32) -> list[str]:
     text = text.strip()
     if len(text) <= max_len:
@@ -812,8 +833,16 @@ def health():
         "model_dir": model_dir,
         "device": device,
         "compute_type": compute_type,
+        "model_loaded": MODEL is not None,
         "download_modes": sorted(SUPPORTED_DOWNLOAD_MODES),
     }
+
+
+@app.post("/model/unload")
+@app.post("/models/unload")
+def unload_model(auth: str = Depends(verify_api_key)):
+    had_model = _unload_model()
+    return {"status": "unloaded", "had_model": had_model}
 
 
 @app.post("/transcribe")

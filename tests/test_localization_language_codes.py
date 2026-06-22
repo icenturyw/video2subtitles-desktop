@@ -33,6 +33,7 @@ def test_tts_voice_defaults_follow_provider_and_language():
     assert _default_tts_voice("edge-tts", "zh-CN") == "zh-CN-XiaoxiaoNeural"
     assert _default_tts_voice("edge-tts", "ja") == "ja-JP-NanamiNeural"
     assert _default_tts_voice("qwen3-tts", "en") == "Vivian"
+    assert _default_tts_voice("sapi", "zh-CN") == "default"
 
 
 def test_tts_preview_text_follows_language():
@@ -51,6 +52,7 @@ def test_saved_translate_mode_builds_runtime_config():
         "translation_provider": "openai_compatible",
         "translation_base_url": "https://example.test/v1",
         "translation_model": "test-model",
+        "translation_api_type": "anthropic_messages",
         "translation_api_key": "sk-test-secret",
     })
 
@@ -61,6 +63,7 @@ def test_saved_translate_mode_builds_runtime_config():
     assert cfg["target_language"] == "zh-CN"
     assert cfg["subtitle_mode"] == "bilingual"
     assert cfg["translation_config"]["model"] == "test-model"
+    assert cfg["translation_config"]["api_type"] == "anthropic_messages"
     assert cfg["translation_config"]["api_key"] == "sk-test-secret"
 
 
@@ -69,12 +72,28 @@ def test_saved_subtitle_mode_disables_localization_runtime_config():
     assert cfg is None
 
 
+def test_subtitle_mode_auto_enables_translation_when_provider_is_configured():
+    cfg = localization_runtime_config({
+        "localization_mode": "subtitle",
+        "translation_base_url": "https://example.test/v1",
+        "translation_api_key": "sk-test-secret",
+        "target_language_dialog": "zh-CN (简体中文)",
+    })
+
+    assert cfg is not None
+    assert cfg["is_translate_mode"] is True
+    assert cfg["is_dub_mode"] is False
+    assert cfg["target_language"] == "zh-CN"
+
+
 def test_saved_dub_mode_sets_dubbing_provider():
     cfg = localization_runtime_config({
         "localization_mode": "dub",
         "target_language_dialog": "ja (日文)",
         "tts_provider": "qwen3-tts",
         "tts_voice": "Vivian",
+        "tts_concurrency": "3",
+        "mute_original_audio": "false",
         "original_audio_volume_display": "25",
     })
 
@@ -85,4 +104,44 @@ def test_saved_dub_mode_sets_dubbing_provider():
     assert cfg["dubbing_enabled"] is True
     assert cfg["tts_provider"] == "qwen3-tts"
     assert cfg["tts_voice"] == "Vivian"
+    assert cfg["tts_concurrency"] == 3
+    assert cfg["mute_original_audio"] is False
     assert cfg["original_volume"] == 0.25
+
+
+def test_saved_dub_mode_mutes_original_audio_by_default():
+    cfg = localization_runtime_config({
+        "localization_mode": "dub",
+        "target_language_dialog": "ja (鏃ユ枃)",
+        "tts_provider": "qwen3-tts",
+        "original_audio_volume_display": "25",
+    })
+
+    assert cfg is not None
+    assert cfg["mute_original_audio"] is True
+    assert cfg["original_volume"] == 0.0
+
+
+def test_saved_dub_mode_includes_qwen3_tts_options():
+    cfg = localization_runtime_config({
+        "localization_mode": "dub",
+        "target_language_dialog": "zh-CN (简体中文)",
+        "tts_provider": "qwen3-tts",
+        "tts_qwen_mode": "voice_design",
+        "tts_qwen_instruct": "warm narrator",
+        "tts_qwen_seed": "42",
+        "tts_qwen_temperature": "0.7",
+        "tts_qwen_top_p": "0.8",
+        "tts_qwen_max_new_tokens": "512",
+        "tts_segment_gap": "0.08",
+    })
+
+    assert cfg is not None
+    opts = cfg["tts_options"]
+    assert opts["qwen_mode"] == "voice_design"
+    assert opts["instruct"] == "warm narrator"
+    assert opts["seed"] == 42
+    assert opts["temperature"] == 0.7
+    assert opts["top_p"] == 0.8
+    assert opts["max_new_tokens"] == 512
+    assert opts["tts_segment_gap"] == 0.08

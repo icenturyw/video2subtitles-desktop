@@ -7,12 +7,14 @@ added, so yt-dlp warnings are never shown as if they were video titles.
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
+import threading
 from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import getproxies
 
-from PyQt5.QtCore import QProcessEnvironment
+from process_utils import hidden_subprocess_kwargs
 
 
 def _is_youtube_url(url: str) -> bool:
@@ -104,18 +106,34 @@ def install() -> None:
         return
 
     def patched_start(self):
-        self._proc = mw.QProcess(self)
-        self._proc.setProcessChannelMode(mw.QProcess.SeparateChannels)
-        self._proc.finished.connect(self._on_finished)
-        env = QProcessEnvironment.systemEnvironment()
-        env.insert("PYTHONIOENCODING", "utf-8")
-        self._proc.setProcessEnvironment(env)
         args = _title_fetch_args(self.url, mw)
         exe, prefix = _find_ytdlp()
-        if prefix:
-            self._proc.start(exe, prefix + args)
-        else:
-            self._proc.start(exe, args)
+        cmd = [exe, *(prefix + args if prefix else args)]
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+
+        def _run():
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=90,
+                    env=env,
+                    **hidden_subprocess_kwargs(),
+                )
+                title = _clean_title(proc.stdout or "")
+                if not title:
+                    title = _clean_title((proc.stdout or "") + "\n" + (proc.stderr or ""))
+                if title:
+                    self.title_ready.emit(self.url, title)
+            except Exception as exc:
+                print(f"TitleFetcher failed: {exc}")
+
+        self._proc = None
+        threading.Thread(target=_run, daemon=True).start()
 
     def patched_on_finished(self, *args):
         if not self._proc:

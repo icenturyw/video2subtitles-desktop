@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from process_utils import hidden_subprocess_kwargs
 from tts.base import (
     TTSResult, TTSUnavailableError, TTSCache,
 )
@@ -97,6 +98,7 @@ def _get_audio_duration(path: Path) -> float:
                 str(path),
             ],
             capture_output=True, text=True, timeout=30,
+            **hidden_subprocess_kwargs(),
         )
         if result.returncode == 0 and result.stdout.strip():
             return float(result.stdout.strip())

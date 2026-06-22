@@ -41,14 +41,27 @@ DEFAULT_SETTINGS = {
     "translation_provider": "openai_compatible",
     "translation_base_url": "",
     "translation_model": "",
+    "translation_api_type": "auto",
     "translation_timeout": "60",
     "translation_concurrency": "2",
+    "translation_max_batch_items": "10",
     "translation_quality": "fast",
     "default_target_language": "zh-CN",
     "subtitle_style_preset": "default",
     "tts_provider": "",
     "tts_voice": "",
-    "original_audio_volume": "0.2",
+    "tts_concurrency": "1",
+    "tts_qwen_mode": "auto",
+    "tts_qwen_instruct": "",
+    "tts_qwen_ref_audio": "",
+    "tts_qwen_ref_text": "",
+    "tts_qwen_seed": "42",
+    "tts_qwen_temperature": "",
+    "tts_qwen_top_p": "",
+    "tts_qwen_max_new_tokens": "",
+    "tts_segment_gap": "0.04",
+    "low_vram_mode": "true",
+    "original_audio_volume": "0.0",
     # Localization dialog persistent settings
     "translation_api_key": "",
     "localization_mode": "subtitle",
@@ -59,7 +72,8 @@ DEFAULT_SETTINGS = {
     "export_ass": "true",
     "burn_subtitles": "true",
     "embed_soft_subtitles": "false",
-    "original_audio_volume_display": "30",
+    "mute_original_audio": "true",
+    "original_audio_volume_display": "0",
 }
 
 ENV_BY_KEY = {
@@ -119,7 +133,7 @@ def load_settings():
     if not SETTINGS_PATH.exists():
         return DEFAULT_SETTINGS.copy()
     try:
-        data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8-sig"))
         return _clean_settings(data)
     except Exception:
         return DEFAULT_SETTINGS.copy()

@@ -15,6 +15,8 @@ import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
+from process_utils import hidden_subprocess_kwargs
+
 logger = logging.getLogger(__name__)
 
 
@@ -33,8 +35,7 @@ def _find_pid_on_port(port: int) -> Optional[str]:
     """Return PID string of the process listening on *port*, or None."""
     try:
         kwargs: Dict = {"capture_output": True, "text": True, "timeout": 3}
-        if os.name == "nt":
-            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        kwargs = hidden_subprocess_kwargs(kwargs)
         result = subprocess.run(["netstat", "-ano"], **kwargs)
         for line in result.stdout.splitlines():
             if f":{port}" in line and "LISTENING" in line:
@@ -50,8 +51,8 @@ def _kill_pid(pid: str) -> None:
     """Kill a process by PID string."""
     try:
         kwargs: Dict = {"capture_output": True, "timeout": 3}
+        kwargs = hidden_subprocess_kwargs(kwargs)
         if os.name == "nt":
-            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
             subprocess.run(["taskkill", "/F", "/PID", pid], **kwargs)
         else:
             os.kill(int(pid), signal.SIGTERM)
@@ -229,8 +230,7 @@ class SidecarManager:
                     "stderr": subprocess.STDOUT,
                     "env": env,
                 }
-                if os.name == "nt":
-                    popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+                popen_kwargs = hidden_subprocess_kwargs(popen_kwargs)
 
                 self._process = subprocess.Popen(
                     [python_exe, str(script)], **popen_kwargs

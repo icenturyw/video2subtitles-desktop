@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import logging
 import os
+import json
 import shutil
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import sys
 _ENGINE_DIR = Path(__file__).resolve().parent.parent
@@ -34,6 +36,7 @@ from engine.workspace import (
 
 logger = logging.getLogger("engine.pipeline")
 _PIPELINE_LOG = "localization.log"
+_QWEN3_DEFAULT_STABLE_SEED = 42
 
 
 # Import from project-level modules and engine sibling packages
@@ -50,7 +53,7 @@ try:
     from services.ffmpeg_service import find_ffmpeg, render_hardsub, render_softsub
     from subtitles.normalize import read_subtitle_file
     from subtitles.srt_writer import write_srt, write_vtt, write_txt
-    from subtitles.validate import validate_timeline
+    from subtitles.validate import validate_timeline, validate_translation
     from translation.batching import (
         CheckpointManager, batch_segments, batch_to_request,
     )
@@ -95,6 +98,8 @@ class PipelineRunner:
         subtitle_mode = request.get("subtitle_mode", "bilingual")
         burn = request.get("burn_subtitles", False)
         embed_soft = request.get("embed_soft_subtitles", False)
+        dubbing = request.get("dubbing_enabled", False)
+        low_vram_mode = bool(request.get("low_vram_mode", True))
 
         style_dict = request.get("style", {})
         style = SubtitleStyle.from_dict(style_dict) if style_dict else SubtitleStyle()
@@ -128,14 +133,17 @@ class PipelineRunner:
         segments = read_subtitle_file(source_sub)
         if not segments:
             self._fail(job_id, ws, "SUBTITLE_INVALID_TIMELINE",
-                       "无法读取源字幕文件")
+                       "Unable to read source subtitle file")
             return
 
         warnings = validate_timeline(segments)
         for w in warnings:
             write_log(ws, f"  Timeline warning [{w[0]}]: {w[1]}")
 
-        self._progress.update(job_id, "normalize", 100, f"读取了 {len(segments)} 条字幕")
+        self._progress.update(job_id, "normalize", 100, f"Loaded {len(segments)} subtitle segments")
+
+        if low_vram_mode and dubbing and self._is_qwen3_tts_request(request):
+            self._unload_qwen3_tts(ws, "before translation")
 
         # --- TRANSLATE ---
         if resume_stage == "translate" or resume_stage in ("prepare", "normalize"):
@@ -155,6 +163,11 @@ class PipelineRunner:
 
             self._progress.update(job_id, "translate", 100, "翻译完成")
 
+        if target_lang and source_lang.lower() != target_lang.lower():
+            report = self._write_translation_quality_report(ws, segments)
+            if report:
+                self._store.add_artifact(job_id, report)
+
         # --- SUBTITLE_EXPORT ---
         if self._check_cancel(job_id, ws, cancel_token):
             return
@@ -169,21 +182,25 @@ class PipelineRunner:
         self._progress.update(job_id, "subtitle_export", 100, "字幕生成完成")
 
         # --- TTS (dub mode only) ---
-        dubbing = request.get("dubbing_enabled", False)
         if dubbing:
             if self._check_cancel(job_id, ws, cancel_token):
                 return
             self._store.update(job_id, stage="tts")
-            self._progress.update(job_id, "tts", 0, "语音合成...")
+            self._progress.update(job_id, "tts", 0, "TTS synthesis starting...")
             write_log(ws, "Stage: tts")
 
-            tts_success = self._run_tts(job_id, ws, segments, request, target_lang, cancel_token)
+            try:
+                tts_success = self._run_tts(job_id, ws, segments, request, target_lang, cancel_token)
+            finally:
+                if low_vram_mode and self._is_qwen3_tts_request(request):
+                    self._unload_qwen3_tts(ws, "after TTS")
             if not tts_success:
                 return
 
-            self._progress.update(job_id, "tts", 100, "语音合成完成")
+            self._progress.update(job_id, "tts", 100, "TTS synthesis complete")
 
         # --- AUDIO_MIX (dub mode only) ---
+        render_video = source_video
         if dubbing:
             if self._check_cancel(job_id, ws, cancel_token):
                 return
@@ -191,18 +208,24 @@ class PipelineRunner:
             self._progress.update(job_id, "audio_mix", 0, "音频混合...")
             write_log(ws, "Stage: audio_mix")
 
-            mix_success = self._run_audio_mix(job_id, ws, segments, source_video, target_lang, cancel_token)
+            mix_success = self._run_audio_mix(
+                job_id, ws, segments, source_video, target_lang, request, cancel_token,
+            )
             if not mix_success:
                 return
+            dubbed_video = ws / "rendered" / f"{ws.name}_{target_lang}_dubbed.mp4"
+            if dubbed_video.exists():
+                render_video = dubbed_video
 
-            self._progress.update(job_id, "audio_mix", 100, "音频混合完成")
+        if dubbing:
+            self._progress.update(job_id, "audio_mix", 100, "Audio mix complete")
 
         # --- RENDER ---
         if self._check_cancel(job_id, ws, cancel_token):
             return
         self._store.update(job_id, stage="render")
 
-        if burn and source_video:
+        if burn and render_video:
             self._progress.update(job_id, "render", 0, "准备渲染...")
             write_log(ws, "Stage: render")
 
@@ -214,11 +237,14 @@ class PipelineRunner:
                     return
 
                 log_path = ws / "logs" / "ffmpeg.log"
-                output_name = f"{ws.name}_{target_lang or 'sub'}.mp4"
+                if dubbing:
+                    output_name = f"{ws.name}_{target_lang or 'sub'}_dubbed_hardsub.mp4"
+                else:
+                    output_name = f"{ws.name}_{target_lang or 'sub'}.mp4"
                 output_path = ws / "rendered" / output_name
 
                 result = render_hardsub(
-                    video_path=source_video,
+                    video_path=render_video,
                     subtitle_path=sub_path,
                     output_path=output_path,
                     subtitle_mode=subtitle_mode,
@@ -243,7 +269,7 @@ class PipelineRunner:
                 if embed_soft:
                     soft_output = ws / "rendered" / f"{ws.name}_{target_lang}_soft.mp4"
                     soft_result = render_softsub(
-                        video_path=source_video,
+                        video_path=render_video,
                         subtitle_path=sub_path,
                         output_path=soft_output,
                         cancel_checker=lambda: cancel_token.is_cancelled(),
@@ -317,6 +343,47 @@ class PipelineRunner:
 
         return None
 
+    @staticmethod
+    def _is_qwen3_tts_request(request: Dict[str, Any]) -> bool:
+        provider = str(request.get("tts_provider", "") or "").lower()
+        return provider in {"qwen3-tts", "qwen3_tts", "qwen3"}
+
+    @staticmethod
+    def _prepare_qwen3_tts_options(options: Dict[str, Any]) -> Dict[str, Any]:
+        prepared = dict(options)
+        seed = prepared.get("seed")
+        if seed in ("", None):
+            prepared["seed"] = _QWEN3_DEFAULT_STABLE_SEED
+            prepared["seed_policy"] = "default_stable"
+            return prepared
+        try:
+            seed_int = int(seed)
+        except (TypeError, ValueError):
+            prepared["seed"] = _QWEN3_DEFAULT_STABLE_SEED
+            prepared["seed_policy"] = "default_stable"
+            return prepared
+        if seed_int < 0:
+            prepared.pop("seed", None)
+            prepared["seed_policy"] = "random"
+        else:
+            prepared["seed"] = seed_int
+            prepared["seed_policy"] = "explicit"
+        return prepared
+
+    def _unload_qwen3_tts(self, ws: Path, reason: str) -> None:
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                "http://127.0.0.1:8767/models/unload",
+                data=b"",
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=5):
+                pass
+            write_log(ws, f"  Qwen3-TTS model unloaded ({reason})")
+        except Exception as exc:
+            write_log(ws, f"  Qwen3-TTS unload skipped ({reason}): {exc}")
+
     def _run_translation(self, job_id: str, ws: Path,
                           segments: List[SubtitleSegment],
                           request: Dict[str, Any],
@@ -341,11 +408,16 @@ class PipelineRunner:
             write_log(ws, "  All segments already translated (checkpoint)")
             return True
 
-        batches = batch_segments(pending, max_chars=trans_config.max_batch_chars)
+        max_batch_items = max(1, int(getattr(trans_config, "max_batch_items", 10) or 10))
+        batches = batch_segments(
+            pending,
+            max_chars=trans_config.max_batch_chars,
+            max_items=max_batch_items,
+        )
 
         provider_name = trans_config.provider
         try:
-            provider = get_provider(provider_name)
+            get_provider(provider_name)
         except ValueError:
             self._fail(job_id, ws, "TRANSLATION_ERROR",
                        f"Unknown provider: {provider_name}")
@@ -353,8 +425,118 @@ class PipelineRunner:
 
         total = len(batches)
         completed_batches = 0
+        concurrency = max(1, int(getattr(trans_config, "concurrency", 1) or 1))
+        concurrency = min(concurrency, total)
 
-        for batch in batches:
+        def request_translation(batch: List[SubtitleSegment]) -> List[Dict]:
+            if cancel_token.is_cancelled():
+                raise RuntimeError("Task cancelled")
+            provider = get_provider(provider_name)
+            try:
+                return provider.translate_batch(
+                    batch_to_request(batch), trans_config, source_lang, target_lang,
+                    glossary=glossary_text,
+                )
+            finally:
+                close = getattr(provider, "close", None)
+                if callable(close):
+                    close()
+
+        def complete_translations(batch_index: int,
+                                  batch: List[SubtitleSegment]) -> List[Dict]:
+            try:
+                translations = request_translation(batch)
+            except Exception as exc:
+                if len(batch) <= 1:
+                    seg = batch[0]
+                    write_log(
+                        ws,
+                        f"  Batch {batch_index}: segment {seg.index} translation failed; using source text ({exc})",
+                    )
+                    return [{"id": seg.index, "text": seg.text}]
+                mid = max(1, len(batch) // 2)
+                write_log(
+                    ws,
+                    f"  Batch {batch_index}: translation response invalid; splitting {len(batch)} segments",
+                )
+                return (
+                    complete_translations(batch_index, batch[:mid])
+                    + complete_translations(batch_index, batch[mid:])
+                )
+
+            valid_by_id = {
+                int(t["id"]): str(t.get("text", ""))
+                for t in translations
+                if isinstance(t, dict)
+                and str(t.get("id", "")).isdigit()
+                and int(t.get("id")) in {s.index for s in batch}
+                and str(t.get("text", "")).strip()
+            }
+            missing = [seg for seg in batch if seg.index not in valid_by_id]
+            if missing:
+                if len(batch) <= 1:
+                    seg = batch[0]
+                    write_log(
+                        ws,
+                        f"  Batch {batch_index}: segment {seg.index} missing/empty translation; using source text",
+                    )
+                    valid_by_id[seg.index] = seg.text
+                else:
+                    write_log(
+                        ws,
+                        f"  Batch {batch_index}: retrying {len(missing)} missing/empty translations",
+                    )
+                    for item in complete_translations(batch_index, missing):
+                        if str(item.get("text", "")).strip():
+                            valid_by_id[int(item["id"])] = str(item["text"])
+
+            return [{"id": seg.index, "text": valid_by_id.get(seg.index, seg.text)} for seg in batch]
+
+        def translate_one(batch_index: int,
+                          batch: List[SubtitleSegment]) -> tuple[int, List[SubtitleSegment], List[Dict]]:
+            return batch_index, batch, complete_translations(batch_index, batch)
+
+        if concurrency > 1:
+            write_log(ws, f"  Translation concurrency: {concurrency}")
+            self._progress.update(
+                job_id, "translate", 0,
+                f"Requesting translation API with {concurrency} threads...",
+            )
+
+            with ThreadPoolExecutor(max_workers=concurrency) as executor:
+                futures = {
+                    executor.submit(translate_one, idx, batch): idx
+                    for idx, batch in enumerate(batches, 1)
+                }
+                for future in as_completed(futures):
+                    if cancel_token.is_cancelled():
+                        self._mark_cancelled(job_id, ws)
+                        for pending_future in futures:
+                            pending_future.cancel()
+                        return False
+                    try:
+                        batch_index, batch, translations = future.result()
+                    except Exception as e:
+                        for pending_future in futures:
+                            pending_future.cancel()
+                        if cancel_token.is_cancelled():
+                            self._mark_cancelled(job_id, ws)
+                        else:
+                            self._fail(job_id, ws, "TRANSLATION_ERROR", str(e)[:200])
+                        return False
+
+                    self._apply_translation_result(batch, translations)
+                    checkpoints.mark_completed([s.index for s in batch])
+                    write_log(ws, f"  Batch {batch_index}/{total} translated ({len(batch)} segments)")
+                    completed_batches += 1
+                    self._progress.update(
+                        job_id, "translate", int((completed_batches / total) * 100),
+                        f"Translated batch {completed_batches}/{total}",
+                    )
+
+            return True
+
+        for batch_index, batch in enumerate(batches, 1):
             if cancel_token.is_cancelled():
                 self._mark_cancelled(job_id, ws)
                 return False
@@ -362,35 +544,47 @@ class PipelineRunner:
             batch_pct = int((completed_batches / total) * 100)
             self._progress.update(
                 job_id, "translate", batch_pct,
-                f"正在请求翻译 API：批次 {completed_batches + 1}/{total}",
+                f"Requesting translation API: batch {batch_index}/{total}",
             )
 
-            batch_req = batch_to_request(batch)
             try:
-                translations = provider.translate_batch(
-                    batch_req, trans_config, source_lang, target_lang,
-                    glossary=glossary_text,
-                )
+                _, batch, translations = translate_one(batch_index, batch)
             except Exception as e:
-                self._fail(job_id, ws, "TRANSLATION_ERROR", str(e)[:200])
+                if cancel_token.is_cancelled():
+                    self._mark_cancelled(job_id, ws)
+                else:
+                    self._fail(job_id, ws, "TRANSLATION_ERROR", str(e)[:200])
                 return False
 
-            # Apply translations
-            trans_map = {t["id"]: t["text"] for t in translations}
-            for seg in batch:
-                if seg.index in trans_map:
-                    seg.translation = trans_map[seg.index]
-
-            # Mark checkpoint
+            self._apply_translation_result(batch, translations)
             checkpoints.mark_completed([s.index for s in batch])
-            write_log(ws, f"  Batch {completed_batches + 1}/{total} translated ({len(batch)} segments)")
+            write_log(ws, f"  Batch {batch_index}/{total} translated ({len(batch)} segments)")
             completed_batches += 1
             self._progress.update(
                 job_id, "translate", int((completed_batches / total) * 100),
-                f"已完成翻译批次 {completed_batches}/{total}",
+                f"Translated batch {completed_batches}/{total}",
             )
 
         return True
+
+    def _apply_translation_result(self, batch: List[SubtitleSegment],
+                                  translations: List[Dict]) -> None:
+        trans_map = {t["id"]: t["text"] for t in translations}
+        for seg in batch:
+            if seg.index in trans_map:
+                seg.translation = self._clean_translation_text(trans_map[seg.index])
+
+    @staticmethod
+    def _clean_translation_text(text: str) -> str:
+        cleaned = str(text or "").strip()
+        replacements = {
+            "\u0104\u0141": "?",
+            "\u0104\u02d8": "?",
+            "\u9225": "'",
+        }
+        for old, new in replacements.items():
+            cleaned = cleaned.replace(old, new)
+        return cleaned
 
     def _write_subtitle_files(self, ws: Path,
                                segments: List[SubtitleSegment],
@@ -470,6 +664,7 @@ class PipelineRunner:
 
         tts_provider_name = request.get("tts_provider", "edge-tts")
         tts_voice = request.get("tts_voice", "")
+        tts_options = dict(request.get("tts_options", {}) or {})
         if not tts_voice:
             tts_voice = self._default_tts_voice(target_lang)
 
@@ -478,15 +673,60 @@ class PipelineRunner:
             provider = get_tts_provider(tts_provider_name, cache_dir=tts_dir)
         except (ImportError, ValueError) as e:
             self._fail(job_id, ws, "TTS_UNAVAILABLE",
-                       f"TTS provider {tts_provider_name} 不可用: {e}")
+                       f"TTS provider {tts_provider_name} unavailable: {e}")
             return False
 
         from tts.timing import adjust_timing, save_timing_report
 
-        tts_segments = []
+        # Preflight: ensure Qwen3-TTS sidecar is running before attempting synthesis
+        if self._is_qwen3_tts_request(request):
+            try:
+                import json as _json
+                import urllib.request as _urllib
+                _req = _urllib.Request("http://127.0.0.1:8767/health", method="GET")
+                with _urllib.urlopen(_req, timeout=3) as _resp:
+                    _data = _json.loads(_resp.read().decode("utf-8"))
+                if _data.get("status") != "ok":
+                    raise RuntimeError(f"health check returned: {_data.get('status')}")
+            except Exception as _exc:
+                write_log(ws, f"  Qwen3-TTS preflight failed: {_exc}")
+                self._fail(job_id, ws, "TTS_SERVICE_DOWN",
+                           "Qwen3-TTS 本地服务未运行，请在 设置 → Qwen3-TTS 管理 中点击「启动服务」后重试")
+                return False
+
+        tts_segments: List[Tuple[int, Path, float]] = []
         speed_ratios = {}
-        total = len([s for s in segments if s.translation])
+        candidates = [
+            seg for seg in segments
+            if (seg.translation or seg.text or "").strip()
+        ]
+        candidates.sort(key=lambda seg: (seg.start, seg.index))
+        total = len(candidates)
         completed = 0
+        tts_concurrency = max(1, int(request.get("tts_concurrency", 1) or 1))
+        tts_concurrency = min(tts_concurrency, 4, total or 1)
+        if not getattr(provider, "supports_concurrency", True):
+            tts_concurrency = 1
+        try:
+            tts_gap = float(tts_options.get("tts_segment_gap", request.get("tts_segment_gap", 0.04)) or 0.04)
+        except (TypeError, ValueError):
+            tts_gap = 0.04
+        tts_gap = max(0.0, min(0.25, tts_gap))
+        min_tts_duration = 0.02
+
+        target_durations = {}
+        for i, seg in enumerate(candidates):
+            nominal = max(min_tts_duration, seg.end - seg.start)
+            if i + 1 < len(candidates):
+                next_start = candidates[i + 1].start
+                available = next_start - seg.start - tts_gap
+                target_durations[seg.index] = (
+                    min(nominal, available)
+                    if available >= min_tts_duration
+                    else 0.0
+                )
+            else:
+                target_durations[seg.index] = nominal
 
         options = {
             "rate": "+0%",
@@ -494,79 +734,253 @@ class PipelineRunner:
             "volume": "+0%",
             "timeout": 60,
         }
+        options.update(tts_options)
+        if tts_provider_name in ("qwen3-tts", "qwen3_tts", "qwen3"):
+            options = self._prepare_qwen3_tts_options(options)
+            prompt_id = self._ensure_qwen3_clone_prompt(provider, options, ws)
+            if prompt_id:
+                options["voice_clone_prompt_id"] = prompt_id
 
-        for seg in segments:
+        report_rows: List[Dict[str, Any]] = []
+
+        def synthesize_segment(seg: SubtitleSegment) -> Dict[str, Any]:
             if cancel_token.is_cancelled():
-                self._mark_cancelled(job_id, ws)
-                return False
-
-            text = seg.translation or seg.text
-            if not text.strip():
-                continue
+                return {"cancelled": True}
 
             seg_path = tts_dir / f"seg_{seg.index:04d}.wav"
             temp_path = tts_dir / f"seg_{seg.index:04d}_raw.wav"
+            text = seg.translation or seg.text
+            if not text.strip():
+                seg_path.unlink(missing_ok=True)
+                temp_path.unlink(missing_ok=True)
+                return {"skipped": True, "index": seg.index, "start": seg.start,
+                        "target_duration": target_dur, "reason": "empty text"}
+            target_dur = target_durations.get(seg.index, seg.end - seg.start)
+            if target_dur <= 0:
+                seg_path.unlink(missing_ok=True)
+                temp_path.unlink(missing_ok=True)
+                return {
+                    "skipped": True,
+                    "index": seg.index,
+                    "start": seg.start,
+                    "target_duration": target_dur,
+                    "warning": "timing_warning: skipped, no safe gap before next segment",
+                }
 
             try:
                 result = provider.synthesize(
                     text.strip(), target_lang, tts_voice, temp_path, options,
                 )
             except Exception as e:
-                write_log(ws, f"  TTS failed for seg {seg.index}: {e}")
-                continue
+                seg_path.unlink(missing_ok=True)
+                temp_path.unlink(missing_ok=True)
+                return {"error": str(e), "index": seg.index, "start": seg.start,
+                        "target_duration": target_dur}
 
             actual_dur = result.duration_seconds
-            target_dur = seg.end - seg.start
+            speed = None
+            warning = ""
 
             if actual_dur > 0 and target_dur > 0:
                 adj_dur, warning, speed = adjust_timing(
                     temp_path, seg_path, actual_dur, target_dur,
                 )
-                if warning:
-                    write_log(ws, f"  TTS timing [{seg.index}]: {warning}")
                 if not seg_path.exists():
-                    import shutil
                     shutil.copy2(str(temp_path), str(seg_path))
-                speed_ratios[seg.index] = speed
             else:
-                import shutil
                 shutil.copy2(str(temp_path), str(seg_path))
 
-            tts_segments.append((seg_path, seg.start))
-            completed += 1
-            pct = int((completed / total) * 100) if total else 100
-            self._progress.update(job_id, "tts", pct, f"语音合成 {completed}/{total}")
+            return {
+                "index": seg.index,
+                "path": seg_path,
+                "start": seg.start,
+                "target_duration": target_dur,
+                "actual_duration": actual_dur,
+                "adjusted_duration": adj_dur if actual_dur > 0 and target_dur > 0 else actual_dur,
+                "speed": speed,
+                "warning": warning,
+                "cached": getattr(result, "cached", False),
+                "mode": getattr(result, "mode", options.get("qwen_mode", "")),
+            }
+
+        def record_report(result: Dict[str, Any]) -> None:
+            if not result.get("index"):
+                return
+            report_rows.append({
+                "index": result.get("index"),
+                "start": result.get("start"),
+                "mode": result.get("mode", options.get("qwen_mode", "")),
+                "cached": bool(result.get("cached", False)),
+                "target_duration": result.get("target_duration"),
+                "actual_duration": result.get("actual_duration"),
+                "adjusted_duration": result.get("adjusted_duration"),
+                "speed": result.get("speed"),
+                "warning": result.get("warning", ""),
+                "error": result.get("error", ""),
+                "skipped": bool(result.get("skipped", False)),
+                "reason": result.get("reason", ""),
+            })
+
+        if tts_concurrency > 1:
+            write_log(ws, f"  TTS concurrency: {tts_concurrency}")
+            with ThreadPoolExecutor(max_workers=tts_concurrency) as executor:
+                futures = [executor.submit(synthesize_segment, seg) for seg in candidates]
+                for future in as_completed(futures):
+                    if cancel_token.is_cancelled():
+                        self._mark_cancelled(job_id, ws)
+                        return False
+                    result = future.result()
+                    if result.get("cancelled"):
+                        self._mark_cancelled(job_id, ws)
+                        return False
+                    record_report(result)
+                    if result.get("error"):
+                        write_log(ws, f"  TTS failed for seg {result.get('index')}: {result['error']}")
+                    elif result.get("skipped") and result.get("warning"):
+                        write_log(ws, f"  TTS timing [{result.get('index')}]: {result['warning']}")
+                    elif result.get("path"):
+                        tts_segments.append((result["index"], result["path"], result["start"]))
+                        if result.get("warning"):
+                            write_log(ws, f"  TTS timing [{result['index']}]: {result['warning']}")
+                        if result.get("speed") is not None:
+                            speed_ratios[result["index"]] = result["speed"]
+                    completed += 1
+                    pct = int((completed / total) * 100) if total else 100
+                    self._progress.update(
+                        job_id, "tts", pct,
+                        f"TTS synthesis {completed}/{total}",
+                    )
+        else:
+            for seg in candidates:
+                if cancel_token.is_cancelled():
+                    self._mark_cancelled(job_id, ws)
+                    return False
+                result = synthesize_segment(seg)
+                if result.get("cancelled"):
+                    self._mark_cancelled(job_id, ws)
+                    return False
+                record_report(result)
+                if result.get("error"):
+                    write_log(ws, f"  TTS failed for seg {result.get('index')}: {result['error']}")
+                elif result.get("skipped") and result.get("warning"):
+                    write_log(ws, f"  TTS timing [{result.get('index')}]: {result['warning']}")
+                elif result.get("path"):
+                    tts_segments.append((result["index"], result["path"], result["start"]))
+                    if result.get("warning"):
+                        write_log(ws, f"  TTS timing [{result['index']}]: {result['warning']}")
+                    if result.get("speed") is not None:
+                        speed_ratios[result["index"]] = result["speed"]
+                completed += 1
+                pct = int((completed / total) * 100) if total else 100
+                self._progress.update(job_id, "tts", pct, f"TTS synthesis {completed}/{total}")
 
         if not tts_segments:
-            self._fail(job_id, ws, "TTS_NO_OUTPUT", "未生成任何语音")
+            self._fail(job_id, ws, "TTS_NO_OUTPUT", "No TTS audio was generated")
             return False
 
         import json
         index_path = tts_dir / "index.json"
-        index_data = [{"index": i, "path": str(p), "start": s}
-                      for i, (p, s) in enumerate(tts_segments)]
+        tts_segments.sort(key=lambda item: item[2])
+        index_data = [{"index": idx, "path": str(p), "start": s}
+                      for idx, p, s in tts_segments]
         index_path.write_text(json.dumps(index_data, ensure_ascii=False), encoding="utf-8")
 
         if speed_ratios:
             save_timing_report(speed_ratios, tts_dir / "timing_report.json")
 
-        self._store.update(job_id, stage="tts", message=f"语音合成 {completed} 句")
+        report_artifact = self._write_tts_control_report(
+            ws, report_rows, tts_provider_name, tts_voice, options
+        )
+        if report_artifact:
+            self._store.add_artifact(job_id, report_artifact)
+
+        self._store.update(job_id, stage="tts", message=f"TTS generated {completed} segments")
         return True
+
+    def _ensure_qwen3_clone_prompt(self, provider: Any, options: Dict[str, Any], ws: Path) -> str:
+        mode = str(options.get("qwen_mode", options.get("mode", "auto")) or "auto").lower()
+        if mode != "voice_clone":
+            return str(options.get("voice_clone_prompt_id", "") or "")
+        if options.get("voice_clone_prompt_id"):
+            return str(options.get("voice_clone_prompt_id"))
+        ref_audio = str(options.get("ref_audio", "") or "").strip()
+        if not ref_audio:
+            return ""
+        create_prompt = getattr(provider, "create_voice_clone_prompt", None)
+        if not callable(create_prompt):
+            return ""
+        try:
+            prompt_id = create_prompt(
+                ref_audio,
+                str(options.get("ref_text", "") or ""),
+                bool(options.get("x_vector_only_mode", False)),
+            )
+            if prompt_id:
+                write_log(ws, f"  Qwen3 voice clone prompt created: {prompt_id}")
+            return prompt_id
+        except Exception as exc:
+            write_log(ws, f"  Qwen3 voice clone prompt creation failed: {exc}")
+            return ""
+
+    def _write_translation_quality_report(self, ws: Path,
+                                          segments: List[SubtitleSegment]) -> Optional[Dict]:
+        warnings = validate_translation(segments)
+        report_path = ws / "translation" / "translation_quality_report.json"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "total_segments": len(segments),
+            "warning_count": len(warnings),
+            "warnings": [
+                {"code": code, "message": message, "context": context}
+                for code, message, context in warnings
+            ],
+        }
+        report_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return {
+            "kind": "translation_quality_report",
+            "path": "translation/translation_quality_report.json",
+        }
+
+    def _write_tts_control_report(self, ws: Path, rows: List[Dict[str, Any]],
+                                  provider: str, voice: str,
+                                  options: Dict[str, Any]) -> Optional[Dict]:
+        report_path = ws / "audio" / "tts" / "tts_control_report.json"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        public_options = {
+            key: value for key, value in options.items()
+            if key not in {"voice_clone_prompt_id"}
+        }
+        payload = {
+            "provider": provider,
+            "voice": voice,
+            "options": public_options,
+            "total_segments": len(rows),
+            "cached_segments": sum(1 for row in rows if row.get("cached")),
+            "skipped_segments": sum(1 for row in rows if row.get("skipped")),
+            "error_segments": sum(1 for row in rows if row.get("error")),
+            "segments": sorted(rows, key=lambda row: int(row.get("index") or 0)),
+        }
+        report_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return {
+            "kind": "tts_control_report",
+            "path": "audio/tts/tts_control_report.json",
+        }
 
     def _run_audio_mix(self, job_id: str, ws: Path,
                         segments: List[SubtitleSegment],
                         source_video: Optional[Path],
                         target_lang: str,
+                        request: Dict[str, Any],
                         cancel_token: CancellationToken) -> bool:
         """Mix TTS audio with original video audio."""
         if not source_video:
-            self._fail(job_id, ws, "AUDIO_MIX_NO_VIDEO", "找不到源视频文件")
+            self._fail(job_id, ws, "AUDIO_MIX_NO_VIDEO", "Source video is required for audio mix")
             return False
 
         tts_dir = ws / "audio" / "tts"
         tts_wavs = sorted(tts_dir.glob("seg_*.wav"))
         if not tts_wavs:
-            self._fail(job_id, ws, "AUDIO_MIX_NO_TTS", "未找到 TTS 语音文件")
+            self._fail(job_id, ws, "AUDIO_MIX_NO_TTS", "No TTS audio files found")
             return False
 
         tts_segments = []
@@ -581,13 +995,23 @@ class PipelineRunner:
             return cancel_token.is_cancelled()
 
         output_path = ws / "rendered" / f"{ws.name}_{target_lang}_dubbed.mp4"
+        try:
+            original_volume = float(request.get("original_volume", 0.0))
+        except (TypeError, ValueError):
+            original_volume = 0.0
+        original_volume = max(0.0, min(1.0, original_volume))
 
-        self._progress.update(job_id, "audio_mix", 10, "正在混合音频...")
+        mix_message = (
+            "Mixing TTS audio with original audio..."
+            if original_volume > 0
+            else "Replacing original audio with TTS audio..."
+        )
+        self._progress.update(job_id, "audio_mix", 10, mix_message)
         result = mix_audio(
             video_path=source_video,
             tts_segments=tts_segments,
             output_path=output_path,
-            original_volume=0.3,
+            original_volume=original_volume,
             cancel_checker=cc,
             log_path=ws / "logs" / "ffmpeg.log",
         )
@@ -598,7 +1022,7 @@ class PipelineRunner:
 
         if not result.get("success"):
             self._fail(job_id, ws, "AUDIO_MIX_FAILED",
-                       result.get("error", "音频混合失败"))
+                       result.get("error", "Audio mix failed"))
             return False
 
         self._store.add_artifact(job_id, {
@@ -606,7 +1030,7 @@ class PipelineRunner:
             "path": f"rendered/{output_path.name}",
             "language": target_lang,
         })
-        self._progress.update(job_id, "audio_mix", 100, "音频混合完成")
+        self._progress.update(job_id, "audio_mix", 100, "Audio mix complete")
         return True
 
     @staticmethod
@@ -626,9 +1050,9 @@ class PipelineRunner:
     def _mark_cancelled(self, job_id: str, ws: Path) -> None:
         self._store.update(
             job_id, status="cancelled", stage="cancelled",
-            message="任务已取消", error_code="TASK_CANCELLED",
+            message="Task cancelled", error_code="TASK_CANCELLED",
         )
-        self._progress.update(job_id, "cancelled", 0, "任务已取消")
+        self._progress.update(job_id, "cancelled", 0, "Task cancelled")
         write_log(ws, "Pipeline cancelled")
 
     def _fail(self, job_id: str, ws: Path, code: str, message: str) -> None:

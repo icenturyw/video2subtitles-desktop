@@ -72,6 +72,10 @@ class LocalizationClient:
         dubbing_enabled: bool = False,
         tts_provider: str = "edge-tts",
         tts_voice: str = "",
+        tts_concurrency: int = 1,
+        tts_options: Optional[Dict[str, Any]] = None,
+        original_volume: float = 0.0,
+        low_vram_mode: bool = True,
         translation: Optional[Dict[str, Any]] = None,
         style: Optional[Dict[str, Any]] = None,
         job_id: str = "",
@@ -92,6 +96,10 @@ class LocalizationClient:
             "dubbing_enabled": dubbing_enabled,
             "tts_provider": tts_provider,
             "tts_voice": tts_voice,
+            "tts_concurrency": tts_concurrency,
+            "tts_options": tts_options or {},
+            "original_volume": original_volume,
+            "low_vram_mode": low_vram_mode,
         }
         if job_id:
             payload["job_id"] = job_id

@@ -5,9 +5,11 @@ import subprocess
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+from process_utils import hidden_subprocess_kwargs
 
-MAX_SPEED = 1.25
-MAX_SLOW = 0.90
+
+MAX_SPEED = 2.0
+MAX_SLOW = 0.75
 
 
 def adjust_timing(
@@ -16,7 +18,7 @@ def adjust_timing(
     actual_duration: float,
     target_duration: float,
 ) -> Tuple[float, str, float]:
-    """Apply atempo to match target duration.
+    """Apply atempo/trim to fit the target duration.
     
     Returns:
         (adjusted_duration, warning, speed_ratio) where speed_ratio is
@@ -25,27 +27,82 @@ def adjust_timing(
     if actual_duration <= 0 or target_duration <= 0:
         return actual_duration, "zero duration", 1.0
 
-    ratio = actual_duration / target_duration
+    required_speed = actual_duration / target_duration
 
-    if MAX_SLOW <= ratio <= MAX_SPEED:
-        speed = 1.0 / ratio
-        try:
-            subprocess.run(
-                [
-                    "ffmpeg", "-y", "-i", str(input_audio),
-                    "-filter:a", f"atempo={speed:.3f}",
-                    str(output_audio),
-                ],
-                capture_output=True, text=True, timeout=60,
-                check=True,
-            )
-            return target_duration, "", speed
-        except Exception as e:
-            return actual_duration, f"atempo failed: {e}", 1.0
+    if required_speed > MAX_SPEED:
+        speed = MAX_SPEED
+        warning = (
+            f"timing_warning: too long ({required_speed:.2f}x), "
+            f"sped up {MAX_SPEED:.2f}x and trimmed"
+        )
+    elif required_speed < MAX_SLOW:
+        speed = MAX_SLOW
+        warning = (
+            f"timing_warning: too short ({required_speed:.2f}x), "
+            f"slowed to {MAX_SLOW:.2f}x"
+        )
+    else:
+        speed = required_speed
+        warning = ""
 
-    if ratio > MAX_SPEED:
-        return actual_duration, f"timing_warning: too long ({ratio:.2f}x)", 1.0
-    return actual_duration, f"timing_warning: too short ({ratio:.2f}x)", 1.0
+    filters = _atempo_chain(speed)
+    if required_speed > MAX_SPEED:
+        filters.extend([f"atrim=0:{target_duration:.3f}", "asetpts=N/SR/TB"])
+
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+                "-i", str(input_audio),
+                "-filter:a", ",".join(filters),
+                str(output_audio),
+            ],
+            capture_output=True, text=True, timeout=60,
+            check=True,
+            **hidden_subprocess_kwargs(),
+        )
+        if required_speed > MAX_SPEED:
+            return target_duration, warning, speed
+        adjusted = actual_duration / speed if speed else actual_duration
+        return adjusted, warning, speed
+    except Exception as e:
+        trimmed = _trim_audio(input_audio, output_audio, target_duration)
+        if trimmed:
+            return target_duration, f"atempo failed, trimmed instead: {e}", 1.0
+        return actual_duration, f"atempo failed: {e}", 1.0
+
+
+def _atempo_chain(speed: float) -> List[str]:
+    """Build ffmpeg atempo filters using conservative 0.5..2.0 factors."""
+    factors = []
+    remaining = max(0.01, float(speed))
+    while remaining > 2.0:
+        factors.append(2.0)
+        remaining /= 2.0
+    while remaining < 0.5:
+        factors.append(0.5)
+        remaining /= 0.5
+    factors.append(remaining)
+    return [f"atempo={factor:.3f}" for factor in factors]
+
+
+def _trim_audio(input_audio: Path, output_audio: Path, target_duration: float) -> bool:
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+                "-i", str(input_audio),
+                "-t", f"{target_duration:.3f}",
+                "-c:a", "pcm_s16le",
+                str(output_audio),
+            ],
+            capture_output=True, text=True, timeout=60,
+            check=True,
+            **hidden_subprocess_kwargs(),
+        )
+        return output_audio.exists()
+    except Exception:
+        return False
 
 
 def build_concat_file(segments: List[Tuple[Path, float]], output: Path) -> str:

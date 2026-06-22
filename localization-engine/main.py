@@ -196,6 +196,10 @@ def create_job(req: CreateJobRequest):
         "dubbing_enabled": req.dubbing_enabled,
         "tts_provider": req.tts_provider,
         "tts_voice": req.tts_voice,
+        "tts_concurrency": req.tts_concurrency,
+        "tts_options": req.tts_options,
+        "original_volume": req.original_volume,
+        "low_vram_mode": req.low_vram_mode,
     }
     if req.translation:
         if req.translation.api_key:

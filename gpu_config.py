@@ -5,9 +5,10 @@ fall back to CPU.  This keeps RTX machines fast without breaking CPU-only users.
 """
 from __future__ import annotations
 
-import os
 import subprocess
 from typing import Dict, Tuple
+
+from process_utils import hidden_subprocess_kwargs
 
 
 SUPPORTED_DEVICES = ["auto", "cuda", "cpu"]
@@ -23,8 +24,7 @@ def has_nvidia_gpu() -> bool:
             "text": True,
             "timeout": 2,
         }
-        if os.name == "nt":
-            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        kwargs = hidden_subprocess_kwargs(kwargs)
         result = subprocess.run(["nvidia-smi", "-L"], **kwargs)
         return result.returncode == 0 and bool(result.stdout.strip())
     except Exception:
@@ -39,8 +39,7 @@ def gpu_name() -> str:
             "text": True,
             "timeout": 2,
         }
-        if os.name == "nt":
-            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        kwargs = hidden_subprocess_kwargs(kwargs)
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
             **kwargs,

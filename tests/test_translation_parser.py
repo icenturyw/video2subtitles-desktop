@@ -1,3 +1,4 @@
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -42,6 +43,33 @@ class TestTranslationParser(unittest.TestCase):
     def test_extract_wrapped_translation_response(self):
         result = {"translations": [{"id": 1, "text": "你好"}]}
         self.assertIn("translations", _extract_response_content(result))
+
+    def test_extract_responses_api_output_array(self):
+        result = {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": '[{"id": 1, "text": "hello"}]',
+                        }
+                    ],
+                }
+            ]
+        }
+        self.assertEqual(_extract_response_content(result), '[{"id": 1, "text": "hello"}]')
+
+    def test_extract_anthropic_messages_content(self):
+        result = {
+            "content": [
+                {
+                    "type": "text",
+                    "text": '[{"id": 1, "text": "你好"}]',
+                }
+            ]
+        }
+        self.assertEqual(_extract_response_content(result), '[{"id": 1, "text": "你好"}]')
 
     def test_extract_newapi_data_wrapped_choices_response(self):
         result = {
@@ -112,6 +140,7 @@ class TestTranslationParser(unittest.TestCase):
         config = TranslationConfig(
             base_url="https://example.test/v1",
             model="test-model",
+            api_type="chat_completions",
             retry_count=3,
         )
 
@@ -121,6 +150,151 @@ class TestTranslationParser(unittest.TestCase):
         self.assertEqual(calls["count"], 1)
         self.assertIn("HTTP 404", str(ctx.exception))
         self.assertIn("model not supported", str(ctx.exception))
+
+    def test_auto_falls_back_from_responses_to_chat_completions(self):
+        paths = []
+
+        def handler(request):
+            paths.append(request.url.path)
+            if request.url.path.endswith("/responses"):
+                return httpx.Response(404, json={"error": "not found"})
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": '[{"id": 1, "text": "hello"}]',
+                            }
+                        }
+                    ]
+                },
+            )
+
+        provider = OpenAICompatibleProvider()
+        provider._client = httpx.Client(transport=httpx.MockTransport(handler))
+        config = TranslationConfig(
+            base_url="https://example.test/v1",
+            model="test-model",
+            retry_count=0,
+        )
+
+        result = provider.translate_batch([{"id": 1, "text": "hi"}], config, "en", "zh-CN")
+
+        self.assertEqual(result, [{"id": 1, "text": "hello"}])
+        self.assertEqual(paths, ["/v1/responses", "/v1/chat/completions"])
+
+    def test_auto_falls_back_when_responses_returns_invalid_translation_json(self):
+        paths = []
+
+        def handler(request):
+            paths.append(request.url.path)
+            if request.url.path.endswith("/responses"):
+                return httpx.Response(
+                    200,
+                    json={"output_text": "{'format': {'type': 'text'}}"},
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": '[{"id": 1, "text": "hello"}]',
+                            }
+                        }
+                    ]
+                },
+            )
+
+        provider = OpenAICompatibleProvider()
+        provider._client = httpx.Client(transport=httpx.MockTransport(handler))
+        config = TranslationConfig(
+            base_url="https://example.test/v1",
+            model="local-compatible-model",
+            retry_count=0,
+        )
+
+        result = provider.translate_batch([{"id": 1, "text": "hi"}], config, "en", "zh-CN")
+
+        self.assertEqual(result, [{"id": 1, "text": "hello"}])
+        self.assertEqual(paths, ["/v1/responses", "/v1/chat/completions"])
+
+    def test_responses_api_translation(self):
+        def handler(request):
+            self.assertTrue(request.url.path.endswith("/responses"))
+            payload = json.loads(request.content.decode("utf-8"))
+            self.assertIn("instructions", payload)
+            self.assertIn("input", payload)
+            return httpx.Response(
+                200,
+                json={"output_text": '[{"id": 1, "text": "hello"}]'},
+            )
+
+        provider = OpenAICompatibleProvider()
+        provider._client = httpx.Client(transport=httpx.MockTransport(handler))
+        config = TranslationConfig(
+            base_url="https://example.test/v1",
+            model="gpt-5.5",
+            api_type="responses",
+            retry_count=0,
+        )
+
+        result = provider.translate_batch([{"id": 1, "text": "hi"}], config, "en", "zh-CN")
+
+        self.assertEqual(result, [{"id": 1, "text": "hello"}])
+
+    def test_claude_auto_uses_anthropic_messages_first(self):
+        paths = []
+
+        def handler(request):
+            paths.append(request.url.path)
+            payload = json.loads(request.content.decode("utf-8"))
+            self.assertIn("system", payload)
+            self.assertIn("messages", payload)
+            self.assertIn("anthropic-version", request.headers)
+            self.assertEqual(request.headers.get("anthropic-beta"), "context-1m-2025-08-07")
+            return httpx.Response(
+                200,
+                json={"content": [{"type": "text", "text": '[{"id": 1, "text": "你好"}]'}]},
+            )
+
+        provider = OpenAICompatibleProvider()
+        provider._client = httpx.Client(transport=httpx.MockTransport(handler))
+        config = TranslationConfig(
+            base_url="https://example.test",
+            model="claude-opus-4-6",
+            retry_count=0,
+        )
+
+        result = provider.translate_batch([{"id": 1, "text": "hi"}], config, "en", "zh-CN")
+
+        self.assertEqual(result, [{"id": 1, "text": "你好"}])
+        self.assertEqual(paths, ["/v1/messages"])
+
+    def test_anthropic_messages_accepts_v1_base_url(self):
+        paths = []
+
+        def handler(request):
+            paths.append(request.url.path)
+            return httpx.Response(
+                200,
+                json={"content": [{"type": "text", "text": '[{"id": 1, "text": "你好"}]'}]},
+            )
+
+        provider = OpenAICompatibleProvider()
+        provider._client = httpx.Client(transport=httpx.MockTransport(handler))
+        config = TranslationConfig(
+            base_url="https://example.test/v1",
+            model="claude-opus-4-6",
+            api_type="anthropic_messages",
+            retry_count=0,
+        )
+
+        result = provider.translate_batch([{"id": 1, "text": "hi"}], config, "en", "zh-CN")
+
+        self.assertEqual(result, [{"id": 1, "text": "你好"}])
+        self.assertEqual(paths, ["/v1/messages"])
 
     def test_parse_missing_id(self):
         response = '[{"id": 1, "text": "你好"}]'
