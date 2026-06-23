@@ -1327,7 +1327,6 @@ class MainWindow(QMainWindow):
         main_layout.setSpacing(0)
 
         self._create_toolbar(main_layout)
-        self._create_url_bar(main_layout)
         self._create_content(main_layout)
         self._create_statusbar()
 
@@ -1339,22 +1338,24 @@ class MainWindow(QMainWindow):
                 border-bottom: 1px solid {THEME["border"]};
             }}
         """)
-        toolbar.setFixedHeight(64)
+        toolbar.setFixedHeight(68)
         layout = QHBoxLayout(toolbar)
-        layout.setContentsMargins(20, 0, 20, 0)
+        layout.setContentsMargins(24, 0, 24, 0)
         layout.setSpacing(12)
 
         logo = QLabel("🎬")
-        logo.setStyleSheet("font-size: 24px;")
+        logo.setStyleSheet("font-size: 26px;")
         layout.addWidget(logo)
 
+        title_block = QVBoxLayout()
+        title_block.setSpacing(2)
         title = QLabel("Video2Subtitles")
-        title.setStyleSheet(f"font-size: 18px; font-weight: 700; color: {THEME['text_primary']}; letter-spacing: 1px;")
-        layout.addWidget(title)
-
-        subtitle = QLabel("视频字幕生成工具")
-        subtitle.setStyleSheet(f"font-size: 12px; color: {THEME['text_muted']}; padding-top: 4px;")
-        layout.addWidget(subtitle)
+        title.setStyleSheet(f"font-size: 18px; font-weight: 800; color: {THEME['text_primary']}; letter-spacing: 0.5px;")
+        title_block.addWidget(title)
+        subtitle = QLabel("把视频变成字幕、翻译和可交付文件")
+        subtitle.setStyleSheet(f"font-size: 12px; color: {THEME['text_muted']};")
+        title_block.addWidget(subtitle)
+        layout.addLayout(title_block)
 
         layout.addStretch()
 
@@ -1363,54 +1364,26 @@ class MainWindow(QMainWindow):
         self.server_status.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.server_status)
 
-        self.add_files_btn = QPushButton("📁 添加视频")
-        self.add_files_btn.setObjectName("btn_secondary")
-        self.add_files_btn.setFixedHeight(38)
-        self.add_files_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        self.add_files_btn.clicked.connect(self._add_files)
-        layout.addWidget(self.add_files_btn)
-
-        self.add_folder_btn = QPushButton("📂 添加目录")
-        self.add_folder_btn.setObjectName("btn_secondary")
-        self.add_folder_btn.setFixedHeight(38)
-        self.add_folder_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        self.add_folder_btn.clicked.connect(self._add_folder)
-        layout.addWidget(self.add_folder_btn)
-
-        self.start_btn = QPushButton("▶ 开始处理")
-        self.start_btn.setFixedHeight(38)
-        self.start_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        self.start_btn.clicked.connect(lambda: self._start_processing())
-        self.start_btn.setEnabled(False)
-        layout.addWidget(self.start_btn)
-
-        self.stop_btn = QPushButton("⏹ 停止")
-        self.stop_btn.setObjectName("btn_danger")
-        self.stop_btn.setFixedHeight(38)
-        self.stop_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        self.stop_btn.clicked.connect(self._stop_processing)
-        self.stop_btn.setEnabled(False)
-        layout.addWidget(self.stop_btn)
-
         self.output_dir_btn = QPushButton("📁 输出目录")
         self.output_dir_btn.setObjectName("btn_secondary")
-        self.output_dir_btn.setFixedHeight(38)
+        self.output_dir_btn.setFixedHeight(36)
         self.output_dir_btn.setCursor(QCursor(Qt.PointingHandCursor))
         self.output_dir_btn.clicked.connect(self._change_output_dir)
         self.output_dir_btn.setToolTip(str(self.output_dir))
         layout.addWidget(self.output_dir_btn)
 
-        self.localize_btn = QPushButton("🌐 本地化")
+        self.localize_btn = QPushButton("🌐 翻译 / 配音")
         self.localize_btn.setObjectName("btn_secondary")
-        self.localize_btn.setFixedHeight(38)
+        self.localize_btn.setFixedHeight(36)
         self.localize_btn.setCursor(QCursor(Qt.PointingHandCursor))
         self.localize_btn.clicked.connect(self._show_localization_dialog)
         layout.addWidget(self.localize_btn)
 
         settings_btn = QPushButton("⚙")
         settings_btn.setObjectName("btn_icon")
-        settings_btn.setFixedSize(38, 38)
+        settings_btn.setFixedSize(36, 36)
         settings_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        settings_btn.setToolTip("设置")
         settings_btn.clicked.connect(self._show_settings)
         layout.addWidget(settings_btn)
 
@@ -1470,38 +1443,120 @@ class MainWindow(QMainWindow):
 
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(20, 16, 10, 16)
-        left_layout.setSpacing(12)
+        left_layout.setContentsMargins(24, 18, 12, 18)
+        left_layout.setSpacing(14)
+
+        hero_card = CardFrame()
+        hero_layout = hero_card.layout()
+        hero_layout.setContentsMargins(18, 16, 18, 16)
+        hero_layout.setSpacing(8)
+        hero_title = QLabel("今天要处理哪个视频？")
+        hero_title.setStyleSheet(f"font-size: 20px; font-weight: 800; color: {THEME['text_primary']};")
+        hero_layout.addWidget(hero_title)
+        hero_hint = QLabel("先添加本地文件、目录或在线视频链接，再点击下方的大按钮开始生成字幕。")
+        hero_hint.setWordWrap(True)
+        hero_hint.setStyleSheet(f"font-size: 12px; color: {THEME['text_secondary']}; line-height: 1.5;")
+        hero_layout.addWidget(hero_hint)
+        left_layout.addWidget(hero_card)
+
+        input_card = CardFrame()
+        input_layout = input_card.layout()
+        input_layout.setContentsMargins(18, 16, 18, 16)
+        input_layout.setSpacing(12)
+        step1 = QLabel("① 添加视频")
+        step1.setStyleSheet(f"font-size: 14px; font-weight: 800; color: {THEME['accent']};")
+        input_layout.addWidget(step1)
+
+        file_buttons = QHBoxLayout()
+        file_buttons.setSpacing(10)
+        self.add_files_btn = QPushButton("📁 选择视频文件")
+        self.add_files_btn.setObjectName("btn_secondary")
+        self.add_files_btn.setFixedHeight(40)
+        self.add_files_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self.add_files_btn.clicked.connect(self._add_files)
+        file_buttons.addWidget(self.add_files_btn)
+
+        self.add_folder_btn = QPushButton("📂 批量添加目录")
+        self.add_folder_btn.setObjectName("btn_secondary")
+        self.add_folder_btn.setFixedHeight(40)
+        self.add_folder_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self.add_folder_btn.clicked.connect(self._add_folder)
+        file_buttons.addWidget(self.add_folder_btn)
+        input_layout.addLayout(file_buttons)
+
+        url_row = QHBoxLayout()
+        url_row.setSpacing(8)
+        self.url_input = QLineEdit()
+        self.url_input.setPlaceholderText("粘贴 YouTube / Bilibili / 抖音等视频链接，回车添加")
+        self.url_input.setMinimumHeight(40)
+        self.url_input.returnPressed.connect(self._add_url)
+        url_row.addWidget(self.url_input, 1)
+
+        self.add_url_btn = QPushButton("添加链接")
+        self.add_url_btn.setFixedHeight(40)
+        self.add_url_btn.setFixedWidth(100)
+        self.add_url_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self.add_url_btn.clicked.connect(self._add_url)
+        url_row.addWidget(self.add_url_btn)
+        input_layout.addLayout(url_row)
+        left_layout.addWidget(input_card)
+
+        action_card = CardFrame()
+        action_layout = action_card.layout()
+        action_layout.setContentsMargins(18, 16, 18, 16)
+        action_layout.setSpacing(12)
+        step2 = QLabel("② 开始处理")
+        step2.setStyleSheet(f"font-size: 14px; font-weight: 800; color: {THEME['accent']};")
+        action_layout.addWidget(step2)
+
+        self.start_btn = QPushButton("▶ 开始生成字幕")
+        self.start_btn.setFixedHeight(46)
+        self.start_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self.start_btn.clicked.connect(lambda: self._start_processing())
+        self.start_btn.setEnabled(False)
+        action_layout.addWidget(self.start_btn)
+
+        secondary_actions = QHBoxLayout()
+        secondary_actions.setSpacing(8)
+        self.stop_btn = QPushButton("⏹ 停止")
+        self.stop_btn.setObjectName("btn_danger")
+        self.stop_btn.setFixedHeight(36)
+        self.stop_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self.stop_btn.clicked.connect(self._stop_processing)
+        self.stop_btn.setEnabled(False)
+        secondary_actions.addWidget(self.stop_btn)
+
+        self.retry_all_btn = QPushButton("🔄 重试失败")
+        self.retry_all_btn.setObjectName("btn_secondary")
+        self.retry_all_btn.setFixedHeight(36)
+        self.retry_all_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self.retry_all_btn.clicked.connect(self._retry_failed)
+        self.retry_all_btn.setEnabled(False)
+        secondary_actions.addWidget(self.retry_all_btn)
+
+        self.clear_btn = QPushButton("🧹 清空列表")
+        self.clear_btn.setObjectName("btn_secondary")
+        self.clear_btn.setFixedHeight(36)
+        self.clear_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self.clear_btn.clicked.connect(self._clear_all)
+        self.clear_btn.setEnabled(False)
+        secondary_actions.addWidget(self.clear_btn)
+        action_layout.addLayout(secondary_actions)
+        left_layout.addWidget(action_card)
 
         list_header = QHBoxLayout()
-        list_title = QLabel("视频列表")
-        list_title.setStyleSheet(f"font-size: 16px; font-weight: 700; color: {THEME['text_primary']};")
+        list_title = QLabel("③ 任务列表")
+        list_title.setStyleSheet(f"font-size: 16px; font-weight: 800; color: {THEME['text_primary']};")
         list_header.addWidget(list_title)
 
-        self.count_label = QLabel("0 个文件")
+        self.count_label = QLabel("0 个视频")
         self.count_label.setStyleSheet(f"font-size: 12px; color: {THEME['text_muted']}; padding-top: 4px;")
         list_header.addWidget(self.count_label)
         list_header.addStretch()
 
-        self.clear_btn = QPushButton("清空")
-        self.clear_btn.setObjectName("btn_secondary")
-        self.clear_btn.setFixedHeight(30)
-        self.clear_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        self.clear_btn.clicked.connect(self._clear_all)
-        self.clear_btn.setEnabled(False)
-        list_header.addWidget(self.clear_btn)
-
-        self.retry_all_btn = QPushButton("重试失败")
-        self.retry_all_btn.setObjectName("btn_secondary")
-        self.retry_all_btn.setFixedHeight(30)
-        self.retry_all_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        self.retry_all_btn.clicked.connect(self._retry_failed)
-        self.retry_all_btn.setEnabled(False)
-        list_header.addWidget(self.retry_all_btn)
-
         self.history_btn = QPushButton("历史记录")
         self.history_btn.setObjectName("btn_secondary")
-        self.history_btn.setFixedHeight(30)
+        self.history_btn.setFixedHeight(32)
         self.history_btn.setCursor(QCursor(Qt.PointingHandCursor))
         self.history_btn.clicked.connect(self._show_history)
         list_header.addWidget(self.history_btn)
@@ -1520,27 +1575,28 @@ class MainWindow(QMainWindow):
         self.file_list.dragEnterEvent = self._drag_enter_event
         self.file_list.dragMoveEvent = self._drag_move_event
         self.file_list.dropEvent = self._drop_event
-        left_layout.addWidget(self.file_list)
+        self.file_list.setMinimumHeight(220)
+        left_layout.addWidget(self.file_list, 1)
 
         splitter.addWidget(left_panel)
 
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(10, 16, 20, 16)
+        right_layout.setContentsMargins(12, 18, 24, 18)
         right_layout.setSpacing(0)
 
         self.subtitle_viewer = SubtitleViewer()
         right_layout.addWidget(self.subtitle_viewer)
 
         splitter.addWidget(right_panel)
-        splitter.setSizes([550, 600])
+        splitter.setSizes([520, 720])
 
         parent_layout.addWidget(splitter, 1)
 
     def _create_statusbar(self):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self.status_label = QLabel("就绪 - 请添加视频文件")
+        self.status_label = QLabel("就绪 - 添加视频后点击「开始生成字幕」")
         self.status_bar.addWidget(self.status_label, 1)
 
         self.progress_bar_total = QProgressBar()
@@ -1619,7 +1675,7 @@ class MainWindow(QMainWindow):
             self._update_counts()
             self.start_btn.setEnabled(len(self.video_items) > 0)
             self.clear_btn.setEnabled(len(self.video_items) > 0)
-            self.status_label.setText(f"已添加 {added} 个文件（含历史记录），共 {len(self.video_items)} 个")
+            self.status_label.setText(f"已添加 {added} 个视频（含历史记录），共 {len(self.video_items)} 个")
 
     def _clear_all(self):
         if self.worker and self.worker.isRunning():
@@ -1633,7 +1689,7 @@ class MainWindow(QMainWindow):
         self.clear_btn.setEnabled(False)
         self.retry_all_btn.setEnabled(False)
         self.progress_bar_total.setValue(0)
-        self.status_label.setText("就绪 - 请添加视频文件")
+        self.status_label.setText("就绪 - 添加视频后点击「开始生成字幕」")
 
     def _retry_failed(self):
         failed = []
@@ -1680,6 +1736,8 @@ class MainWindow(QMainWindow):
             self.stop_btn.setEnabled(True)
             self.add_files_btn.setEnabled(False)
             self.add_folder_btn.setEnabled(False)
+            self.add_url_btn.setEnabled(False)
+            self.url_input.setEnabled(False)
 
             language = "auto"
             if hasattr(self, "lang_combo"):
@@ -1702,6 +1760,8 @@ class MainWindow(QMainWindow):
             self.stop_btn.setEnabled(False)
             self.add_files_btn.setEnabled(True)
             self.add_folder_btn.setEnabled(True)
+            self.add_url_btn.setEnabled(True)
+            self.url_input.setEnabled(True)
 
     def _stop_processing(self):
         self._stopped = True
@@ -1772,6 +1832,8 @@ class MainWindow(QMainWindow):
             self.stop_btn.setEnabled(False)
             self.add_files_btn.setEnabled(True)
             self.add_folder_btn.setEnabled(True)
+            self.add_url_btn.setEnabled(True)
+            self.url_input.setEnabled(True)
 
             completed = sum(1 for d in self.video_items.values() if d["widget"].status == "completed")
             failed = sum(1 for d in self.video_items.values() if d["widget"].status == "error")
@@ -2276,7 +2338,7 @@ class MainWindow(QMainWindow):
             self.subtitle_viewer.clear()
 
     def _update_counts(self):
-        self.count_label.setText(f"{len(self.video_items)} 个文件")
+        self.count_label.setText(f"{len(self.video_items)} 个视频")
 
     def _update_progress(self):
         total = len(self.video_items)
