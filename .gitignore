@@ -58,6 +58,13 @@ cookies.txt
 *.swp
 *.swo
 
+# Local AI tool bridges
+.ai-bridge/
+.chatgpt-git-mcp/
+
+# Source packages
+*.zip
+
 # OS
 Thumbs.db
 .DS_Store

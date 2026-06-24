@@ -27,6 +27,7 @@
 - **自动多格式输出** — 任务完成后会自动保存 SRT、VTT、TXT，并生成 `manifest.json` 输出元数据
 - **字幕工具模块化** — 字幕时间格式、SRT/VTT/TXT 读写、SRT 解析和文件名清洗集中到 `subtitle_utils.py`，降低重复实现
 - **基础验证脚本** — 新增 `tools/check_project.py`，可执行源码语法检查和基础单元测试
+- **安全源码打包** — 新增 `tools/package_source.py`，可生成便于发送给 AI 辅助排查的源码压缩包，默认排除模型、缓存、输出媒体、cookies、密钥和本地桥接目录
 - **历史记录增强** — 历史窗口可打开输出目录、加回任务列表、重新生成 ChatGPT 包、复制/打开来源
 - **错误日志增强** — 生成失败时会突出显示错误、弹出可复制详情，并在右侧预览区保留完整错误日志和服务日志尾部
 - **标题获取增强** — 添加 YouTube 链接时会过滤 yt-dlp 的警告输出，避免把 `No supported JavaScript runtime...` 当成视频标题显示
@@ -91,12 +92,22 @@ python -m unittest discover -s tests
 
 `tools/check_project.py` 会执行项目 Python 源码语法编译和 `tests/` 基础单元测试。完整桌面端验证仍建议在 Windows 图形环境中手动启动 `python app.py` 或 `start_debug.bat` 检查。
 
+生成给 AI 辅助排查的安全源码包：
+
+```bash
+python tools/package_source.py --dry-run
+python tools/package_source.py --output video2subtitles-source-package.zip
+```
+
+`tools/package_source.py` 默认排除 `.git/`、`.cache/`、`models/`、`output/`、虚拟环境、cookies、`.env*`、密钥/证书、音视频文件、已有压缩包、下载模型和本地桥接目录。生成的 zip 内会附带 `PACKAGE_MANIFEST.json`，发送前建议快速查看一次跳过摘要。
+
 ---
 
 ## 维护记录 / Maintenance Notes
 
 ### 2026-06 — 字幕样式微调、TTS 时序优化与音频混合改进
 
+- **安全源码打包脚本**：新增 `tools/package_source.py`，用于生成可发送给 AI 辅助排查的源码 zip；默认排除模型、缓存、输出目录、音视频、cookies、`.env*`、密钥证书、虚拟环境和本地桥接目录，并在压缩包内写入 `PACKAGE_MANIFEST.json` 便于复核。
 - **字幕字号调整**：所有内置样式预设（default/netflix/youtube/bilingual/mobile_vertical）的 `font_size` 整体下调，以适配更多屏幕尺寸和嵌入场景；`margin_v` 微调，移动端竖屏样式边距从 80 调整为 60。
 - **精确 TTS 时序控制**：速度约束范围收紧（MAX_SPEED 2.0→1.5，MAX_SLOW 0.75→0.8），`atempo` 失败时不再暴力裁剪音频，改为保留原始音频，避免音质劣化。目标时长计算引入 `nominal * 0.9` 下界，使 TTS 朗读节奏更自然。
 - **沉默边界检测切分**：`timing.py` 新增 `detect_silence_boundaries()`，对合并 TTS chunk 使用 FFmpeg silencedetect 探测自然停顿点，实现逐段精确时间窗口划分；沉默检测不足时回退字符比例估算。
@@ -543,7 +554,7 @@ video_2_subtitles/
 ├── .cache/             # 本地设置、服务日志和辅助脚本缓存 / Local cache
 ├── start.bat           # 生产启动（Win） / Production launcher
 ├── start_debug.bat     # 调试启动（Win） / Debug launcher
-├── tools/              # 开发验证脚本 / Development check scripts
+├── tools/              # 开发验证与安全源码打包脚本 / Development check and source package scripts
 ├── tests/              # 基础单元测试 / Unit tests
 ├── example.png         # 界面截图 / Screenshot
 ├── example2.png        # 界面截图 / Screenshot
