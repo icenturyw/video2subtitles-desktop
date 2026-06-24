@@ -50,6 +50,7 @@
 - **流水线阶段重试** — 本地化任务支持从任意阶段（翻译/字幕导出/TTS/音频混合/渲染）重新执行，避免全量重跑
 - **单任务取消** — 右键菜单可单独停止正在进行的任务，不再只有全局停止
 - **精确 TTS 音频裁剪** — 多段合并的 TTS chunk 使用 `atrim` 滤波器按时间窗口精确提取逐段音频，替代原字符比例估算
+- **字幕时间轴保护** — stable/strict 配音分块会按字幕间隔和时间跨度拆分，避免跨长静音合成后把后续语音提前切入；音频混合优先使用本轮 `audio/tts/index.json` 防止旧音频残留混入
 - **翻译完整性保护** — 配音模式下如果翻译缺失导致原文送入 TTS，流水线会以 `TRANSLATION_INCOMPLETE` 明确报错
 - **音频混合可取消** — 所有 FFmpeg 子进程支持回调检测取消信号，混合/合成过程可快速终止
 - **用户视角主界面** — 主界面按「添加视频 → 开始处理 → 查看结果」重排为任务卡片，顶部只保留状态、输出目录、翻译/配音和设置入口，减少按钮拥挤
@@ -107,7 +108,8 @@ python tools/package_source.py --output video2subtitles-source-package.zip
 
 ### 2026-06 — 字幕样式微调、TTS 时序优化与音频混合改进
 
-- **安全源码打包脚本**：新增 `tools/package_source.py`，用于生成可发送给 AI 辅助排查的源码 zip；默认排除模型、缓存、输出目录、音视频、cookies、`.env*`、密钥证书、虚拟环境和本地桥接目录，并在压缩包内写入 `PACKAGE_MANIFEST.json` 便于复核。
+- **安全源码打包脚本**：新增 `tools/package_source.py`，用于生成可发送给 AI 辅助排查的源码 zip；默认排除模型、缓存、输出目录、音视频、cookies、`.env*`、密钥证书、虚拟环境和本地桥接目录，并在压缩包内写入 `PACKAGE_MANIFEST.json` 便于复核；同时修复隐藏文件名前缀被错误去掉的问题。
+- **TTS 字幕同步修复**：stable/strict 模式下 `build_tts_chunks` 会按字幕 gap 和时间跨度拆分 chunk，防止长间隔字幕被合成为连续语音；TTS 阶段新增 `tts_timeline_report.json`，音频混合阶段优先使用本轮 `index.json`，避免旧 `seg_*.wav` 残留造成错配。
 - **字幕字号调整**：所有内置样式预设（default/netflix/youtube/bilingual/mobile_vertical）的 `font_size` 整体下调，以适配更多屏幕尺寸和嵌入场景；`margin_v` 微调，移动端竖屏样式边距从 80 调整为 60。
 - **精确 TTS 时序控制**：速度约束范围收紧（MAX_SPEED 2.0→1.5，MAX_SLOW 0.75→0.8），`atempo` 失败时不再暴力裁剪音频，改为保留原始音频，避免音质劣化。目标时长计算引入 `nominal * 0.9` 下界，使 TTS 朗读节奏更自然。
 - **沉默边界检测切分**：`timing.py` 新增 `detect_silence_boundaries()`，对合并 TTS chunk 使用 FFmpeg silencedetect 探测自然停顿点，实现逐段精确时间窗口划分；沉默检测不足时回退字符比例估算。

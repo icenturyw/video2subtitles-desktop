@@ -105,6 +105,7 @@ EXCLUDED_FILE_GLOBS = {
     "id_rsa",
     "id_ed25519",
     "known_hosts",
+    "package_manifest.json",
     "*.log",
     "*.tmp",
     "*.bak",
@@ -187,7 +188,12 @@ class PackageStats:
 
 
 def _as_posix(path: Path) -> str:
-    return path.as_posix().lstrip("./")
+    normalized = path.as_posix()
+    if normalized == ".":
+        return ""
+    if normalized.startswith("./"):
+        return normalized[2:]
+    return normalized
 
 
 def _matches_any(value: str, patterns: Iterable[str]) -> bool:

@@ -156,8 +156,9 @@ class TestBuildTtsChunks:
             MockSegment(3, "world", 2.0, 3.0),
         ]
         chunks = build_tts_chunks(segs)
-        assert len(chunks) == 1
-        assert chunks[0].segment_indexes == [1, 3]
+        assert len(chunks) == 2
+        assert chunks[0].segment_indexes == [1]
+        assert chunks[1].segment_indexes == [3]
 
     def test_max_chars_respected(self):
         segs = [
@@ -205,10 +206,30 @@ class TestBuildTtsChunks:
             MockSegment(2, "Second", 100.0, 101.0),
         ]
         chunks = build_tts_chunks(segs)
-        # These are far apart in terms of time, but chunking doesn't split
-        # based on gap - it merges based on max_duration_sec
-        # With default 45s max, both would fit
-        assert len(chunks) >= 1
+        assert len(chunks) == 2
+        assert chunks[0].segment_indexes == [1]
+        assert chunks[1].segment_indexes == [2]
+
+    def test_short_gap_can_still_merge(self):
+        segs = [
+            MockSegment(1, "Hello", 0.0, 1.0),
+            MockSegment(2, "world", 1.1, 2.0),
+        ]
+        chunks = build_tts_chunks(segs, {"max_gap_sec": 0.8})
+        assert len(chunks) == 1
+        assert chunks[0].segment_indexes == [1, 2]
+
+    def test_timeline_span_limit_splits_chunks(self):
+        segs = [
+            MockSegment(1, "A", 0.0, 1.0),
+            MockSegment(2, "B", 8.0, 9.0),
+            MockSegment(3, "C", 16.0, 17.0),
+        ]
+        chunks = build_tts_chunks(segs, {
+            "max_gap_sec": 20.0,
+            "max_timeline_span_sec": 12.0,
+        })
+        assert len(chunks) >= 2
 
     def test_empty_segments_list(self):
         chunks = build_tts_chunks([])

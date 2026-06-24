@@ -936,17 +936,98 @@ class PipelineRunner:
 
         report_rows: List[Dict[str, Any]] = []
         tts_errors: List[Dict[str, Any]] = []
+        chunk_fallback_count = 0
+
+        def _float_option(*keys: str, default: float, minimum: float, maximum: float) -> float:
+            value: Any = default
+            for key in keys:
+                if key in tts_options:
+                    value = tts_options.get(key)
+                    break
+                if key in request:
+                    value = request.get(key)
+                    break
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                parsed = default
+            return max(minimum, min(maximum, parsed))
+
+        def _int_option(*keys: str, default: int, minimum: int, maximum: int) -> int:
+            value: Any = default
+            for key in keys:
+                if key in tts_options:
+                    value = tts_options.get(key)
+                    break
+                if key in request:
+                    value = request.get(key)
+                    break
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                parsed = default
+            return max(minimum, min(maximum, parsed))
+
+        def _bool_option(*keys: str, default: bool) -> bool:
+            value: Any = default
+            for key in keys:
+                if key in tts_options:
+                    value = tts_options.get(key)
+                    break
+                if key in request:
+                    value = request.get(key)
+                    break
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                normalized = value.strip().lower()
+                if normalized in {"1", "true", "yes", "on"}:
+                    return True
+                if normalized in {"0", "false", "no", "off"}:
+                    return False
+            return bool(value)
+
+        chunk_options = {
+            "max_chars": _int_option("tts_chunk_max_chars", "max_chars", default=500, minimum=20, maximum=5000),
+            "max_duration_sec": _float_option(
+                "tts_chunk_max_duration_sec", "max_duration_sec",
+                default=45.0, minimum=1.0, maximum=120.0,
+            ),
+            "min_chars": _int_option("tts_chunk_min_chars", "min_chars", default=40, minimum=1, maximum=1000),
+            "prefer_sentence_end": _bool_option(
+                "tts_chunk_prefer_sentence_end", "prefer_sentence_end", default=True,
+            ),
+            "max_gap_sec": _float_option(
+                "tts_chunk_max_gap_sec", "max_gap_sec",
+                default=0.8, minimum=0.1, maximum=5.0,
+            ),
+            "max_timeline_span_sec": _float_option(
+                "tts_chunk_max_timeline_span_sec", "max_timeline_span_sec",
+                default=12.0, minimum=2.0, maximum=60.0,
+            ),
+        }
+        chunk_max_gap_sec = float(chunk_options["max_gap_sec"])
+
+        segment_by_index = {seg.index: seg for seg in candidates}
+        next_start_by_index: Dict[int, Optional[float]] = {}
+        for i, seg in enumerate(candidates):
+            next_start_by_index[seg.index] = candidates[i + 1].start if i + 1 < len(candidates) else None
 
         # ------------------------------------------------------------------
-        # Build TTS chunks for stable/strict modes (merge short segments)
+        # Build TTS chunks for stable/strict modes (merge only local segments)
         # ------------------------------------------------------------------
         use_chunking = consistency_mode in ("stable", "strict") and _HAS_VOICE_PROFILE and callable(build_tts_chunks)
         chunks: List[Any] = []
         chunk_to_segments: Dict[int, List[SubtitleSegment]] = {}
 
         if use_chunking:
-            raw_chunks = build_tts_chunks(candidates)
-            write_log(ws, f"  TTS chunks: {len(candidates)} segments -> {len(raw_chunks)} chunks (mode={consistency_mode})")
+            raw_chunks = build_tts_chunks(candidates, chunk_options)
+            write_log(
+                ws,
+                f"  TTS chunks: {len(candidates)} segments -> {len(raw_chunks)} chunks "
+                f"(mode={consistency_mode}, max_gap={chunk_options['max_gap_sec']}s, "
+                f"max_span={chunk_options['max_timeline_span_sec']}s)",
+            )
             for c in raw_chunks:
                 c_segs = [seg for seg in candidates if seg.index in c.segment_indexes]
                 chunk_to_segments[c.chunk_index] = c_segs
@@ -957,12 +1038,56 @@ class PipelineRunner:
         # ------------------------------------------------------------------
         # Shared helpers
         # ------------------------------------------------------------------
+        def _timeline_fields(
+            seg: SubtitleSegment,
+            *,
+            source_mode: str,
+            chunk_index: Optional[int] = None,
+            chunk_segment_indexes: Optional[List[int]] = None,
+            source_window_start: Optional[float] = None,
+            source_window_duration: Optional[float] = None,
+        ) -> Dict[str, Any]:
+            next_start = next_start_by_index.get(seg.index)
+            gap_to_next = None if next_start is None else max(0.0, float(next_start) - float(seg.end))
+            return {
+                "subtitle_start": float(seg.start),
+                "subtitle_end": float(seg.end),
+                "next_subtitle_start": next_start,
+                "subtitle_gap_to_next": gap_to_next,
+                "source_mode": source_mode,
+                "chunk_index": chunk_index,
+                "chunk_segment_indexes": chunk_segment_indexes or [],
+                "source_window_start": source_window_start,
+                "source_window_duration": source_window_duration,
+                "overlay_start": float(seg.start),
+                "overlay_start_matches_subtitle_start": True,
+            }
+
         def record_report(result: Dict[str, Any]) -> None:
             if not result.get("index"):
                 return
+            seg = segment_by_index.get(int(result.get("index")))
+            start = result.get("start")
+            overlay_matches = True
+            if seg is not None and start is not None:
+                try:
+                    overlay_matches = abs(float(start) - float(seg.start)) <= 0.05
+                except (TypeError, ValueError):
+                    overlay_matches = False
             report_rows.append({
                 "index": result.get("index"),
                 "start": result.get("start"),
+                "subtitle_start": result.get("subtitle_start"),
+                "subtitle_end": result.get("subtitle_end"),
+                "next_subtitle_start": result.get("next_subtitle_start"),
+                "subtitle_gap_to_next": result.get("subtitle_gap_to_next"),
+                "source_mode": result.get("source_mode", "per_segment"),
+                "chunk_index": result.get("chunk_index"),
+                "chunk_segment_indexes": result.get("chunk_segment_indexes", []),
+                "source_window_start": result.get("source_window_start"),
+                "source_window_duration": result.get("source_window_duration"),
+                "overlay_start": start,
+                "overlay_start_matches_subtitle_start": overlay_matches,
                 "mode": result.get("mode", options.get("qwen_mode", "")),
                 "cached": bool(result.get("cached", False)),
                 "target_duration": result.get("target_duration"),
@@ -1017,7 +1142,7 @@ class PipelineRunner:
             else:
                 shutil.copy2(str(normalized_path), str(seg_path))
 
-            return {
+            payload = {
                 "index": seg.index,
                 "path": seg_path,
                 "start": seg.start,
@@ -1029,6 +1154,8 @@ class PipelineRunner:
                 "cached": getattr(result, "cached", False),
                 "mode": getattr(result, "mode", options.get("qwen_mode", "")),
             }
+            payload.update(_timeline_fields(seg, source_mode="per_segment"))
+            return payload
 
         _wav_dur_cache: Dict[str, float] = {}
 
@@ -1039,15 +1166,25 @@ class PipelineRunner:
                 _wav_dur_cache[key] = _get_wav_duration(path)
             return _wav_dur_cache[key]
 
+        def _max_segment_gap(csegs: List[SubtitleSegment]) -> float:
+            if len(csegs) < 2:
+                return 0.0
+            ordered = sorted(csegs, key=lambda item: (item.start, item.index))
+            gaps = [
+                float(ordered[i + 1].start) - float(ordered[i].end)
+                for i in range(len(ordered) - 1)
+            ]
+            return max([0.0] + gaps)
+
         def _build_chunk_windows(csegs: List[SubtitleSegment],
                                  chunk_dur: float,
                                  chunk_path: Path) -> Optional[Dict[int, Tuple[float, float]]]:
-            """Build segment windows using silence detection with character-proportion fallback.
+            """Build segment windows using silence detection with guarded fallback.
 
-            Returns:
-                Dict mapping segment index -> (start_offset, duration), or None
-                if both silence detection and proportion estimation are unreliable
-                (caller should fall back to per-segment synthesis).
+            Character-proportion slicing is only safe for a compact subtitle
+            region. If a chunk somehow crosses a long timeline gap, returning
+            None forces per-segment synthesis instead of putting later speech
+            into an earlier subtitle window.
             """
             if chunk_dur <= 0:
                 return {}
@@ -1073,7 +1210,17 @@ class PipelineRunner:
                     windows[seg.index] = (max(0.0, start_offset), max(0.001, duration))
                 return windows
 
-            # Silence detection insufficient; use character-proportion as fallback
+            # Silence detection insufficient; use character-proportion only for
+            # compact chunks. Long internal gaps indicate the chunk should have
+            # been split and per-segment synthesis is safer.
+            if target_boundary_count >= 1 and _max_segment_gap(csegs) > chunk_max_gap_sec:
+                write_log(
+                    ws,
+                    f"  TTS chunk window fallback disabled: max internal gap "
+                    f"{_max_segment_gap(csegs):.3f}s > {chunk_max_gap_sec:.3f}s",
+                )
+                return None
+
             units: List[Tuple[int, int, int]] = []
             cursor = 0
             for seg in csegs:
@@ -1120,6 +1267,7 @@ class PipelineRunner:
         # Chunk-based synthesis (stable / strict mode)
         # ------------------------------------------------------------------
         def synthesize_chunk(chunk: Any) -> List[Dict[str, Any]]:
+            nonlocal chunk_fallback_count
             results: List[Dict[str, Any]] = []
             csegs = chunk_to_segments.get(chunk.chunk_index, [])
             if not csegs:
@@ -1165,6 +1313,32 @@ class PipelineRunner:
             if chunk_dur <= 0:
                 chunk_dur = result.duration_seconds
             chunk_windows = _build_chunk_windows(csegs, chunk_dur, chunk_path)
+            if chunk_windows is None:
+                chunk_fallback_count += 1
+                write_log(
+                    ws,
+                    f"  TTS chunk {chunk.chunk_index} crosses an unsafe timeline gap; "
+                    "falling back to per-segment synthesis",
+                )
+                fallback_results: List[Dict[str, Any]] = []
+                for seg in csegs:
+                    result_item = synthesize_segment(seg)
+                    if result_item.get("cancelled"):
+                        fallback_results.append(result_item)
+                        break
+                    if result_item.get("index"):
+                        warning = result_item.get("warning", "")
+                        fallback_note = "chunk_fallback: unsafe chunk timeline"
+                        result_item["warning"] = f"{warning}; {fallback_note}" if warning else fallback_note
+                        result_item.update(_timeline_fields(
+                            seg,
+                            source_mode="chunk_fallback",
+                            chunk_index=chunk.chunk_index,
+                            chunk_segment_indexes=list(chunk.segment_indexes),
+                        ))
+                    fallback_results.append(result_item)
+                return fallback_results
+
             single_segment_chunk = len(csegs) == 1
 
             for seg in csegs:
@@ -1225,7 +1399,7 @@ class PipelineRunner:
                     speed = None
                     adj_dur = estimated_dur
 
-                results.append({
+                payload = {
                     "index": seg.index,
                     "path": seg_path,
                     "start": seg.start,
@@ -1236,7 +1410,16 @@ class PipelineRunner:
                     "warning": warning,
                     "cached": getattr(result, "cached", False),
                     "mode": getattr(result, "mode", options.get("qwen_mode", "")),
-                })
+                }
+                payload.update(_timeline_fields(
+                    seg,
+                    source_mode="chunk" if not single_segment_chunk else "single_chunk",
+                    chunk_index=chunk.chunk_index,
+                    chunk_segment_indexes=list(chunk.segment_indexes),
+                    source_window_start=start_offset if not single_segment_chunk else 0.0,
+                    source_window_duration=estimated_dur if not single_segment_chunk else source_duration,
+                ))
+                results.append(payload)
 
             return results
 
@@ -1373,6 +1556,15 @@ class PipelineRunner:
         if report_artifact:
             self._store.add_artifact(job_id, report_artifact)
 
+        timeline_artifact = self._write_tts_timeline_report(
+            ws, report_rows,
+            chunk_count=len(chunks),
+            chunk_fallback_count=chunk_fallback_count,
+            chunk_options=chunk_options,
+        )
+        if timeline_artifact:
+            self._store.add_artifact(job_id, timeline_artifact)
+
         self._store.update(job_id, stage="tts", message=f"TTS generated {completed} segments")
         return True
 
@@ -1449,6 +1641,36 @@ class PipelineRunner:
             "path": "audio/tts/tts_control_report.json",
         }
 
+    def _write_tts_timeline_report(self, ws: Path, rows: List[Dict[str, Any]],
+                                   *, chunk_count: int,
+                                   chunk_fallback_count: int,
+                                   chunk_options: Dict[str, Any]) -> Optional[Dict]:
+        report_path = ws / "audio" / "tts" / "tts_timeline_report.json"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        warnings = [
+            row for row in rows
+            if row.get("warning")
+            or row.get("error")
+            or not bool(row.get("overlay_start_matches_subtitle_start", True))
+        ]
+        payload = {
+            "total_segments": len(rows),
+            "chunk_count": int(chunk_count),
+            "chunk_fallback_count": int(chunk_fallback_count),
+            "max_gap_sec": chunk_options.get("max_gap_sec"),
+            "max_timeline_span_sec": chunk_options.get("max_timeline_span_sec"),
+            "warnings_count": len(warnings),
+            "segments": sorted(rows, key=lambda row: int(row.get("index") or 0)),
+        }
+        report_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return {
+            "kind": "tts_timeline_report",
+            "path": "audio/tts/tts_timeline_report.json",
+        }
+
     def _run_audio_mix(self, job_id: str, ws: Path,
                         segments: List[SubtitleSegment],
                         source_video: Optional[Path],
@@ -1461,16 +1683,54 @@ class PipelineRunner:
             return False
 
         tts_dir = ws / "audio" / "tts"
-        tts_wavs = sorted(tts_dir.glob("seg_*.wav"))
-        if not tts_wavs:
+        segment_start_by_index = {int(seg.index): float(seg.start) for seg in segments}
+        tts_segments = []
+        index_path = tts_dir / "index.json"
+
+        if index_path.exists():
+            try:
+                index_data = json.loads(index_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                write_log(ws, f"  Failed to read TTS index.json, falling back to glob: {exc}")
+                index_data = []
+            for item in index_data if isinstance(index_data, list) else []:
+                try:
+                    idx = int(item.get("index"))
+                except (TypeError, ValueError, AttributeError):
+                    continue
+                raw_path = str(item.get("path", "") or "")
+                if not raw_path:
+                    continue
+                wav_path = Path(raw_path)
+                if not wav_path.is_absolute():
+                    wav_path = ws / wav_path
+                if not wav_path.exists() or wav_path.stat().st_size <= 0:
+                    write_log(ws, f"  TTS index entry skipped, missing audio: index={idx} path={wav_path}")
+                    continue
+                try:
+                    indexed_start = float(item.get("start", segment_start_by_index.get(idx, 0.0)))
+                except (TypeError, ValueError):
+                    indexed_start = segment_start_by_index.get(idx, 0.0)
+                current_start = segment_start_by_index.get(idx, indexed_start)
+                if abs(indexed_start - current_start) > 0.05:
+                    write_log(
+                        ws,
+                        f"  TTS index start mismatch for seg {idx}: "
+                        f"index={indexed_start:.3f}s current={current_start:.3f}s; using current subtitle start",
+                    )
+                tts_segments.append((wav_path, current_start))
+        else:
+            tts_wavs = sorted(tts_dir.glob("seg_*.wav"))
+            for seg in segments:
+                match = [w for w in tts_wavs if w.stem.endswith(f"{seg.index:04d}")]
+                if match and match[0].stat().st_size > 0:
+                    tts_segments.append((match[0], seg.start))
+
+        if not tts_segments:
             self._fail(job_id, ws, "AUDIO_MIX_NO_TTS", "No TTS audio files found")
             return False
 
-        tts_segments = []
-        for seg in segments:
-            match = [w for w in tts_wavs if w.stem.endswith(f"{seg.index:04d}")]
-            if match:
-                tts_segments.append((match[0], seg.start))
+        tts_segments.sort(key=lambda item: item[1])
 
         from audio.mix import mix_audio
 

@@ -722,6 +722,53 @@ class TestPipelineTTSConcurrency(unittest.TestCase):
         self.assertTrue((ws / "audio" / "tts" / "seg_0001.wav").exists())
         self.assertTrue((ws / "audio" / "tts" / "seg_0002.wav").exists())
 
+    def test_stable_tts_does_not_chunk_across_long_gap(self):
+        from job_models import SubtitleSegment
+        from tts.base import TTSResult
+
+        synthesized_texts = []
+
+        class FakeTTSProvider:
+            def synthesize(self, text, language, voice, output_path, options):
+                synthesized_texts.append(text)
+                Path(output_path).write_bytes(b"wav")
+                return TTSResult(output_path=Path(output_path), duration_seconds=0.5)
+
+            def list_voices(self, language=None):
+                return []
+
+        ws = Path(self.tmpdir)
+        segments = [
+            SubtitleSegment(index=1, start=0.0, end=1.0, text="src-1", translation="hello"),
+            SubtitleSegment(index=2, start=20.0, end=21.0, text="src-2", translation="world"),
+        ]
+        store = TaskStore(ws / "data")
+        store.create("job-tts-gap", {"workspace_dir": str(ws)})
+        runner = PipelineRunner(store, ProgressTracker())
+
+        def fake_adjust(input_audio, output_audio, actual_duration, target_duration):
+            Path(output_audio).write_bytes(b"seg")
+            return target_duration, "", 1.0
+
+        with patch("tts.get_provider", return_value=FakeTTSProvider()), \
+             patch("tts.timing.adjust_timing", side_effect=fake_adjust):
+            ok = runner._run_tts(
+                "job-tts-gap",
+                ws,
+                segments,
+                {"tts_provider": "fake", "tts_voice": "voice", "tts_consistency_mode": "stable"},
+                "zh-CN",
+                CancellationToken(),
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(synthesized_texts, ["hello", "world"])
+        index = json.loads((ws / "audio" / "tts" / "index.json").read_text(encoding="utf-8"))
+        self.assertEqual([item["start"] for item in index], [0.0, 20.0])
+        timeline = json.loads((ws / "audio" / "tts" / "tts_timeline_report.json").read_text(encoding="utf-8"))
+        self.assertEqual(timeline["chunk_count"], 2)
+        self.assertTrue(all(item["overlay_start_matches_subtitle_start"] for item in timeline["segments"]))
+
     def test_tts_skip_removes_stale_segment_audio(self):
         from job_models import SubtitleSegment
         from tts.base import TTSResult
@@ -1180,6 +1227,49 @@ class TestPipelineAudioMix(unittest.TestCase):
 
         self.assertTrue(ok)
         self.assertEqual(mock_mix.call_args.kwargs["original_volume"], 1.0)
+
+    def test_audio_mix_uses_tts_index_and_ignores_stale_files(self):
+        from job_models import SubtitleSegment
+
+        ws = Path(self.tmpdir)
+        source_video = ws / "source.mp4"
+        tts_dir = ws / "audio" / "tts"
+        tts_dir.mkdir(parents=True)
+        source_video.write_bytes(b"video")
+        valid = tts_dir / "seg_0001.wav"
+        stale = tts_dir / "seg_9999.wav"
+        valid.write_bytes(b"wav")
+        stale.write_bytes(b"old")
+        (tts_dir / "index.json").write_text(
+            json.dumps([{"index": 1, "path": str(valid), "start": 0.0}], ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        runner = PipelineRunner(TaskStore(ws / "data"), ProgressTracker())
+        segments = [
+            SubtitleSegment(index=1, start=0.0, end=1.0, text="hello", translation="hi"),
+            SubtitleSegment(index=9999, start=99.0, end=100.0, text="old", translation="old"),
+        ]
+
+        def fake_mix_audio(**kwargs):
+            kwargs["output_path"].parent.mkdir(parents=True, exist_ok=True)
+            kwargs["output_path"].write_bytes(b"mp4")
+            return {"success": True}
+
+        with patch("audio.mix.mix_audio", side_effect=fake_mix_audio) as mock_mix:
+            ok = runner._run_audio_mix(
+                "job-audio",
+                ws,
+                segments,
+                source_video,
+                "en",
+                {},
+                CancellationToken(),
+            )
+
+        self.assertTrue(ok)
+        mixed_segments = mock_mix.call_args.kwargs["tts_segments"]
+        self.assertEqual(mixed_segments, [(valid, 0.0)])
 
     def test_audio_mix_defaults_to_muting_original_audio(self):
         from job_models import SubtitleSegment
