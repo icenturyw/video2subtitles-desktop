@@ -71,16 +71,36 @@ def _clean_options(options: dict) -> Dict:
     return cleaned
 
 
-def _generation_options(options: dict) -> Dict:
+def _estimate_max_tokens(text: str) -> int:
+    """Estimate a safe max_new_tokens value for a given text.
+
+    Conservative estimates per character:
+        - CJK: ~2 tokens per character
+        - Latin/Cyrillic: ~1.5 tokens per character
+        - Fallback: ~2 tokens per character + margin
+    """
+    if not text:
+        return 256
+    cjk_chars = sum(1 for c in text if '\u4e00' <= c <= '\u9fff'
+                    or '\u3040' <= c <= '\u30ff' or '\uac00' <= c <= '\ud7af')
+    other_chars = len(text) - cjk_chars
+    estimated = int(cjk_chars * 2.0 + other_chars * 1.5) + 256
+    return max(256, min(4096, estimated))
+
+
+def _generation_options(options: dict, text: str = "") -> Dict:
     payload: Dict[str, object] = {}
     for key in ("max_new_tokens", "seed"):
         value = options.get(key)
         if value in ("", None):
+            if key == "max_new_tokens" and text:
+                payload[key] = _estimate_max_tokens(text)
             continue
         try:
             payload[key] = int(value)
         except (TypeError, ValueError):
-            pass
+            if key == "max_new_tokens" and text and "max_new_tokens" not in payload:
+                payload[key] = _estimate_max_tokens(text)
     for key in ("top_p", "temperature"):
         value = options.get(key)
         if value in ("", None):
@@ -246,7 +266,7 @@ class Qwen3TTSProvider:
         else:
             raise TTSUnavailableError("当前加载的模型不支持任何合成模式")
 
-        payload.update(_generation_options(options))
+        payload.update(_generation_options(options, text))
         payload = {k: v for k, v in payload.items() if v is not None}
         cache_variant = _cache_variant(requested_mode, options, caps, speaker)
 
@@ -285,6 +305,18 @@ class Qwen3TTSProvider:
 
         if duration <= 0:
             duration = _get_wav_duration(output_path)
+
+        if duration > 0 and text:
+            chars_per_sec = len(text) / duration if duration > 0.01 else 0
+            is_cjk = any('\u4e00' <= c <= '\u9fff' or '\u3040' <= c <= '\u30ff'
+                        or '\uac00' <= c <= '\ud7af' for c in text[:50])
+            min_cps = 3.0 if is_cjk else 6.0
+            if chars_per_sec > 80 or (chars_per_sec < min_cps and duration < 0.3):
+                logger.warning(
+                    "Possible TTS truncation: text=%d chars, duration=%.2fs, "
+                    "cps=%.1f, language=%s",
+                    len(text), duration, chars_per_sec, lang,
+                )
 
         if self._cache and duration > 0:
             self._cache.put(text, speaker, lang, output_path, cache_variant)

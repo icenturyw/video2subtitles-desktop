@@ -13,7 +13,7 @@ def normalize_tts_audio(
     sample_rate: int = 24000,
     channels: int = 1,
     normalize_loudness: bool = True,
-    remove_silence: bool = True,
+    remove_silence: bool = False,
 ) -> Optional[Path]:
     """Normalize TTS audio to consistent format.
 

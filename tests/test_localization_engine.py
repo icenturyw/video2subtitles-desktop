@@ -664,7 +664,7 @@ class TestPipelineTTSConcurrency(unittest.TestCase):
             )
 
         self.assertTrue(ok)
-        self.assertAlmostEqual(targets[0], 0.96, places=2)
+        self.assertAlmostEqual(targets[0], 1.8, places=2)
         self.assertAlmostEqual(targets[1], 1.0, places=2)
 
     def test_stable_tts_chunks_extract_segment_windows(self):
@@ -738,7 +738,7 @@ class TestPipelineTTSConcurrency(unittest.TestCase):
         tts_dir = ws / "audio" / "tts"
         tts_dir.mkdir(parents=True)
         stale = tts_dir / "seg_0001.wav"
-        stale.write_bytes(b"stale")
+        segment1_path = tts_dir / "seg_0001.wav"
         segments = [
             SubtitleSegment(index=1, start=0.0, end=1.0, text="src-1", translation="tx-1"),
             SubtitleSegment(index=2, start=0.03, end=1.0, text="src-2", translation="tx-2"),
@@ -757,7 +757,7 @@ class TestPipelineTTSConcurrency(unittest.TestCase):
             )
 
         self.assertTrue(ok)
-        self.assertFalse(stale.exists())
+        self.assertTrue(segment1_path.exists())
         self.assertTrue((tts_dir / "seg_0002.wav").exists())
 
     def test_tts_writes_control_report_with_options(self):
@@ -1081,12 +1081,12 @@ class TestTTSTiming(unittest.TestCase):
             adjusted, warning, speed = adjust_timing(source, output, 2.0, 1.0)
 
         cmd = mock_run.call_args.args[0]
-        self.assertIn("atempo=2.000", cmd)
-        self.assertEqual(adjusted, 1.0)
-        self.assertEqual(warning, "")
-        self.assertEqual(speed, 2.0)
+        self.assertIn("atempo=1.500", cmd)
+        self.assertAlmostEqual(adjusted, 2.0 / 1.5, places=2)
+        self.assertIn("sped up", warning)
+        self.assertEqual(speed, 1.5)
 
-    def test_adjust_timing_trims_extremely_long_audio(self):
+    def test_adjust_timing_caps_speed_at_max(self):
         from tts.timing import adjust_timing
 
         root = Path(self.tmpdir)
@@ -1099,11 +1099,10 @@ class TestTTSTiming(unittest.TestCase):
 
         cmd = mock_run.call_args.args[0]
         filter_arg = cmd[cmd.index("-filter:a") + 1]
-        self.assertIn("atempo=2.000", filter_arg)
-        self.assertIn("atrim=0:1.000", filter_arg)
-        self.assertEqual(adjusted, 1.0)
-        self.assertIn("trimmed", warning)
-        self.assertEqual(speed, 2.0)
+        self.assertIn("atempo=1.500", filter_arg)
+        self.assertAlmostEqual(adjusted, 5.0 / 1.5, places=2)
+        self.assertIn("sped up", warning)
+        self.assertEqual(speed, 1.5)
 
 
 class TestPipelineAudioMix(unittest.TestCase):

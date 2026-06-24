@@ -910,11 +910,10 @@ class PipelineRunner:
             if i + 1 < len(candidates):
                 next_start = candidates[i + 1].start
                 available = next_start - seg.start - tts_gap
-                target_durations[seg.index] = (
-                    min(nominal, available)
-                    if available >= min_tts_duration
-                    else 0.0
-                )
+                if available >= min_tts_duration:
+                    target_durations[seg.index] = max(nominal * 0.9, min(nominal, available))
+                else:
+                    target_durations[seg.index] = min(nominal * 0.9, max(nominal / 1.5, min_tts_duration))
             else:
                 target_durations[seg.index] = nominal
 
@@ -1041,26 +1040,55 @@ class PipelineRunner:
             return _wav_dur_cache[key]
 
         def _build_chunk_windows(csegs: List[SubtitleSegment],
-                                 chunk_dur: float) -> Dict[int, Tuple[float, float]]:
-            """Estimate each segment's source window inside a synthesized chunk."""
+                                 chunk_dur: float,
+                                 chunk_path: Path) -> Optional[Dict[int, Tuple[float, float]]]:
+            """Build segment windows using silence detection with character-proportion fallback.
+
+            Returns:
+                Dict mapping segment index -> (start_offset, duration), or None
+                if both silence detection and proportion estimation are unreliable
+                (caller should fall back to per-segment synthesis).
+            """
             if chunk_dur <= 0:
                 return {}
 
+            from tts.timing import detect_silence_boundaries
+            boundaries = detect_silence_boundaries(chunk_path)
+            target_boundary_count = len(csegs) - 1
+
+            if len(boundaries) >= target_boundary_count and target_boundary_count >= 1:
+                # Use silence detection: pick the most evenly distributed boundaries
+                if len(boundaries) > target_boundary_count:
+                    step = len(boundaries) / (target_boundary_count + 1)
+                    picked = [boundaries[int((i + 1) * step)]
+                              for i in range(target_boundary_count)]
+                else:
+                    picked = boundaries.copy()
+
+                split_points = [0.0] + picked + [chunk_dur]
+                windows: Dict[int, Tuple[float, float]] = {}
+                for i, seg in enumerate(csegs):
+                    start_offset = split_points[i]
+                    duration = split_points[i + 1] - split_points[i]
+                    windows[seg.index] = (max(0.0, start_offset), max(0.001, duration))
+                return windows
+
+            # Silence detection insufficient; use character-proportion as fallback
             units: List[Tuple[int, int, int]] = []
             cursor = 0
             for seg in csegs:
                 seg_text = (seg.translation or seg.text or "").strip()
                 seg_units = max(1, len(seg_text))
                 units.append((seg.index, cursor, seg_units))
-                cursor += seg_units + 1  # account for the joiner space between texts
+                cursor += seg_units + 1
 
             total_units = max(1, cursor - 1)
-            windows: Dict[int, Tuple[float, float]] = {}
+            windows_fallback: Dict[int, Tuple[float, float]] = {}
             for seg_index, start_unit, seg_units in units:
                 start_offset = chunk_dur * (start_unit / total_units)
                 duration = chunk_dur * (seg_units / total_units)
-                windows[seg_index] = (start_offset, max(0.001, duration))
-            return windows
+                windows_fallback[seg_index] = (start_offset, max(0.001, duration))
+            return windows_fallback
 
         # ------------------------------------------------------------------
         # Per-segment synthesis (fast mode)
@@ -1136,7 +1164,7 @@ class PipelineRunner:
             chunk_dur = _get_wav_duration_cached(chunk_path)
             if chunk_dur <= 0:
                 chunk_dur = result.duration_seconds
-            chunk_windows = _build_chunk_windows(csegs, chunk_dur)
+            chunk_windows = _build_chunk_windows(csegs, chunk_dur, chunk_path)
             single_segment_chunk = len(csegs) == 1
 
             for seg in csegs:

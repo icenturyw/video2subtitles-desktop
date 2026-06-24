@@ -36,10 +36,12 @@ class StyleRequest(BaseModel):
     """Subtitle style configuration in API requests."""
     preset: str = "default"
     font_family: str = "Microsoft YaHei"
-    font_size: int = 48
+    font_size: int = 28
     outline: float = 2.0
     shadow: float = 1.0
-    margin_v: int = 40
+    margin_v: int = 50
+    alignment: int = 2
+    bold: bool = False
 
 
 class CreateJobRequest(BaseModel):

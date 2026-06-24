@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import time
 import webbrowser
@@ -99,16 +100,20 @@ def _patched_init(self, *args, **kwargs):
 
 
 def _copy_downloaded_video(window, key: str, sub_dir: Path, base: str) -> Path | None:
+    import glob as _glob_mod
     video_id = window._get_video_id(key)
+    safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", video_id)[:80]
     whisper_temp = mw.WHISPER_SERVER / "temp"
     if not whisper_temp.exists():
         return None
     candidates = []
-    for pattern in (f"{video_id}.*", f"{video_id[:80]}.*"):
+    for pattern in (_glob_mod.escape(safe_id) + ".*", _glob_mod.escape(safe_id[:80]) + ".*"):
         candidates.extend(whisper_temp.glob(pattern))
-    # Also search recent video files when aliases are not exact, e.g. Bilibili hashes.
-    candidates.extend(p for p in whisper_temp.iterdir() if p.is_file() and p.suffix.lower() in VIDEO_EXTS)
     candidates = [p for p in candidates if p.is_file() and p.suffix.lower() in VIDEO_EXTS and p.stat().st_size > 0]
+    if not candidates:
+        for candidate in whisper_temp.iterdir():
+            if candidate.is_file() and candidate.suffix.lower() in VIDEO_EXTS and candidate.stat().st_size > 0:
+                candidates.append(candidate)
     candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     for src in candidates:
         dst = sub_dir / f"{base}{src.suffix.lower()}"

@@ -67,18 +67,18 @@ class TestSubtitleStyle(unittest.TestCase):
     def test_defaults(self):
         style = SubtitleStyle()
         self.assertEqual(style.preset, "default")
-        self.assertEqual(style.font_size, 48)
+        self.assertEqual(style.font_size, 28)
 
     def test_to_dict_and_back(self):
-        style = SubtitleStyle(preset="netflix", font_size=52, bold=True)
+        style = SubtitleStyle(preset="netflix", font_size=32, bold=True)
         d = style.to_dict()
         restored = SubtitleStyle.from_dict(d)
         self.assertEqual(restored.preset, "netflix")
-        self.assertEqual(restored.font_size, 52)
+        self.assertEqual(restored.font_size, 32)
         self.assertTrue(restored.bold)
 
     def test_from_dict_ignores_unknown_fields(self):
-        d = {"preset": "youtube", "font_size": 44, "unknown_field": True}
+        d = {"preset": "youtube", "font_size": 26, "unknown_field": True}
         style = SubtitleStyle.from_dict(d)
         self.assertEqual(style.preset, "youtube")
         self.assertFalse(hasattr(style, "unknown_field"))

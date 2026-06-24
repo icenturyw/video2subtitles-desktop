@@ -95,6 +95,17 @@ python -m unittest discover -s tests
 
 ## 维护记录 / Maintenance Notes
 
+### 2026-06 — 字幕样式微调、TTS 时序优化与音频混合改进
+
+- **字幕字号调整**：所有内置样式预设（default/netflix/youtube/bilingual/mobile_vertical）的 `font_size` 整体下调，以适配更多屏幕尺寸和嵌入场景；`margin_v` 微调，移动端竖屏样式边距从 80 调整为 60。
+- **精确 TTS 时序控制**：速度约束范围收紧（MAX_SPEED 2.0→1.5，MAX_SLOW 0.75→0.8），`atempo` 失败时不再暴力裁剪音频，改为保留原始音频，避免音质劣化。目标时长计算引入 `nominal * 0.9` 下界，使 TTS 朗读节奏更自然。
+- **沉默边界检测切分**：`timing.py` 新增 `detect_silence_boundaries()`，对合并 TTS chunk 使用 FFmpeg silencedetect 探测自然停顿点，实现逐段精确时间窗口划分；沉默检测不足时回退字符比例估算。
+- **音频混合时长策略变更**：`mix.py` 中 `amix` 的 `duration` 参数从 `first` 改为 `longest`，当原音比 TTS 配音长时，混合结果以最长音频为准，避免原音被截断。
+- **TTS 归一化去静音默认关闭**：`normalize.py` 中 `remove_silence` 默认从 `True` 改为 `False`，保留 TTS 自然首尾停顿，仅在需要时主动开启。
+- **Qwen3-TTS max_new_tokens 自动估算**：根据文本中 CJK/非 CJK 字符比例动态计算安全 `max_new_tokens`，避免长文本被截断；合成后检测 chars/sec 比率，异常时记录截断警告日志。
+- **视频 ID 提取修复**：修复 `main_window.py` 中 `_get_video_id` 对 URL 查询参数（如 `&t=...`）的处理，支持 `/?` 边界截断，并对提取结果做安全字符过滤；`output_patch.py` 使用 `glob.escape` 防止特殊字符匹配异常。
+- **StyleRequest 模型扩展**：本地化引擎 API 的 `StyleRequest` 新增 `alignment` 和 `bold` 字段，与 `job_models.py` 的 `SubtitleStyle` 对齐。
+
 ### 2026-06 — Qwen3-TTS 音色一致性修复
 
 - **TTS Voice Profile 冻结**：新增 `TtsVoiceProfile` 统一配置对象（`localization-engine/tts/voice_profile.py`），每个任务开始时将所有 TTS 参数（voice、model、seed、temperature、top_p、参考音频等）冻结为一个 profile，所有调用共用该 profile，杜绝逐句独立生成时参数漂移。

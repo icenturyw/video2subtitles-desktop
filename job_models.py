@@ -102,14 +102,14 @@ class SubtitleStyle:
 
     preset: str = "default"
     font_family: str = "Microsoft YaHei"
-    font_size: int = 48
+    font_size: int = 28
     primary_color: str = "&H00FFFFFF"
     secondary_color: str = "&H0000FFFF"
     outline_color: str = "&H00000000"
     background_color: str = "&H80000000"
     outline: float = 2.0
     shadow: float = 1.0
-    margin_v: int = 40
+    margin_v: int = 50
     alignment: int = 2
     bold: bool = False
     bilingual_source_scale: float = 0.8
@@ -129,19 +129,19 @@ class SubtitleStyle:
         return {
             "default": cls(),
             "netflix": cls(
-                preset="netflix", font_size=52, outline=3.0, shadow=0.0,
+                preset="netflix", font_size=32, outline=3.0, shadow=0.0,
                 primary_color="&H00FFFFFF", outline_color="&H00000000",
             ),
             "youtube": cls(
-                preset="youtube", font_size=44, outline=2.0, shadow=2.0,
+                preset="youtube", font_size=26, outline=2.0, shadow=2.0,
                 background_color="&HA0000000",
             ),
             "bilingual": cls(
-                preset="bilingual", font_size=42,
+                preset="bilingual", font_size=26,
                 bilingual_source_scale=0.75, bilingual_translation_scale=1.0,
             ),
             "mobile_vertical": cls(
-                preset="mobile_vertical", font_size=36, margin_v=80,
+                preset="mobile_vertical", font_size=24, margin_v=60,
             ),
         }
 

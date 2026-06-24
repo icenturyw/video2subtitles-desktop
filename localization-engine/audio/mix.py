@@ -149,7 +149,7 @@ def mix_audio(
     filter_parts.append(f"{all_labels}amix=inputs={len(tts_segments)}:normalize=0[tts_mix]")
     if has_original_audio:
         filter_parts.append(f"[0:a]volume={original_volume:.2f}[orig]")
-        filter_parts.append("[orig][tts_mix]amix=inputs=2:duration=first[out]")
+        filter_parts.append("[orig][tts_mix]amix=inputs=2:duration=longest[out]")
         audio_map = "[out]"
     else:
         audio_map = "[tts_mix]"
@@ -303,7 +303,7 @@ def _mux_tts_with_video(
     if original_volume > 0 and _video_has_audio(video_path):
         cmd.extend([
             "-filter_complex",
-            f"[0:a]volume={original_volume:.2f}[orig];[orig][1:a]amix=inputs=2:duration=first[out]",
+            f"[0:a]volume={original_volume:.2f}[orig];[orig][1:a]amix=inputs=2:duration=longest[out]",
             "-map", "0:v",
             "-map", "[out]",
         ])
@@ -377,7 +377,7 @@ def mix_simple_audio(
             cmd.extend([
                 "-filter_complex",
                 f"[0:a]volume={original_volume:.2f}[orig];"
-                f"[orig][1:a]amix=inputs=2:duration=first[out]",
+                f"[orig][1:a]amix=inputs=2:duration=longest[out]",
                 "-map", "0:v",
                 "-map", "[out]",
             ])

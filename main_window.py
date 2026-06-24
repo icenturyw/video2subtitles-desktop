@@ -2022,10 +2022,10 @@ class MainWindow(QMainWindow):
 
     def _get_video_id(self, url):
         import re, hashlib
-        match = re.search(r'(?:v=|\/videos\/|embed\/|youtu.be\/|\/v\/|\/e\/|watch\?v=|&v=)([^#&\n]*)', url)
+        match = re.search(r'(?:v=|\/videos\/|embed\/|youtu.be\/|\/v\/|\/e\/|watch\?v=|&v=)([^#&\n/?]*)', url)
         if match:
-            return match.group(1)
-        return hashlib.md5(url.encode()).hexdigest()[:11]
+            return re.sub(r"[^A-Za-z0-9_.-]", "_", match.group(1))[:80]
+        return hashlib.md5(url.encode("utf-8")).hexdigest()[:11]
 
     def _on_title_fetched(self, url, title):
         if hasattr(self, '_fetchers') and url in self._fetchers:

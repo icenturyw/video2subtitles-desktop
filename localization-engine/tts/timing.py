@@ -8,8 +8,8 @@ from typing import Dict, List, Tuple
 from process_utils import hidden_subprocess_kwargs
 
 
-MAX_SPEED = 2.0
-MAX_SLOW = 0.75
+MAX_SPEED = 1.5
+MAX_SLOW = 0.8
 
 
 def adjust_timing(
@@ -18,7 +18,7 @@ def adjust_timing(
     actual_duration: float,
     target_duration: float,
 ) -> Tuple[float, str, float]:
-    """Apply atempo/trim to fit the target duration.
+    """Apply atempo (and optional fade-out) to approach the target duration.
     
     Returns:
         (adjusted_duration, warning, speed_ratio) where speed_ratio is
@@ -33,7 +33,7 @@ def adjust_timing(
         speed = MAX_SPEED
         warning = (
             f"timing_warning: too long ({required_speed:.2f}x), "
-            f"sped up {MAX_SPEED:.2f}x and trimmed"
+            f"sped up {MAX_SPEED:.2f}x"
         )
     elif required_speed < MAX_SLOW:
         speed = MAX_SLOW
@@ -46,8 +46,6 @@ def adjust_timing(
         warning = ""
 
     filters = _atempo_chain(speed)
-    if required_speed > MAX_SPEED:
-        filters.extend([f"atrim=0:{target_duration:.3f}", "asetpts=N/SR/TB"])
 
     try:
         subprocess.run(
@@ -62,14 +60,15 @@ def adjust_timing(
             **hidden_subprocess_kwargs(),
         )
         if required_speed > MAX_SPEED:
-            return target_duration, warning, speed
+            adjusted = actual_duration / speed if speed else actual_duration
+            return adjusted, warning, speed
         adjusted = actual_duration / speed if speed else actual_duration
         return adjusted, warning, speed
     except Exception as e:
-        trimmed = _trim_audio(input_audio, output_audio, target_duration)
-        if trimmed:
-            return target_duration, f"atempo failed, trimmed instead: {e}", 1.0
-        return actual_duration, f"atempo failed: {e}", 1.0
+        import shutil
+        if str(input_audio.resolve()) != str(output_audio.resolve()):
+            shutil.copy2(str(input_audio), str(output_audio))
+        return actual_duration, f"atempo failed, kept original: {e}", 1.0
 
 
 def _atempo_chain(speed: float) -> List[str]:
@@ -84,25 +83,6 @@ def _atempo_chain(speed: float) -> List[str]:
         remaining /= 0.5
     factors.append(remaining)
     return [f"atempo={factor:.3f}" for factor in factors]
-
-
-def _trim_audio(input_audio: Path, output_audio: Path, target_duration: float) -> bool:
-    try:
-        subprocess.run(
-            [
-                "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
-                "-i", str(input_audio),
-                "-t", f"{target_duration:.3f}",
-                "-c:a", "pcm_s16le",
-                str(output_audio),
-            ],
-            capture_output=True, text=True, timeout=60,
-            check=True,
-            **hidden_subprocess_kwargs(),
-        )
-        return output_audio.exists()
-    except Exception:
-        return False
 
 
 def extract_audio_window(
@@ -156,6 +136,45 @@ def build_concat_file(segments: List[Tuple[Path, float]], output: Path) -> str:
     )
 
     return ";".join(filter_parts)
+
+
+def detect_silence_boundaries(
+    audio_path: Path,
+    noise_threshold: str = "-40dB",
+    min_silence_duration: float = 0.15,
+) -> List[float]:
+    """Detect natural silence/pause boundaries in an audio file.
+
+    Uses FFmpeg silencedetect to find periods of silence that likely
+    represent natural breaks between sentences/phrases.
+
+    Returns:
+        Sorted list of boundary timestamps (midpoints of silence intervals).
+    """
+    if not audio_path.exists():
+        return []
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-i", str(audio_path),
+                "-af", f"silencedetect=noise={noise_threshold}:d={min_silence_duration}",
+                "-f", "null", "-",
+            ],
+            capture_output=True, text=True, timeout=60,
+            **hidden_subprocess_kwargs(),
+        )
+        import re
+        boundaries = []
+        silence_starts = re.findall(r"silence_start:\s*([\d.]+)", result.stderr)
+        silence_ends = re.findall(r"silence_end:\s*([\d.]+)", result.stderr)
+        for start_str, end_str in zip(silence_starts, silence_ends):
+            start = float(start_str)
+            end = float(end_str)
+            boundaries.append((start + end) / 2.0)
+        boundaries.sort()
+        return boundaries
+    except Exception:
+        return []
 
 
 def save_timing_report(speed_ratios: Dict[int, float],
