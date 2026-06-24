@@ -88,6 +88,17 @@ _QWEN_DEFAULT_VOICES = [
 ]
 _QWEN_DEFAULT_STABLE_SEED = 42
 
+_VOLCENGINE_DEFAULT_ENDPOINT = "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
+_VOLCENGINE_DEFAULT_RESOURCE_ID = "seed-tts-2.0"
+_VOLCENGINE_DEFAULT_MODEL = "seed-tts-2.0-expressive"
+_VOLCENGINE_DEFAULT_VOICE = "zh_female_vv_uranus_bigtts"
+_VOLCENGINE_DEFAULT_VOICES = [
+    {"name": "zh_female_vv_uranus_bigtts", "locale": "zh-CN", "gender": "Female"},
+    {"name": "zh_male_dayi_uranus_bigtts", "locale": "zh-CN", "gender": "Male"},
+    {"name": "zh_female_shuangkuaisisi_moon_bigtts", "locale": "zh-CN", "gender": "Female"},
+    {"name": "zh_male_wennuanahu_moon_bigtts", "locale": "zh-CN", "gender": "Male"},
+]
+
 _PREVIEW_TEXTS = {
     "zh": "你好，这是当前配音音色的试听。",
     "en": "Hello, this is a preview of the selected dubbing voice.",
@@ -109,6 +120,8 @@ def _provider_key(text: str) -> str:
     value = str(text or "").lower()
     if "qwen3-tts" in value:
         return "qwen3-tts"
+    if "volcengine" in value or "volcano" in value or "doubao" in value or "火山" in value or "豆包" in value:
+        return "volcengine-doubao"
     if "sapi" in value or "windows" in value:
         return "sapi"
     return "edge-tts"
@@ -162,6 +175,8 @@ def _language_base(language: str) -> str:
 def _default_tts_voice(provider: str, language: str) -> str:
     if provider == "qwen3-tts":
         return _QWEN_DEFAULT_VOICES[0]
+    if provider == "volcengine-doubao":
+        return _VOLCENGINE_DEFAULT_VOICE
     if provider == "sapi":
         return "default"
     lower = str(language or "").strip().lower()
@@ -245,6 +260,13 @@ def localization_runtime_config(settings: dict) -> dict | None:
         "instruct": settings.get("tts_qwen_instruct", ""),
         "ref_audio": settings.get("tts_qwen_ref_audio", ""),
         "ref_text": settings.get("tts_qwen_ref_text", ""),
+        "volcengine_endpoint": settings.get("tts_volcengine_endpoint", _VOLCENGINE_DEFAULT_ENDPOINT),
+        "volcengine_api_key": settings.get("tts_volcengine_api_key", ""),
+        "volcengine_app_id": settings.get("tts_volcengine_app_id", ""),
+        "volcengine_access_key": settings.get("tts_volcengine_access_key", ""),
+        "volcengine_resource_id": settings.get("tts_volcengine_resource_id", _VOLCENGINE_DEFAULT_RESOURCE_ID),
+        "volcengine_model": settings.get("tts_volcengine_model", _VOLCENGINE_DEFAULT_MODEL),
+        "volcengine_format": settings.get("tts_volcengine_format", "mp3"),
         "tts_segment_gap": float(settings.get("tts_segment_gap", "0.04") or 0.04),
         "tts_consistency_mode": consistency_mode,
     }
@@ -253,6 +275,17 @@ def localization_runtime_config(settings: dict) -> dict | None:
         ("tts_qwen_temperature", "temperature", float),
         ("tts_qwen_top_p", "top_p", float),
         ("tts_qwen_max_new_tokens", "max_new_tokens", int),
+    ]:
+        raw = str(settings.get(source_key, "") or "").strip()
+        if raw:
+            try:
+                tts_options[option_key] = cast(raw)
+            except (TypeError, ValueError):
+                pass
+    for source_key, option_key, cast in [
+        ("tts_volcengine_sample_rate", "volcengine_sample_rate", int),
+        ("tts_volcengine_speech_rate", "volcengine_speech_rate", int),
+        ("tts_volcengine_loudness_rate", "volcengine_loudness_rate", int),
     ]:
         raw = str(settings.get(source_key, "") or "").strip()
         if raw:
@@ -453,6 +486,7 @@ class LocalizationDialog(QDialog):
         self.tts_provider.addItems([
             "edge-tts",
             "qwen3-tts（本地 Qwen3-TTS）",
+            "volcengine-doubao（火山引擎豆包 TTS）",
             "sapi（Windows 本地 TTS）",
         ])
         if not _EDGE_TTS_AVAILABLE:
@@ -479,6 +513,7 @@ class LocalizationDialog(QDialog):
 
         self.tts_voice = QComboBox()
         self.tts_voice.setMinimumWidth(360)
+        self.tts_voice.setEditable(True)
         voice_layout.addWidget(self.tts_voice, 1)
 
         self.tts_voice_refresh_btn = QPushButton("刷新")
@@ -597,6 +632,75 @@ class LocalizationDialog(QDialog):
         self.tts_segment_gap.setValue(float(self._settings.get("tts_segment_gap", "0.04") or 0.04))
         adv_form.addRow("段间安全间隔:", self.tts_segment_gap)
         layout.addWidget(self.qwen_advanced)
+
+        self.volcengine_group = QGroupBox("火山引擎豆包 TTS")
+        volc_form = QFormLayout(self.volcengine_group)
+        volc_form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+        volc_form.setHorizontalSpacing(14)
+        volc_form.setVerticalSpacing(10)
+        volc_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+        self.volcengine_endpoint = QLineEdit(
+            self._settings.get("tts_volcengine_endpoint", _VOLCENGINE_DEFAULT_ENDPOINT)
+        )
+        self.volcengine_endpoint.setMinimumWidth(420)
+        volc_form.addRow("API 地址:", self.volcengine_endpoint)
+
+        self.volcengine_api_key = QLineEdit(self._settings.get("tts_volcengine_api_key", ""))
+        self.volcengine_api_key.setEchoMode(QLineEdit.Password)
+        self.volcengine_api_key.setMinimumWidth(420)
+        self.volcengine_api_key.setPlaceholderText("新控制台优先使用 X-Api-Key")
+        volc_form.addRow("API Key:", self.volcengine_api_key)
+
+        self.volcengine_app_id = QLineEdit(self._settings.get("tts_volcengine_app_id", ""))
+        self.volcengine_app_id.setMinimumWidth(420)
+        volc_form.addRow("AppId:", self.volcengine_app_id)
+
+        self.volcengine_access_key = QLineEdit(self._settings.get("tts_volcengine_access_key", ""))
+        self.volcengine_access_key.setEchoMode(QLineEdit.Password)
+        self.volcengine_access_key.setMinimumWidth(420)
+        volc_form.addRow("AccessKey:", self.volcengine_access_key)
+
+        self.volcengine_resource_id = QLineEdit(
+            self._settings.get("tts_volcengine_resource_id", _VOLCENGINE_DEFAULT_RESOURCE_ID)
+        )
+        self.volcengine_resource_id.setMinimumWidth(420)
+        volc_form.addRow("ResourceId:", self.volcengine_resource_id)
+
+        self.volcengine_model = QLineEdit(
+            self._settings.get("tts_volcengine_model", _VOLCENGINE_DEFAULT_MODEL)
+        )
+        self.volcengine_model.setMinimumWidth(420)
+        volc_form.addRow("模型:", self.volcengine_model)
+
+        self.volcengine_format = QComboBox()
+        self.volcengine_format.setMinimumWidth(360)
+        self.volcengine_format.addItems(["mp3", "wav", "pcm", "ogg_opus"])
+        volc_form.addRow("音频格式:", self.volcengine_format)
+
+        self.volcengine_sample_rate = QSpinBox()
+        self.volcengine_sample_rate.setRange(8000, 48000)
+        self.volcengine_sample_rate.setSingleStep(1000)
+        self.volcengine_sample_rate.setValue(
+            int(self._settings.get("tts_volcengine_sample_rate", "24000") or 24000)
+        )
+        volc_form.addRow("采样率:", self.volcengine_sample_rate)
+
+        self.volcengine_speech_rate = QSpinBox()
+        self.volcengine_speech_rate.setRange(-100, 100)
+        self.volcengine_speech_rate.setValue(
+            int(self._settings.get("tts_volcengine_speech_rate", "0") or 0)
+        )
+        volc_form.addRow("语速:", self.volcengine_speech_rate)
+
+        self.volcengine_loudness_rate = QSpinBox()
+        self.volcengine_loudness_rate.setRange(-100, 100)
+        self.volcengine_loudness_rate.setValue(
+            int(self._settings.get("tts_volcengine_loudness_rate", "0") or 0)
+        )
+        volc_form.addRow("音量:", self.volcengine_loudness_rate)
+        self.volcengine_group.setVisible(False)
+        layout.addWidget(self.volcengine_group)
 
         layout.addWidget(self.tts_group)
 
@@ -729,12 +833,38 @@ class LocalizationDialog(QDialog):
                 self.qwen_mode.setCurrentIndex(i)
                 break
 
+        self.volcengine_endpoint.setText(
+            s.get("tts_volcengine_endpoint", _VOLCENGINE_DEFAULT_ENDPOINT)
+        )
+        self.volcengine_api_key.setText(s.get("tts_volcengine_api_key", ""))
+        self.volcengine_app_id.setText(s.get("tts_volcengine_app_id", ""))
+        self.volcengine_access_key.setText(s.get("tts_volcengine_access_key", ""))
+        self.volcengine_resource_id.setText(
+            s.get("tts_volcengine_resource_id", _VOLCENGINE_DEFAULT_RESOURCE_ID)
+        )
+        self.volcengine_model.setText(
+            s.get("tts_volcengine_model", _VOLCENGINE_DEFAULT_MODEL)
+        )
+        idx = self.volcengine_format.findText(s.get("tts_volcengine_format", "mp3"))
+        self.volcengine_format.setCurrentIndex(idx if idx >= 0 else 0)
+        self.volcengine_sample_rate.setValue(
+            int(s.get("tts_volcengine_sample_rate", "24000") or 24000)
+        )
+        self.volcengine_speech_rate.setValue(
+            int(s.get("tts_volcengine_speech_rate", "0") or 0)
+        )
+        self.volcengine_loudness_rate.setValue(
+            int(s.get("tts_volcengine_loudness_rate", "0") or 0)
+        )
+
         tts = _provider_key(s.get("tts_provider", "edge-tts"))
+        self.tts_provider.blockSignals(True)
         for i in range(self.tts_provider.count()):
             if _provider_key(self.tts_provider.itemText(i)) == tts:
                 self.tts_provider.setCurrentIndex(i)
                 break
-        self._refresh_tts_voices()
+        self.tts_provider.blockSignals(False)
+        self._on_tts_provider_changed(self.tts_provider.currentIndex())
 
     def _choose_qwen_ref_audio(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -747,9 +877,13 @@ class LocalizationDialog(QDialog):
             self.qwen_ref_audio.setText(path)
 
     def _on_tts_provider_changed(self, index: int):
-        is_qwen3 = self._current_tts_provider() == "qwen3-tts"
+        provider = self._current_tts_provider()
+        is_qwen3 = provider == "qwen3-tts"
+        is_volcengine = provider == "volcengine-doubao"
         self.tts_manage_btn.setVisible(is_qwen3)
         self.tts_qwen3_status.setVisible(is_qwen3)
+        self.qwen_advanced.setVisible(is_qwen3)
+        self.volcengine_group.setVisible(is_volcengine)
         if is_qwen3:
             self._refresh_qwen3_status()
         self._refresh_tts_voices()
@@ -829,6 +963,11 @@ class LocalizationDialog(QDialog):
                 {"name": name, "locale": language, "gender": ""}
                 for name in _QWEN_DEFAULT_VOICES
             ], "Qwen3-TTS 服务未运行，已显示默认音色"
+
+        if provider == "volcengine-doubao":
+            return list(_VOLCENGINE_DEFAULT_VOICES), (
+                "火山音色需与 ResourceId 匹配；可直接输入控制台音色名"
+            )
 
         if not _EDGE_TTS_AVAILABLE:
             voice = _default_tts_voice(provider, language)
@@ -925,6 +1064,25 @@ class LocalizationDialog(QDialog):
         if provider == "qwen3-tts":
             return self._generate_qwen3_preview(text, language, voice, preview_dir)
 
+        if provider == "volcengine-doubao":
+            engine_dir = Path(__file__).resolve().parent.parent / "localization-engine"
+            if str(engine_dir) not in sys.path:
+                sys.path.insert(0, str(engine_dir))
+            from tts import get_provider
+            safe_voice = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in voice)
+            suffix = self.volcengine_format.currentText().strip() or "mp3"
+            if suffix == "ogg_opus":
+                suffix = "opus"
+            output_path = preview_dir / f"volcengine_{safe_voice}.{suffix}"
+            get_provider("volcengine-doubao", cache_dir=preview_dir).synthesize(
+                text,
+                language,
+                voice,
+                output_path,
+                self._volcengine_options_from_ui(),
+            )
+            return output_path
+
         if not _EDGE_TTS_AVAILABLE:
             raise RuntimeError("edge-tts 未安装，请执行: pip install edge-tts")
 
@@ -932,6 +1090,39 @@ class LocalizationDialog(QDialog):
         communicate = edge_tts.Communicate(text, voice)
         asyncio.run(communicate.save(str(output_path)))
         return output_path
+
+    def _volcengine_options_from_ui(self) -> dict:
+        return {
+            "volcengine_endpoint": self.volcengine_endpoint.text().strip() or _VOLCENGINE_DEFAULT_ENDPOINT,
+            "volcengine_api_key": self.volcengine_api_key.text().strip(),
+            "volcengine_app_id": self.volcengine_app_id.text().strip(),
+            "volcengine_access_key": self.volcengine_access_key.text().strip(),
+            "volcengine_resource_id": self.volcengine_resource_id.text().strip() or _VOLCENGINE_DEFAULT_RESOURCE_ID,
+            "volcengine_model": self.volcengine_model.text().strip() or _VOLCENGINE_DEFAULT_MODEL,
+            "volcengine_format": self.volcengine_format.currentText().strip() or "mp3",
+            "volcengine_sample_rate": self.volcengine_sample_rate.value(),
+            "volcengine_speech_rate": self.volcengine_speech_rate.value(),
+            "volcengine_loudness_rate": self.volcengine_loudness_rate.value(),
+            "timeout": 120,
+        }
+
+    def _save_volcengine_settings_to_memory(self):
+        self._settings["tts_volcengine_endpoint"] = (
+            self.volcengine_endpoint.text().strip() or _VOLCENGINE_DEFAULT_ENDPOINT
+        )
+        self._settings["tts_volcengine_api_key"] = self.volcengine_api_key.text().strip()
+        self._settings["tts_volcengine_app_id"] = self.volcengine_app_id.text().strip()
+        self._settings["tts_volcengine_access_key"] = self.volcengine_access_key.text().strip()
+        self._settings["tts_volcengine_resource_id"] = (
+            self.volcengine_resource_id.text().strip() or _VOLCENGINE_DEFAULT_RESOURCE_ID
+        )
+        self._settings["tts_volcengine_model"] = (
+            self.volcengine_model.text().strip() or _VOLCENGINE_DEFAULT_MODEL
+        )
+        self._settings["tts_volcengine_format"] = self.volcengine_format.currentText().strip() or "mp3"
+        self._settings["tts_volcengine_sample_rate"] = str(self.volcengine_sample_rate.value())
+        self._settings["tts_volcengine_speech_rate"] = str(self.volcengine_speech_rate.value())
+        self._settings["tts_volcengine_loudness_rate"] = str(self.volcengine_loudness_rate.value())
 
     def _generate_qwen3_preview(self, text: str, language: str, voice: str,
                                 preview_dir: Path) -> Path:
@@ -1111,6 +1302,7 @@ class LocalizationDialog(QDialog):
         self._settings["tts_qwen_temperature"] = "" if self.qwen_temperature.value() <= 0 else str(self.qwen_temperature.value())
         self._settings["tts_qwen_top_p"] = "" if self.qwen_top_p.value() <= 0 else str(self.qwen_top_p.value())
         self._settings["tts_qwen_max_new_tokens"] = "" if self.qwen_max_tokens.value() <= 0 else str(self.qwen_max_tokens.value())
+        self._save_volcengine_settings_to_memory()
         self._settings["tts_segment_gap"] = f"{self.tts_segment_gap.value():.2f}"
         saved = save_settings(self._settings)
         apply_settings_to_env(saved, overwrite=True)
@@ -1209,6 +1401,7 @@ class LocalizationDialog(QDialog):
         self._settings["tts_qwen_temperature"] = "" if self.qwen_temperature.value() <= 0 else str(self.qwen_temperature.value())
         self._settings["tts_qwen_top_p"] = "" if self.qwen_top_p.value() <= 0 else str(self.qwen_top_p.value())
         self._settings["tts_qwen_max_new_tokens"] = "" if self.qwen_max_tokens.value() <= 0 else str(self.qwen_max_tokens.value())
+        self._save_volcengine_settings_to_memory()
         self._settings["tts_segment_gap"] = f"{self.tts_segment_gap.value():.2f}"
         return localization_runtime_config(self._settings) or {
             "is_translate_mode": False,

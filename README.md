@@ -44,7 +44,13 @@
 - **翻译配置持久化** — 本地化设置中的 API 地址、模型和 Key 会保存到 `.cache/settings.json`，点击 OK 后同步刷新当前进程和本地化引擎运行时配置
 - **双语+样式字幕** — 支持原文、译文、双语 ASS/SSA 字幕，可自定义字体、大小、轮廓、阴影和边距
 - **硬字幕烧录** — 通过 FFmpeg 将字幕直接烧录到视频画面，支持质量预设（快速/平衡/高质量）
-- **配音音色与试听** — 配音模式支持 Edge-TTS 与本地 Qwen3-TTS，目标语言变化时自动刷新音色列表，并可生成试听音频
+- **配音音色与试听** — 配音模式支持 Edge-TTS、本地 Qwen3-TTS 与火山引擎豆包 TTS，目标语言变化时自动刷新音色列表，并可生成试听音频
+- **火山引擎豆包 TTS** — 新增 `VolcengineDoubaoTTSProvider`，支持 X-Api-Key 与 AppId+AccessKey 两种认证方式，可配置资源 ID、模型、音频格式、采样率、语速、音量等参数
+- **流水线阶段重试** — 本地化任务支持从任意阶段（翻译/字幕导出/TTS/音频混合/渲染）重新执行，避免全量重跑
+- **单任务取消** — 右键菜单可单独停止正在进行的任务，不再只有全局停止
+- **精确 TTS 音频裁剪** — 多段合并的 TTS chunk 使用 `atrim` 滤波器按时间窗口精确提取逐段音频，替代原字符比例估算
+- **翻译完整性保护** — 配音模式下如果翻译缺失导致原文送入 TTS，流水线会以 `TRANSLATION_INCOMPLETE` 明确报错
+- **音频混合可取消** — 所有 FFmpeg 子进程支持回调检测取消信号，混合/合成过程可快速终止
 - **用户视角主界面** — 主界面按「添加视频 → 开始处理 → 查看结果」重排为任务卡片，顶部只保留状态、输出目录、翻译/配音和设置入口，减少按钮拥挤
 - **深色主题** — 现代化暗色 UI 界面
 
@@ -132,6 +138,18 @@ python -m unittest discover -s tests
 - **客户端集成**：新增「🌐 本地化」工具栏按钮，打开 `LocalizationDialog` 设置翻译参数；ASR 完成后自动将源字幕提交到本地化引擎，翻译完成后的字幕自动显示在预览区。
 - **详情配置**：`localization_dialog.py` 支持模式选择（快速字幕/翻译字幕成片）、源语言/目标语言、翻译服务（OpenAI 兼容）、API 地址/模型/Key、字幕模式（双语/仅译文/仅原文）、硬字幕烧录和软字幕封装。
 - **新增文件**：`localization_client.py`、`localization-engine/`、`services/ffmpeg_service.py`、`services/sidecar_manager.py`、`ui/localization_dialog.py`、`ui/subtitle_style_dialog.py`、`subtitle_ass.py`。
+
+### 2026-06 — 火山引擎豆包 TTS 与流水线阶段重试
+
+- **火山引擎豆包 TTS**：新增 `VolcengineDoubaoTTSProvider`（`localization-engine/tts/volcengine_tts.py`），支持 X-Api-Key 与 AppId+AccessKey 两种认证方式。UI 设置页新增「火山引擎豆包 TTS」参数组，涵盖端点、模型、格式、采样率、语速、音量等配置项。
+- **流水线阶段重试**：本地化任务支持从指定阶段（翻译/字幕导出/TTS/音频混合/渲染）重新执行，避免全量重跑。已完成阶段自动跳过，已翻译字幕文件自动复用。
+- **单任务取消**：右键菜单支持单独停止正在进行的本地化任务，`api_client.py` 新增 `cancel_task()`，本地转录支持 `LocalWhisperTranscriber.cancel()`。
+- **精确 TTS 音频裁剪**：`localization-engine/tts/timing.py` 新增 `extract_audio_window()`，使用 `atrim` 滤波器按时间窗口精确提取逐段音频，替代字符比例估算。
+- **翻译完整性保护**：配音模式下若翻译缺失导致原文送入 TTS，流水线以 `TRANSLATION_INCOMPLETE` 明确报错，避免产生错误音频。
+- **音频混合可取消**：`localization-engine/audio/mix.py` 中所有 FFmpeg 子进程支持回调检测取消信号，混合/合成可快速终止。
+- **翻译后端增强**：兼容 NewAPI 风格的 `data.choices` 响应，非可恢复错误不再重复重试，日志继续脱敏 API Key。
+- **新环境变量**：`VOLCENGINE_TTS_ENDPOINT`、`VOLCENGINE_TTS_API_KEY`、`VOLCENGINE_TTS_APP_ID`、`VOLCENGINE_TTS_ACCESS_KEY`、`VOLCENGINE_TTS_RESOURCE_ID`、`VOLCENGINE_TTS_MODEL`、`VOLCENGINE_TTS_FORMAT`、`VOLCENGINE_TTS_SAMPLE_RATE`、`VOLCENGINE_TTS_SPEECH_RATE`、`VOLCENGINE_TTS_LOUDNESS_RATE`。
+- **测试新增**：新增/更新 `tests/test_ass_writer.py`、`tests/test_localization_engine.py`、`tests/test_localization_language_codes.py`、`tests/test_qwen3_tts.py`、`tests/test_translation_parser.py`、`tests/test_youtube_captions.py`，覆盖 ASS 写入、阶段重试、翻译解析和音色一致性。
 
 ### 2026-06 — 任务状态模型与取消/重试优化
 
@@ -313,6 +331,16 @@ chatgpt_package/      # 生成 ChatGPT 包后出现
 | `V2S_DOWNLOAD_QUALITY` | 可选。下载质量：`best`、`720p`、`480p`；默认 `best` |
 | `V2S_KEEP_DOWNLOADED_VIDEO` | 可选。是否保留下载视频：`true` / `false`；默认 `true` |
 | `V2S_PROXY` | 可选。在线视频标题预取和 yt-dlp 下载使用的代理地址；留空表示直连 |
+| `VOLCENGINE_TTS_ENDPOINT` | 可选。火山引擎豆包 TTS API 地址；默认 `https://openspeech.bytedance.com/api/v3/tts/unidirectional` |
+| `VOLCENGINE_TTS_API_KEY` | 可选。X-Api-Key 认证密钥（新控制台推荐） |
+| `VOLCENGINE_TTS_APP_ID` | 可选。AppId 认证（旧控制台） |
+| `VOLCENGINE_TTS_ACCESS_KEY` | 可选。AccessKey 认证密钥（旧控制台） |
+| `VOLCENGINE_TTS_RESOURCE_ID` | 可选。资源 ID；默认 `seed-tts-2.0` |
+| `VOLCENGINE_TTS_MODEL` | 可选。模型名称；默认 `seed-tts-2.0-expressive` |
+| `VOLCENGINE_TTS_FORMAT` | 可选。音频格式；默认 `mp3`，可选 `wav`/`pcm`/`ogg_opus` |
+| `VOLCENGINE_TTS_SAMPLE_RATE` | 可选。采样率；默认 `24000` |
+| `VOLCENGINE_TTS_SPEECH_RATE` | 可选。语速调节；默认 `0`，范围 -100~100 |
+| `VOLCENGINE_TTS_LOUDNESS_RATE` | 可选。音量调节；默认 `0`，范围 -100~100 |
 
 Windows 示例：
 
@@ -379,7 +407,7 @@ python app.py
 2. **开始处理** — 点击「开始处理」下载/保存视频并进行字幕转录
 3. **预览字幕** — 点击已完成的任务查看字幕内容
 4. **翻译字幕（可选）** — 点击「🌐 本地化」打开翻译设置，选择目标语言和翻译服务（OpenAI 兼容 API），点击确定后再次处理时会自动翻译字幕并将翻译烧录到视频
-   - 配音模式可选择 `edge-tts` 或 `qwen3-tts`，选择目标语言后会刷新可用音色，点击「试听」可快速验证当前音色。
+   - 配音模式可选择 `edge-tts`、`qwen3-tts` 或 `volcengine-doubao`，选择目标语言后会刷新可用音色，点击「试听」可快速验证当前音色。
    - OpenAI 兼容 API 地址请使用真实接口根路径，例如 `https://example.com/v1`；`/chat/completions` 会由程序自动拼接。
 5. **失败排查** — 如果任务失败，选中失败任务查看完整错误日志，或点击「复制错误日志」发给开发者定位
 6. **导出/打包** — 右键导出 SRT/VTT/TXT，或在右侧字幕预览区点击「生成 ChatGPT 包」；打包期间会显示进度浮层，完成后可打开包目录或复制路径
@@ -485,6 +513,9 @@ video_2_subtitles/
 │   ├── engine/         # Pipeline 编排 / Pipeline orchestrator
 │   ├── subtitles/      # 字幕读写、标准化、验证 / Subtitle I/O & validation
 │   ├── translation/    # 翻译提供者、批处理、术语表 / Translation providers
+│   ├── tts/            # TTS 提供者（Qwen3 / Volcengine Doubao）/ TTS providers
+│   │   └── volcengine_tts.py # 火山引擎豆包 TTS / Volcengine Doubao TTS
+│   ├── audio/          # 音频混合、标准化 / Audio mixing & normalization
 │   └── rendering/      # FFmpeg 滤镜和编码预设 / FFmpeg filters & presets
 ├── qwen3-tts-engine/   # 本地 Qwen3-TTS sidecar / Local Qwen3-TTS sidecar
 │   ├── main.py         # FastAPI sidecar (port 8767)

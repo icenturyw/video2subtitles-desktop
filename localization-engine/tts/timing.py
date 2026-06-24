@@ -105,6 +105,39 @@ def _trim_audio(input_audio: Path, output_audio: Path, target_duration: float) -
         return False
 
 
+def extract_audio_window(
+    input_audio: Path,
+    output_audio: Path,
+    start_offset: float,
+    duration: float,
+) -> bool:
+    """Extract a time window from an audio file."""
+    if duration <= 0:
+        return False
+
+    output_audio.parent.mkdir(parents=True, exist_ok=True)
+    start_offset = max(0.0, float(start_offset))
+    duration = max(0.0, float(duration))
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+                "-i", str(input_audio),
+                "-filter:a",
+                f"atrim=start={start_offset:.3f}:duration={duration:.3f},asetpts=N/SR/TB",
+                "-c:a", "pcm_s16le",
+                str(output_audio),
+            ],
+            capture_output=True, text=True, timeout=60,
+            check=True,
+            **hidden_subprocess_kwargs(),
+        )
+        return output_audio.exists() and output_audio.stat().st_size > 0
+    except Exception:
+        output_audio.unlink(missing_ok=True)
+        return False
+
+
 def build_concat_file(segments: List[Tuple[Path, float]], output: Path) -> str:
     """Build the filter_complex string for timed audio segments."""
     inputs = []

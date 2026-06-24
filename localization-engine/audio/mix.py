@@ -1,12 +1,52 @@
 from __future__ import annotations
 
 import subprocess
+import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 from process_utils import hidden_subprocess_kwargs
 
 _MAX_DIRECT_SEGMENTS = 40
+
+
+def _run_process(cmd: List[str], timeout: float, cancel_checker=None):
+    if not cancel_checker:
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            **hidden_subprocess_kwargs(),
+        )
+
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        **hidden_subprocess_kwargs(),
+    )
+    started = time.monotonic()
+    while True:
+        if cancel_checker():
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+            return subprocess.CompletedProcess(cmd, 130, "", "Cancelled")
+
+        try:
+            stdout, stderr = process.communicate(timeout=0.25)
+            return subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
+        except subprocess.TimeoutExpired:
+            if time.monotonic() - started > timeout:
+                process.kill()
+                process.wait(timeout=5)
+                raise
 
 
 def extract_audio(video_path: Path, output_path: Path) -> bool:
@@ -124,11 +164,7 @@ def mix_audio(
     ]
 
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True, text=True, timeout=600,
-            **hidden_subprocess_kwargs(),
-        )
+        result = _run_process(cmd, 600, cancel_checker=cancel_checker)
         if log_path:
             log_path.parent.mkdir(parents=True, exist_ok=True)
             with open(log_path, "a", encoding="utf-8") as f:
@@ -137,6 +173,8 @@ def mix_audio(
                 f.write(f"[mix] stderr: {result.stderr[-500:]}\n")
 
         if result.returncode != 0:
+            if result.stderr == "Cancelled":
+                return {"success": False, "cancelled": True}
             return {"success": False, "error": result.stderr[-1200:].strip()}
 
         if not output_path.exists():
@@ -170,7 +208,7 @@ def _mix_audio_chunked(
                 return {"success": False, "cancelled": True}
             chunk = tts_segments[start:start + _MAX_DIRECT_SEGMENTS]
             chunk_output = work_dir / f"tts_chunk_{chunk_index:04d}.wav"
-            result = _mix_tts_chunk(chunk, chunk_output, log_path=log_path)
+            result = _mix_tts_chunk(chunk, chunk_output, log_path=log_path, cancel_checker=cancel_checker)
             if not result.get("success"):
                 return result
             chunk_outputs.append(chunk_output)
@@ -179,7 +217,7 @@ def _mix_audio_chunked(
             return {"success": False, "cancelled": True}
 
         tts_mix = work_dir / "tts_mix.wav"
-        result = _mix_chunk_outputs(chunk_outputs, tts_mix, log_path=log_path)
+        result = _mix_chunk_outputs(chunk_outputs, tts_mix, log_path=log_path, cancel_checker=cancel_checker)
         if not result.get("success"):
             return result
 
@@ -189,6 +227,7 @@ def _mix_audio_chunked(
             output_path=output_path,
             original_volume=original_volume,
             log_path=log_path,
+            cancel_checker=cancel_checker,
         )
     finally:
         pass
@@ -199,6 +238,7 @@ def _mix_tts_chunk(
     output_path: Path,
     *,
     log_path: Optional[Path] = None,
+    cancel_checker=None,
 ) -> dict:
     input_files = [str(path) for path, _ in tts_segments]
     filter_parts = []
@@ -217,7 +257,7 @@ def _mix_tts_chunk(
         "-ar", "44100",
         str(output_path),
     ])
-    return _run_ffmpeg(cmd, output_path, log_path=log_path, label="mix-chunk")
+    return _run_ffmpeg(cmd, output_path, log_path=log_path, label="mix-chunk", cancel_checker=cancel_checker)
 
 
 def _mix_chunk_outputs(
@@ -225,6 +265,7 @@ def _mix_chunk_outputs(
     output_path: Path,
     *,
     log_path: Optional[Path] = None,
+    cancel_checker=None,
 ) -> dict:
     if len(chunk_outputs) == 1:
         import shutil
@@ -242,7 +283,7 @@ def _mix_chunk_outputs(
         "-ar", "44100",
         str(output_path),
     ])
-    return _run_ffmpeg(cmd, output_path, log_path=log_path, label="mix-tts")
+    return _run_ffmpeg(cmd, output_path, log_path=log_path, label="mix-tts", cancel_checker=cancel_checker)
 
 
 def _mux_tts_with_video(
@@ -252,6 +293,7 @@ def _mux_tts_with_video(
     *,
     original_volume: float,
     log_path: Optional[Path] = None,
+    cancel_checker=None,
 ) -> dict:
     cmd = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
@@ -272,23 +314,20 @@ def _mux_tts_with_video(
         "-c:a", "aac", "-b:a", "128k",
         str(output_path),
     ])
-    return _run_ffmpeg(cmd, output_path, log_path=log_path, label="mux-video")
+    return _run_ffmpeg(cmd, output_path, log_path=log_path, label="mux-video", cancel_checker=cancel_checker)
 
 
-def _run_ffmpeg(cmd: List[str], output_path: Path, *, log_path: Optional[Path], label: str) -> dict:
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=1800,
-        **hidden_subprocess_kwargs(),
-    )
+def _run_ffmpeg(cmd: List[str], output_path: Path, *, log_path: Optional[Path], label: str,
+                cancel_checker=None) -> dict:
+    result = _run_process(cmd, 1800, cancel_checker=cancel_checker)
     if log_path:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(f"[{label}] cmd inputs={cmd.count('-i')} output={output_path}\n")
             f.write(f"[{label}] stderr: {result.stderr[-1200:]}\n")
     if result.returncode != 0:
+        if result.stderr == "Cancelled":
+            return {"success": False, "cancelled": True}
         return {"success": False, "error": result.stderr[-2000:].strip()}
     if not output_path.exists():
         return {"success": False, "error": "output file not created"}
@@ -349,14 +388,11 @@ def mix_simple_audio(
             "-c:a", "aac", "-b:a", "128k",
             str(output_path),
         ])
-        subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=600,
-            check=True,
-            **hidden_subprocess_kwargs(),
-        )
+        result = _run_process(cmd, 600, cancel_checker=cancel_checker)
+        if result.returncode != 0:
+            if result.stderr == "Cancelled":
+                return {"success": False, "cancelled": True}
+            return {"success": False, "error": result.stderr[-1200:].strip()}
         return {"success": True} if output_path.exists() else {"success": False, "error": "output not created"}
     except subprocess.TimeoutExpired:
         return {"success": False, "error": "FFmpeg timed out"}

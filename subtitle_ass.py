@@ -29,6 +29,16 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 _STYLE_LINE = "Style: {name},{fontname},{fontsize},{primary},{secondary},{outline},{back},{bold},0,0,0,100,100,0,0,1,{outline_w},{shadow},{align},10,10,{margin_v},0"
 
+_PRIMARY_LAYER = 20
+_SECONDARY_LAYER = 10
+
+
+def _secondary_margin_v(style: SubtitleStyle,
+                        translation_scale: float = 1.0) -> int:
+    """Keep bilingual lines from occupying the same screen position."""
+    line_gap = int(max(18, style.font_size * translation_scale + style.outline * 4 + style.shadow))
+    return max(0, int(style.margin_v) + line_gap)
+
 
 def _style_line(name: str, style: SubtitleStyle) -> str:
     return _STYLE_LINE.format(
@@ -84,7 +94,7 @@ def ass_header(style: SubtitleStyle, source_scale: float = 0.8,
         background_color=style.background_color,
         outline=style.outline,
         shadow=style.shadow,
-        margin_v=style.margin_v,
+        margin_v=_secondary_margin_v(style, translation_scale),
         alignment=style.alignment,
         bold=style.bold,
     )
@@ -130,16 +140,16 @@ def segments_to_ass(segments: List[SubtitleSegment], style: SubtitleStyle,
         trans_text = _escape_ass(seg.translation) if seg.translation else ""
 
         if mode == "source":
-            lines.append(_dialog_line(0, seg.start, seg.end, "Default", source_text))
+            lines.append(_dialog_line(_PRIMARY_LAYER, seg.start, seg.end, "Default", source_text))
         elif mode == "translated":
             text = trans_text or source_text
-            lines.append(_dialog_line(0, seg.start, seg.end, "Default", text))
+            lines.append(_dialog_line(_PRIMARY_LAYER, seg.start, seg.end, "Default", text))
         elif mode == "bilingual":
             if trans_text:
-                lines.append(_dialog_line(0, seg.start, seg.end, "Translation", trans_text))
-                lines.append(_dialog_line(1, seg.start, seg.end, "Source", source_text))
+                lines.append(_dialog_line(_SECONDARY_LAYER, seg.start, seg.end, "Source", source_text))
+                lines.append(_dialog_line(_PRIMARY_LAYER, seg.start, seg.end, "Translation", trans_text))
             else:
-                lines.append(_dialog_line(0, seg.start, seg.end, "Default", source_text))
+                lines.append(_dialog_line(_PRIMARY_LAYER, seg.start, seg.end, "Default", source_text))
 
     return "\n".join(lines)
 

@@ -120,6 +120,12 @@ class PipelineRunner:
 
         # Detect stage to resume from (for retry)
         resume_stage = request.get("resume_stage", "prepare")
+        if resume_stage not in _STAGE_ORDER:
+            resume_stage = "prepare"
+        resume_index = _STAGE_ORDER.index(resume_stage)
+
+        def should_run(stage: str) -> bool:
+            return _STAGE_ORDER.index(stage) >= resume_index
 
         # --- PREPARE ---
         if resume_stage in ("prepare",) and self._check_cancel(job_id, ws, cancel_token):
@@ -156,11 +162,11 @@ class PipelineRunner:
 
         self._progress.update(job_id, "normalize", 100, f"Loaded {len(segments)} subtitle segments")
 
-        if low_vram_mode and dubbing and self._is_qwen3_tts_request(request):
+        if low_vram_mode and dubbing and should_run("translate") and self._is_qwen3_tts_request(request):
             self._unload_qwen3_tts(ws, "before translation")
 
         # --- TRANSLATE ---
-        if resume_stage == "translate" or resume_stage in ("prepare", "normalize"):
+        if should_run("translate"):
             if self._check_cancel(job_id, ws, cancel_token):
                 return
             self._store.update(job_id, stage="translate")
@@ -177,26 +183,37 @@ class PipelineRunner:
 
             self._progress.update(job_id, "translate", 100, "翻译完成")
 
+        elif target_lang and source_lang.lower() != target_lang.lower():
+            if not self._load_existing_translations(ws, segments, target_lang):
+                self._fail(
+                    job_id,
+                    ws,
+                    "TRANSLATION_ARTIFACT_NOT_FOUND",
+                    "未找到可复用的翻译字幕，请从翻译阶段重新生成",
+                )
+                return
+
         if target_lang and source_lang.lower() != target_lang.lower():
             report = self._write_translation_quality_report(ws, segments)
             if report:
                 self._store.add_artifact(job_id, report)
 
         # --- SUBTITLE_EXPORT ---
-        if self._check_cancel(job_id, ws, cancel_token):
-            return
-        self._store.update(job_id, stage="subtitle_export")
-        self._progress.update(job_id, "subtitle_export", 0, "生成字幕文件...")
-        write_log(ws, "Stage: subtitle_export")
+        if should_run("subtitle_export"):
+            if self._check_cancel(job_id, ws, cancel_token):
+                return
+            self._store.update(job_id, stage="subtitle_export")
+            self._progress.update(job_id, "subtitle_export", 0, "生成字幕文件...")
+            write_log(ws, "Stage: subtitle_export")
 
-        artifacts = self._write_subtitle_files(ws, segments, subtitle_mode, source_lang, target_lang, style)
-        for art in artifacts:
-            self._store.add_artifact(job_id, art)
+            artifacts = self._write_subtitle_files(ws, segments, subtitle_mode, source_lang, target_lang, style)
+            for art in artifacts:
+                self._store.add_artifact(job_id, art)
 
-        self._progress.update(job_id, "subtitle_export", 100, "字幕生成完成")
+            self._progress.update(job_id, "subtitle_export", 100, "字幕生成完成")
 
         # --- TTS (dub mode only) ---
-        if dubbing:
+        if dubbing and should_run("tts"):
             if self._check_cancel(job_id, ws, cancel_token):
                 return
             self._store.update(job_id, stage="tts")
@@ -215,7 +232,7 @@ class PipelineRunner:
 
         # --- AUDIO_MIX (dub mode only) ---
         render_video = source_video
-        if dubbing:
+        if dubbing and should_run("audio_mix"):
             if self._check_cancel(job_id, ws, cancel_token):
                 return
             self._store.update(job_id, stage="audio_mix")
@@ -231,7 +248,12 @@ class PipelineRunner:
             if dubbed_video.exists():
                 render_video = dubbed_video
 
-        if dubbing:
+        if dubbing and not should_run("audio_mix"):
+            dubbed_video = ws / "rendered" / f"{ws.name}_{target_lang}_dubbed.mp4"
+            if dubbed_video.exists():
+                render_video = dubbed_video
+
+        if dubbing and should_run("audio_mix"):
             self._progress.update(job_id, "audio_mix", 100, "Audio mix complete")
 
         # --- RENDER ---
@@ -417,6 +439,10 @@ class PipelineRunner:
         # Batch
         checkpoints = CheckpointManager(ws / "translation" / "checkpoints" if (ws / "translation").exists() else ws / "translation")
         pending = checkpoints.get_pending_segments(segments)
+        if not pending and any(not (seg.translation or "").strip() for seg in segments):
+            write_log(ws, "  Translation checkpoint ignored: translated text is missing")
+            checkpoints.clear()
+            pending = checkpoints.get_pending_segments(segments)
 
         if not pending:
             write_log(ws, "  All segments already translated (checkpoint)")
@@ -461,13 +487,15 @@ class PipelineRunner:
             try:
                 translations = request_translation(batch)
             except Exception as exc:
+                if cancel_token.is_cancelled():
+                    raise RuntimeError("Task cancelled") from exc
                 if len(batch) <= 1:
                     seg = batch[0]
                     write_log(
                         ws,
                         f"  Batch {batch_index}: segment {seg.index} translation failed; using source text ({exc})",
                     )
-                    return [{"id": seg.index, "text": seg.text}]
+                    return [{"id": seg.index, "text": seg.text, "_fallback_source": True}]
                 mid = max(1, len(batch) // 2)
                 write_log(
                     ws,
@@ -495,16 +523,29 @@ class PipelineRunner:
                         f"  Batch {batch_index}: segment {seg.index} missing/empty translation; using source text",
                     )
                     valid_by_id[seg.index] = seg.text
+                    fallback_ids = {seg.index}
                 else:
                     write_log(
                         ws,
                         f"  Batch {batch_index}: retrying {len(missing)} missing/empty translations",
                     )
+                    fallback_ids = set()
                     for item in complete_translations(batch_index, missing):
                         if str(item.get("text", "")).strip():
                             valid_by_id[int(item["id"])] = str(item["text"])
+                            if item.get("_fallback_source"):
+                                fallback_ids.add(int(item["id"]))
+            else:
+                fallback_ids = set()
 
-            return [{"id": seg.index, "text": valid_by_id.get(seg.index, seg.text)} for seg in batch]
+            result = []
+            for seg in batch:
+                text = valid_by_id.get(seg.index, seg.text)
+                item = {"id": seg.index, "text": text}
+                if seg.index in fallback_ids:
+                    item["_fallback_source"] = True
+                result.append(item)
+            return result
 
         def translate_one(batch_index: int,
                           batch: List[SubtitleSegment]) -> tuple[int, List[SubtitleSegment], List[Dict]]:
@@ -539,6 +580,12 @@ class PipelineRunner:
                             self._fail(job_id, ws, "TRANSLATION_ERROR", str(e)[:200])
                         return False
 
+                    if self._has_source_fallback_translations(batch, translations, request):
+                        self._fail(job_id, ws, "TRANSLATION_INCOMPLETE",
+                                   "翻译结果不完整，部分字幕未翻译，已停止配音以避免把源语言文本送入 TTS")
+                        for pending_future in futures:
+                            pending_future.cancel()
+                        return False
                     self._apply_translation_result(batch, translations)
                     checkpoints.mark_completed([s.index for s in batch])
                     write_log(ws, f"  Batch {batch_index}/{total} translated ({len(batch)} segments)")
@@ -570,6 +617,10 @@ class PipelineRunner:
                     self._fail(job_id, ws, "TRANSLATION_ERROR", str(e)[:200])
                 return False
 
+            if self._has_source_fallback_translations(batch, translations, request):
+                self._fail(job_id, ws, "TRANSLATION_INCOMPLETE",
+                           "翻译结果不完整，部分字幕未翻译，已停止配音以避免把源语言文本送入 TTS")
+                return False
             self._apply_translation_result(batch, translations)
             checkpoints.mark_completed([s.index for s in batch])
             write_log(ws, f"  Batch {batch_index}/{total} translated ({len(batch)} segments)")
@@ -580,6 +631,32 @@ class PipelineRunner:
             )
 
         return True
+
+    @staticmethod
+    def _has_source_fallback_translations(batch: List[SubtitleSegment],
+                                          translations: List[Dict],
+                                          request: Dict[str, Any]) -> bool:
+        if not bool(request.get("dubbing_enabled", False)):
+            return False
+        fallback_ids = {
+            int(t["id"])
+            for t in translations
+            if isinstance(t, dict)
+            and str(t.get("id", "")).isdigit()
+            and t.get("_fallback_source")
+        }
+        if fallback_ids:
+            return True
+        trans_map = {
+            int(t["id"]): str(t.get("text", "")).strip()
+            for t in translations
+            if isinstance(t, dict) and str(t.get("id", "")).isdigit()
+        }
+        for seg in batch:
+            translated = trans_map.get(seg.index, "")
+            if not translated:
+                return True
+        return False
 
     def _apply_translation_result(self, batch: List[SubtitleSegment],
                                   translations: List[Dict]) -> None:
@@ -599,6 +676,40 @@ class PipelineRunner:
         for old, new in replacements.items():
             cleaned = cleaned.replace(old, new)
         return cleaned
+
+    def _load_existing_translations(self, ws: Path,
+                                    segments: List[SubtitleSegment],
+                                    target_lang: str) -> bool:
+        subs_dir = ws / "subtitles"
+        candidates = [
+            subs_dir / f"{target_lang}.srt",
+            subs_dir / f"{target_lang.lower()}.srt",
+        ]
+        for path in candidates:
+            if not path.exists():
+                continue
+            try:
+                translated_segments = read_subtitle_file(path)
+            except Exception as exc:
+                write_log(ws, f"  Failed to load translated subtitles from {path.name}: {exc}")
+                continue
+            by_index = {
+                seg.index: self._clean_translation_text(seg.text)
+                for seg in translated_segments
+                if (seg.text or "").strip()
+            }
+            if not by_index:
+                continue
+            for seg in segments:
+                if seg.index in by_index:
+                    seg.translation = by_index[seg.index]
+            missing = [seg.index for seg in segments if not (seg.translation or "").strip()]
+            if missing:
+                write_log(ws, f"  Existing translation missing {len(missing)} segments")
+                return False
+            write_log(ws, f"  Loaded existing translations from {path.name}")
+            return True
+        return False
 
     def _write_subtitle_files(self, ws: Path,
                                segments: List[SubtitleSegment],
@@ -750,8 +861,12 @@ class PipelineRunner:
             self._fail(job_id, ws, "TTS_UNAVAILABLE",
                        f"TTS provider {tts_provider_name} unavailable: {e}")
             return False
+        try:
+            from tts.base import TTSAuthError
+        except Exception:
+            TTSAuthError = None  # type: ignore[assignment]
 
-        from tts.timing import adjust_timing, save_timing_report
+        from tts.timing import adjust_timing, extract_audio_window, save_timing_report
 
         # Preflight: ensure Qwen3-TTS sidecar is running before attempting synthesis
         if self._is_qwen3_tts_request(request):
@@ -821,6 +936,7 @@ class PipelineRunner:
                 options["voice_clone_prompt_id"] = prompt_id
 
         report_rows: List[Dict[str, Any]] = []
+        tts_errors: List[Dict[str, Any]] = []
 
         # ------------------------------------------------------------------
         # Build TTS chunks for stable/strict modes (merge short segments)
@@ -867,6 +983,10 @@ class PipelineRunner:
                 result = provider.synthesize(
                     text.strip(), target_lang, tts_voice, temp_path, options,
                 )
+                if cancel_token.is_cancelled():
+                    seg_path.unlink(missing_ok=True)
+                    temp_path.unlink(missing_ok=True)
+                    return {"cancelled": True}
             except Exception as e:
                 import traceback
                 tb = traceback.format_exc()
@@ -878,8 +998,9 @@ class PipelineRunner:
                 write_log(ws, f"  TTS traceback:\n{tb}")
                 seg_path.unlink(missing_ok=True)
                 temp_path.unlink(missing_ok=True)
+                error_type = "auth" if TTSAuthError and isinstance(e, TTSAuthError) else "generation"
                 return {"error": str(e), "index": seg.index, "start": seg.start,
-                        "target_duration": target_dur}
+                        "target_duration": target_dur, "error_type": error_type}
 
             actual_dur = result.duration_seconds
             speed = None
@@ -910,26 +1031,6 @@ class PipelineRunner:
                 "mode": getattr(result, "mode", options.get("qwen_mode", "")),
             }
 
-        def _extract_segment_from_chunk(chunk_audio: Path,
-                                        chunk_text: str,
-                                        seg_text: str,
-                                        seg_target_dur: float) -> Tuple[float, float]:
-            """Return (start_offset, duration) within chunk audio for a segment."""
-            chunk_len = len(chunk_text)
-            seg_len = len(seg_text)
-            if chunk_len <= 0 or seg_len <= 0:
-                return 0.0, seg_target_dur
-            if seg_len >= chunk_len:
-                return 0.0, seg_target_dur
-
-            chunk_dur = _get_wav_duration_cached(chunk_audio)
-            if chunk_dur <= 0:
-                return 0.0, seg_target_dur
-
-            ratio = seg_len / chunk_len
-            seg_dur = chunk_dur * ratio
-            return 0.0, seg_dur
-
         _wav_dur_cache: Dict[str, float] = {}
 
         def _get_wav_duration_cached(path: Path) -> float:
@@ -938,6 +1039,28 @@ class PipelineRunner:
                 from tts.qwen3_tts import _get_wav_duration
                 _wav_dur_cache[key] = _get_wav_duration(path)
             return _wav_dur_cache[key]
+
+        def _build_chunk_windows(csegs: List[SubtitleSegment],
+                                 chunk_dur: float) -> Dict[int, Tuple[float, float]]:
+            """Estimate each segment's source window inside a synthesized chunk."""
+            if chunk_dur <= 0:
+                return {}
+
+            units: List[Tuple[int, int, int]] = []
+            cursor = 0
+            for seg in csegs:
+                seg_text = (seg.translation or seg.text or "").strip()
+                seg_units = max(1, len(seg_text))
+                units.append((seg.index, cursor, seg_units))
+                cursor += seg_units + 1  # account for the joiner space between texts
+
+            total_units = max(1, cursor - 1)
+            windows: Dict[int, Tuple[float, float]] = {}
+            for seg_index, start_unit, seg_units in units:
+                start_offset = chunk_dur * (start_unit / total_units)
+                duration = chunk_dur * (seg_units / total_units)
+                windows[seg_index] = (start_offset, max(0.001, duration))
+            return windows
 
         # ------------------------------------------------------------------
         # Per-segment synthesis (fast mode)
@@ -981,6 +1104,10 @@ class PipelineRunner:
                 result = provider.synthesize(
                     chunk.text.strip(), target_lang, tts_voice, chunk_temp, options,
                 )
+                if cancel_token.is_cancelled():
+                    chunk_path.unlink(missing_ok=True)
+                    chunk_temp.unlink(missing_ok=True)
+                    return [{"cancelled": True}]
             except Exception as e:
                 import traceback
                 tb = traceback.format_exc()
@@ -990,12 +1117,14 @@ class PipelineRunner:
                     f"text_preview={chunk.text.strip()[:100]} "
                     f"error={e}")
                 write_log(ws, f"  TTS traceback:\n{tb}")
+                error_type = "auth" if TTSAuthError and isinstance(e, TTSAuthError) else "generation"
                 for seg in csegs:
                     seg_path = tts_dir / f"seg_{seg.index:04d}.wav"
                     seg_path.unlink(missing_ok=True)
                     results.append({
                         "error": str(e), "index": seg.index, "start": seg.start,
                         "target_duration": target_durations.get(seg.index, seg.end - seg.start),
+                        "error_type": error_type,
                     })
                 return results
 
@@ -1004,22 +1133,28 @@ class PipelineRunner:
             if normalized_chunk != chunk_path:
                 shutil.copy2(str(normalized_chunk), str(chunk_path))
 
-            chunk_dur = result.duration_seconds
+            chunk_dur = _get_wav_duration_cached(chunk_path)
             if chunk_dur <= 0:
-                chunk_dur = _get_wav_duration_cached(chunk_path)
-            total_chars = sum(len(seg.translation or seg.text) for seg in csegs)
+                chunk_dur = result.duration_seconds
+            chunk_windows = _build_chunk_windows(csegs, chunk_dur)
+            single_segment_chunk = len(csegs) == 1
 
             for seg in csegs:
-                seg_text = seg.translation or seg.text
-                seg_len = len(seg_text) if seg_text else 1
                 seg_path = tts_dir / f"seg_{seg.index:04d}.wav"
                 seg_target = target_durations.get(seg.index, seg.end - seg.start)
 
-                if chunk_dur > 0 and total_chars > 0:
-                    ratio = seg_len / total_chars
-                    estimated_dur = chunk_dur * ratio
-                else:
-                    estimated_dur = seg_target
+                if seg_target <= 0:
+                    seg_path.unlink(missing_ok=True)
+                    results.append({
+                        "skipped": True, "index": seg.index, "start": seg.start,
+                        "target_duration": seg_target,
+                        "warning": "timing_warning: skipped, no safe gap before next segment",
+                    })
+                    continue
+
+                start_offset, estimated_dur = chunk_windows.get(
+                    seg.index, (0.0, seg_target)
+                )
 
                 if estimated_dur <= 0:
                     seg_path.unlink(missing_ok=True)
@@ -1030,14 +1165,34 @@ class PipelineRunner:
                     })
                     continue
 
-                if seg_target > 0 and estimated_dur > 0:
+                if single_segment_chunk:
+                    source_audio = chunk_path
+                    source_duration = chunk_dur if chunk_dur > 0 else estimated_dur
+                else:
+                    source_audio = tts_dir / f"chunk_{chunk.chunk_index:04d}_seg_{seg.index:04d}.wav"
+                    if not extract_audio_window(
+                        chunk_path, source_audio, start_offset, estimated_dur,
+                    ):
+                        seg_path.unlink(missing_ok=True)
+                        source_audio.unlink(missing_ok=True)
+                        results.append({
+                            "error": "failed to extract segment audio from chunk",
+                            "index": seg.index,
+                            "start": seg.start,
+                            "target_duration": seg_target,
+                            "actual_duration": estimated_dur,
+                        })
+                        continue
+                    source_duration = estimated_dur
+
+                if source_duration > 0:
                     adj_dur, warning, speed = adjust_timing(
-                        chunk_path, seg_path, estimated_dur, seg_target,
+                        source_audio, seg_path, source_duration, seg_target,
                     )
                     if not seg_path.exists():
-                        shutil.copy2(str(chunk_path), str(seg_path))
+                        shutil.copy2(str(source_audio), str(seg_path))
                 else:
-                    shutil.copy2(str(chunk_path), str(seg_path))
+                    shutil.copy2(str(source_audio), str(seg_path))
                     warning = ""
                     speed = None
                     adj_dur = estimated_dur
@@ -1070,8 +1225,12 @@ class PipelineRunner:
                     return False
                 chunk_results = synthesize_chunk(chunk)
                 for result in chunk_results:
+                    if result.get("cancelled"):
+                        self._mark_cancelled(job_id, ws)
+                        return False
                     record_report(result)
                     if result.get("error"):
+                        tts_errors.append(result)
                         write_log(ws, f"  TTS failed for seg {result.get('index')}: {result['error']}")
                     elif result.get("skipped") and result.get("warning"):
                         write_log(ws, f"  TTS timing [{result.get('index')}]: {result['warning']}")
@@ -1097,6 +1256,7 @@ class PipelineRunner:
                         return False
                     record_report(result)
                     if result.get("error"):
+                        tts_errors.append(result)
                         write_log(ws, f"  TTS failed for seg {result.get('index')}: {result['error']}")
                     elif result.get("skipped") and result.get("warning"):
                         write_log(ws, f"  TTS timing [{result.get('index')}]: {result['warning']}")
@@ -1123,6 +1283,7 @@ class PipelineRunner:
                     return False
                 record_report(result)
                 if result.get("error"):
+                    tts_errors.append(result)
                     write_log(ws, f"  TTS failed for seg {result.get('index')}: {result['error']}")
                 elif result.get("skipped") and result.get("warning"):
                     write_log(ws, f"  TTS timing [{result.get('index')}]: {result['warning']}")
@@ -1142,7 +1303,15 @@ class PipelineRunner:
                            "没有可用于 TTS 的字幕文本，转写或翻译结果为空")
             else:
                 audio_files = list(tts_dir.glob("seg_*.wav")) if tts_dir.exists() else []
-                if not audio_files:
+                if tts_errors and not audio_files:
+                    first_error = str(tts_errors[0].get("error") or "unknown TTS error")
+                    if any(err.get("error_type") == "auth" for err in tts_errors):
+                        self._fail(job_id, ws, "TTS_AUTH_FAILED",
+                                   f"TTS 认证失败: {first_error}")
+                    else:
+                        self._fail(job_id, ws, "TTS_GENERATION_FAILED",
+                                   f"TTS 语音合成失败: {first_error}")
+                elif not audio_files:
                     self._fail(job_id, ws, "TTS_NO_AUDIO_OUTPUT",
                                "TTS 执行结束，但没有发现任何音频文件")
                 else:

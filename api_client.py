@@ -89,9 +89,25 @@ class WhisperApiClient:
         except Exception:
             return None
 
+    def cancel_task(self, task_id):
+        if not task_id:
+            return {"error": "missing task_id"}
+        try:
+            r = self.session.post(
+                f"{self.base_url}/cancel/{task_id}",
+                headers=self._headers(),
+                timeout=5,
+            )
+            if r.status_code == 200:
+                return r.json()
+            return {"error": f"HTTP {r.status_code}: {r.text[:200]}"}
+        except Exception as e:
+            return {"error": str(e)}
+
     def wait_for_result(self, task_id, progress_callback=None, poll_interval=1.0, cancel_checker=None):
         while True:
             if cancel_checker and cancel_checker():
+                self.cancel_task(task_id)
                 return {"status": "cancelled", "message": "任务已取消"}
             result = self.get_task_status(task_id)
             if result is None:
@@ -104,6 +120,8 @@ class WhisperApiClient:
             if status == "completed":
                 return result
             if status == "error":
+                return result
+            if status == "cancelled":
                 return result
             time.sleep(poll_interval)
 

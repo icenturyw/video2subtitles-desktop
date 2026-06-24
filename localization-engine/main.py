@@ -41,6 +41,16 @@ from engine.progress import ProgressTracker
 from engine.task_store import TaskStore
 from engine.workspace import get_log_path, read_log_tail, resolve_workspace
 
+RETRY_STAGES = {
+    "prepare",
+    "normalize",
+    "translate",
+    "subtitle_export",
+    "tts",
+    "audio_mix",
+    "render",
+}
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -275,10 +285,16 @@ def retry_job(job_id: str, req: RetryRequest):
     if rec is None:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
 
-    if rec.status not in ("error", "interrupted", "cancelled"):
+    if req.from_stage not in RETRY_STAGES:
         raise HTTPException(
             status_code=400,
-            detail=f"Job is {rec.status}, can only retry from error/interrupted/cancelled",
+            detail=f"Unsupported retry stage: {req.from_stage}",
+        )
+
+    if rec.status not in ("completed", "error", "interrupted", "cancelled"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Job is {rec.status}, can only retry from completed/error/interrupted/cancelled",
         )
 
     # Reset progress and status
@@ -291,6 +307,9 @@ def retry_job(job_id: str, req: RetryRequest):
     else:
         cancel_token = _cancellation().register(job_id)
 
+    request_payload = dict(rec.request_payload or {})
+    request_payload["resume_stage"] = req.from_stage
+
     # Update status
     _store().update(
         job_id,
@@ -300,10 +319,10 @@ def retry_job(job_id: str, req: RetryRequest):
         message="重试中...",
         error_code=None,
         error_detail=None,
+        request_payload=request_payload,
     )
 
     # Re-launch pipeline
-    request_payload = rec.request_payload
     start_pipeline(
         job_id=job_id,
         request=request_payload,

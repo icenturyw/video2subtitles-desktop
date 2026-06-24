@@ -760,6 +760,29 @@ class WorkerThread(QThread):
         self.client = WhisperApiClient()
         self.local = LocalWhisperTranscriber()
         self._use_api = self.client.health_check()
+        self._active_task_ids = set()
+        self._task_lock = threading.Lock()
+
+    def _remember_task(self, task_id):
+        if not task_id:
+            return
+        with self._task_lock:
+            self._active_task_ids.add(str(task_id))
+
+    def _forget_task(self, task_id):
+        if not task_id:
+            return
+        with self._task_lock:
+            self._active_task_ids.discard(str(task_id))
+
+    def _cancel_active_tasks(self):
+        with self._task_lock:
+            task_ids = list(self._active_task_ids)
+        for task_id in task_ids:
+            try:
+                self.client.cancel_task(task_id)
+            except Exception:
+                pass
 
     def run(self):
         try:
@@ -813,6 +836,11 @@ class WorkerThread(QThread):
             if not task_id:
                 self.task_error.emit(url, "服务器未返回任务 ID")
                 return
+            self._remember_task(task_id)
+            if self._cancel_event.is_set():
+                self.client.cancel_task(task_id)
+                self._forget_task(task_id)
+                return
 
             def on_progress(p, m, s):
                 try:
@@ -821,11 +849,14 @@ class WorkerThread(QThread):
                 except Exception:
                     pass
 
-            task_result = self.client.wait_for_result(
-                task_id,
-                progress_callback=on_progress,
-                cancel_checker=lambda: self._cancel_event.is_set(),
-            )
+            try:
+                task_result = self.client.wait_for_result(
+                    task_id,
+                    progress_callback=on_progress,
+                    cancel_checker=lambda: self._cancel_event.is_set(),
+                )
+            finally:
+                self._forget_task(task_id)
 
             if not isinstance(task_result, dict):
                 self.task_error.emit(url, "服务器返回异常结果")
@@ -861,13 +892,21 @@ class WorkerThread(QThread):
             result = self.client.upload_file(file_path, self.language, self.service)
             if "error" not in result:
                 task_id = result.get("task_id", Path(file_path).stem)
-                task_result = self.client.wait_for_result(
-                    task_id,
-                    progress_callback=lambda p, m, s: self.progress_updated.emit(
-                        file_path, p, m, "processing" if s != "completed" else "completed"
-                    ),
-                    cancel_checker=lambda: self._cancel_event.is_set(),
-                )
+                self._remember_task(task_id)
+                if self._cancel_event.is_set():
+                    self.client.cancel_task(task_id)
+                    self._forget_task(task_id)
+                    return
+                try:
+                    task_result = self.client.wait_for_result(
+                        task_id,
+                        progress_callback=lambda p, m, s: self.progress_updated.emit(
+                            file_path, p, m, "processing" if s != "completed" else "completed"
+                        ),
+                        cancel_checker=lambda: self._cancel_event.is_set(),
+                    )
+                finally:
+                    self._forget_task(task_id)
                 status = task_result.get("status")
                 if status == "completed":
                     subs = task_result.get("subtitles", [])
@@ -884,7 +923,11 @@ class WorkerThread(QThread):
         def on_progress(p, m, s):
             self.progress_updated.emit(file_path, p, m, s)
 
+        if self._cancel_event.is_set():
+            return
         subtitles, lang = self.local.transcribe(file_path, self.language, on_progress)
+        if lang == "cancelled" or self._cancel_event.is_set():
+            return
         if lang == "error":
             self.task_error.emit(file_path, subtitles[0] if isinstance(subtitles, list) and subtitles else "转写失败")
         else:
@@ -893,6 +936,11 @@ class WorkerThread(QThread):
     def stop(self):
         self._running = False
         self._cancel_event.set()
+        try:
+            self.local.cancel()
+        except Exception:
+            pass
+        threading.Thread(target=self._cancel_active_tasks, daemon=True).start()
 
 
 class PackageProgressDialog(QDialog):
@@ -1127,10 +1175,12 @@ class ChatGPTPackageWorker(QThread):
 
 class LocalizationWorker(QThread):
     progress_updated = pyqtSignal(str, int, str, str)
+    job_started = pyqtSignal(str, str)
     task_completed = pyqtSignal(str, str)
     task_error = pyqtSignal(str, str, str, str)  # file_path, error_code, message, error_detail
 
-    def __init__(self, file_path, srt_path, source_video, config, output_dir):
+    def __init__(self, file_path, srt_path, source_video, config, output_dir,
+                 retry_job_id="", retry_from_stage=""):
         super().__init__()
         self.file_path = file_path
         self.srt_path = Path(srt_path)
@@ -1138,16 +1188,21 @@ class LocalizationWorker(QThread):
         self.config = config
         self.output_dir = Path(output_dir)
         self._cancelled = False
-        self._job_id = None
+        self._job_id = str(retry_job_id or "") or None
+        self._retry_from_stage = str(retry_from_stage or "")
         self._client = LocalizationClient()
 
     def stop(self):
         self._cancelled = True
         if self._job_id:
-            try:
-                self._client.cancel_job(self._job_id)
-            except Exception:
-                pass
+            job_id = self._job_id
+            threading.Thread(
+                target=lambda: self._client.cancel_job(job_id),
+                daemon=True,
+            ).start()
+
+    def _emit_error(self, code: str = "", message: str = "", detail: str = ""):
+        self.task_error.emit(self.file_path, str(code or ""), str(message or ""), str(detail or ""))
 
     def _resolve_output_srt(self, workspace: Path, final: dict) -> Path | None:
         target_lang = str(self.config.get("target_language", "zh-CN") or "zh-CN")
@@ -1202,17 +1257,48 @@ class LocalizationWorker(QThread):
     def run(self):
         try:
             self.progress_updated.emit(self.file_path, 0, "准备本地化工作空间...", "processing")
+            if self._cancelled:
+                return
 
             workspace = self.srt_path.parent / "localization_workspace"
             for d in ["source", "subtitles", "translation", "rendered", "audio", "audio/tts", "checkpoints", "logs", "temp"]:
                 (workspace / d).mkdir(parents=True, exist_ok=True)
+
+            if self._job_id and self._retry_from_stage:
+                self.progress_updated.emit(self.file_path, 5, "连接本地化引擎...", "processing")
+                if not self._client.health_check():
+                    self._emit_error(message="本地化引擎未启动，请先启动服务")
+                    return
+                if self._cancelled:
+                    self._client.cancel_job(self._job_id)
+                    return
+
+                self.progress_updated.emit(self.file_path, 10, "提交阶段重试任务...", "processing")
+                result = self._client.retry_job(self._job_id, self._retry_from_stage)
+                if "error" in result:
+                    if not self._cancelled:
+                        self._emit_error(message=result["error"])
+                    return
+                self.job_started.emit(self.file_path, self._job_id)
+                final = self._client.wait_for_result(
+                    self._job_id,
+                    progress_callback=lambda p, m, s: self.progress_updated.emit(
+                        self.file_path, int(p), str(m or ""), str(s or "processing")
+                    ),
+                    poll_interval=1.0,
+                    cancel_checker=lambda: self._cancelled,
+                )
+                self._finish_from_result(workspace, final)
+                return
 
             import shutil
             raw_video = workspace / "source" / self.source_video.name
             try:
                 shutil.copy2(str(self.source_video), str(raw_video))
             except Exception as e:
-                self.task_error.emit(self.file_path, f"复制视频文件失败: {e}")
+                self._emit_error(message=f"复制视频文件失败: {e}")
+                return
+            if self._cancelled:
                 return
 
             source_srt_name = self.srt_path.name
@@ -1220,12 +1306,16 @@ class LocalizationWorker(QThread):
             try:
                 shutil.copy2(str(self.srt_path), str(source_sub))
             except Exception as e:
-                self.task_error.emit(self.file_path, f"复制字幕文件失败: {e}")
+                self._emit_error(message=f"复制字幕文件失败: {e}")
+                return
+            if self._cancelled:
                 return
 
             self.progress_updated.emit(self.file_path, 5, "连接本地化引擎...", "processing")
             if not self._client.health_check():
-                self.task_error.emit(self.file_path, "本地化引擎未启动，请先启动服务")
+                self._emit_error(message="本地化引擎未启动，请先启动服务")
+                return
+            if self._cancelled:
                 return
 
             self.progress_updated.emit(self.file_path, 8, "释放 Whisper 显存，准备翻译/配音...", "processing")
@@ -1256,12 +1346,18 @@ class LocalizationWorker(QThread):
             )
 
             if "error" in result:
-                self.task_error.emit(self.file_path, result["error"])
+                if not self._cancelled:
+                    self._emit_error(message=result["error"])
                 return
 
             self._job_id = result.get("job_id")
             if not self._job_id:
-                self.task_error.emit(self.file_path, "引擎未返回任务 ID")
+                if not self._cancelled:
+                    self._emit_error(message="引擎未返回任务 ID")
+                return
+            self.job_started.emit(self.file_path, self._job_id)
+            if self._cancelled:
+                self._client.cancel_job(self._job_id)
                 return
 
             def on_progress(p, m, s):
@@ -1274,29 +1370,35 @@ class LocalizationWorker(QThread):
                 cancel_checker=lambda: self._cancelled,
             )
 
-            status = final.get("status")
-            if status == "completed":
-                output_srt = self._resolve_output_srt(workspace, final)
-                if output_srt and output_srt.exists():
-                    dst = self.srt_path.parent / f"{self.srt_path.stem}_translated.srt"
-                    shutil.copy2(str(output_srt), str(dst))
-                    self.task_completed.emit(self.file_path, str(dst))
-                else:
-                    self.task_completed.emit(self.file_path, "")
-            elif status == "cancelled":
-                pass
-            else:
-                self.task_error.emit(
-                    self.file_path,
-                    final.get("error_code", ""),
-                    final.get("message", "处理失败"),
-                    final.get("error_detail", ""),
-                )
+            self._finish_from_result(workspace, final)
 
         except Exception as e:
             import traceback
             traceback.print_exc()
-            self.task_error.emit(self.file_path, str(e)[:200])
+            if not self._cancelled:
+                self._emit_error(message=str(e)[:200])
+
+    def _finish_from_result(self, workspace: Path, final: dict):
+        import shutil
+
+        status = final.get("status")
+        if status == "completed":
+            output_srt = self._resolve_output_srt(workspace, final)
+            if output_srt and output_srt.exists():
+                dst = self.srt_path.parent / f"{self.srt_path.stem}_translated.srt"
+                shutil.copy2(str(output_srt), str(dst))
+                self.task_completed.emit(self.file_path, str(dst))
+            else:
+                self.task_completed.emit(self.file_path, "")
+        elif status == "cancelled":
+            pass
+        else:
+            self.task_error.emit(
+                self.file_path,
+                final.get("error_code", ""),
+                final.get("message", "处理失败"),
+                final.get("error_detail", ""),
+            )
 
 
 class MainWindow(QMainWindow):
@@ -1309,6 +1411,7 @@ class MainWindow(QMainWindow):
         self._stopped = False
         self._localization_config = None
         self._localization_worker = None
+        self._localization_workers = {}
         self.output_dir = Path(WHISPER_SERVER) / "output" if WHISPER_SERVER.exists() else Path.cwd() / "output"
         self.history = HistoryManager(self.output_dir / "history.json")
         self._setup_ui()
@@ -1657,6 +1760,7 @@ class MainWindow(QMainWindow):
 
             entry = self.history.get(p)
             if entry:
+                self.video_items[p]["localization_job_id"] = entry.get("job_id", "")
                 subs = self.history.get_subtitles(p)
                 if subs:
                     widget.subtitles = subs
@@ -1768,10 +1872,11 @@ class MainWindow(QMainWindow):
         if self.worker:
             self.worker.stop()
             self.worker.wait(2000)
-        if self._localization_worker:
-            self._localization_worker.stop()
-            self._localization_worker.wait(2000)
-            self._localization_worker = None
+        for worker in list(self._localization_workers.values()):
+            worker.stop()
+            worker.wait(2000)
+        self._localization_workers.clear()
+        self._localization_worker = None
         for path, data in self.video_items.items():
             widget = data["widget"]
             if widget.status in ("queued", "downloading", "processing", "pending"):
@@ -1990,6 +2095,7 @@ class MainWindow(QMainWindow):
 
             entry = self.history.get(url)
             if entry:
+                self.video_items[url]["localization_job_id"] = entry.get("job_id", "")
                 subs = self.history.get_subtitles(url)
                 if subs:
                     widget.subtitles = subs
@@ -2039,6 +2145,11 @@ class MainWindow(QMainWindow):
 
         remove_action = QAction("🗑 移除此项", self)
         remove_action.triggered.connect(lambda: self._remove_file(key))
+        if widget.status in ("queued", "downloading", "processing"):
+            stop_action = QAction("停止任务", self)
+            stop_action.triggered.connect(lambda: self._stop_task(key))
+            menu.addAction(stop_action)
+            menu.addSeparator()
         menu.addAction(remove_action)
 
         if widget.status in ("error", "cancelled"):
@@ -2046,6 +2157,25 @@ class MainWindow(QMainWindow):
             retry_action = QAction(label, self)
             retry_action.triggered.connect(lambda: self._start_processing(specific_files=[key]))
             menu.addAction(retry_action)
+
+        if widget.status in ("completed", "error", "cancelled") and self._get_localization_job_id(key):
+            stage_menu = QMenu("重新生成指定阶段", self)
+            stages = [
+                ("翻译及后续", "translate"),
+                ("字幕导出及后续", "subtitle_export"),
+                ("语音合成及后续", "tts"),
+                ("音频混合及后续", "audio_mix"),
+                ("视频渲染", "render"),
+            ]
+            for label, stage in stages:
+                action = QAction(label, self)
+                action.triggered.connect(lambda checked=False, st=stage: self._retry_localization_stage(key, st))
+                stage_menu.addAction(action)
+            stage_menu.addSeparator()
+            full_action = QAction("全部重新处理", self)
+            full_action.triggered.connect(lambda: self._start_processing(specific_files=[key]))
+            stage_menu.addAction(full_action)
+            menu.addMenu(stage_menu)
 
         if widget.status == "completed" and widget.subtitles:
             menu.addSeparator()
@@ -2082,6 +2212,68 @@ class MainWindow(QMainWindow):
             menu.addAction(del_action)
 
         menu.exec_(self.file_list.viewport().mapToGlobal(pos))
+
+    def _get_localization_job_id(self, key):
+        data = self.video_items.get(key) or {}
+        job_id = data.get("localization_job_id") or self.history.get_job_id(key)
+        return str(job_id or "").strip()
+
+    def _get_history_srt_path(self, key):
+        entry = self.history.get(key) or {}
+        srt_path = entry.get("srt_path") or ""
+        return srt_path if srt_path and Path(srt_path).exists() else ""
+
+    def _retry_localization_stage(self, key, stage):
+        if key not in self.video_items:
+            return
+        job_id = self._get_localization_job_id(key)
+        srt_path = self._get_history_srt_path(key)
+        if not job_id or not srt_path:
+            QMessageBox.warning(self, "无法重新生成", "缺少本地化任务 ID 或字幕历史记录，请使用“全部重新处理”。")
+            return
+        if self._localization_workers.get(key):
+            QMessageBox.information(self, "任务运行中", "该任务正在运行，请先停止后再重新生成。")
+            return
+
+        self._stopped = False
+        self._refresh_localization_config_from_settings()
+        source_video = key
+        if self.video_items.get(key, {}).get("is_url"):
+            output_dir = self.history.get_output_dir(key)
+            source_video = str(self._find_output_video(key, output_dir)) if output_dir else ""
+        worker = LocalizationWorker(
+            key,
+            srt_path,
+            source_video or key,
+            self._localization_config or {},
+            self.output_dir,
+            retry_job_id=job_id,
+            retry_from_stage=stage,
+        )
+        self.video_items[key]["widget"].update_status("processing", 0, f"重新生成: {stage}")
+        self.stop_btn.setEnabled(True)
+        self._attach_localization_worker(key, worker)
+        self.status_label.setText(f"正在从 {stage} 重新生成...")
+
+    def _stop_task(self, key):
+        if key not in self.video_items:
+            return
+        worker = self._localization_workers.get(key)
+        if worker:
+            worker.stop()
+        else:
+            job_id = self._get_localization_job_id(key)
+            if job_id:
+                threading.Thread(
+                    target=lambda: LocalizationClient().cancel_job(job_id),
+                    daemon=True,
+                ).start()
+            elif self.worker and self.worker.isRunning():
+                self.worker.stop()
+        widget = self.video_items[key]["widget"]
+        widget.update_status("cancelled", widget.progress, "已请求停止")
+        self._update_progress()
+        self.status_label.setText("已请求停止任务")
 
     def _delete_output(self, key):
         ret = QMessageBox.question(
@@ -2475,6 +2667,38 @@ class MainWindow(QMainWindow):
             print(f"load localization config failed: {exc}")
             self._localization_config = None
 
+    def _attach_localization_worker(self, file_path, worker):
+        worker.progress_updated.connect(self._on_localization_progress)
+        worker.job_started.connect(self._on_localization_job_started)
+        worker.task_completed.connect(self._on_localization_completed)
+        worker.task_error.connect(self._on_localization_error)
+        worker.finished.connect(lambda fp=file_path, w=worker: self._on_localization_worker_finished(fp, w))
+        self._localization_workers[file_path] = worker
+        self._localization_worker = worker
+        worker.start()
+
+    def _on_localization_worker_finished(self, file_path, worker):
+        if self._localization_workers.get(file_path) is worker:
+            self._localization_workers.pop(file_path, None)
+        if self._localization_worker is worker:
+            self._localization_worker = None
+
+    def _on_localization_job_started(self, file_path, job_id):
+        if file_path not in self.video_items:
+            return
+        self.video_items[file_path]["localization_job_id"] = job_id
+        entry = self.history.get(file_path) or {}
+        entry["job_id"] = job_id
+        entry["mode"] = "localization"
+        if self._localization_config:
+            entry["source_language"] = self._localization_config.get(
+                "source_language", entry.get("source_language", "auto")
+            )
+            entry["target_language"] = self._localization_config.get(
+                "target_language", entry.get("target_language", "")
+            )
+        self.history.put(file_path, entry)
+
     def _start_localization(self, file_path, srt_path):
         # Preflight: ensure Qwen3-TTS sidecar is running before launching a dub job
         cfg = self._localization_config or {}
@@ -2523,11 +2747,7 @@ class MainWindow(QMainWindow):
                 file_path, srt_path, str(video_file),
                 self._localization_config, self.output_dir,
             )
-            worker.progress_updated.connect(self._on_localization_progress)
-            worker.task_completed.connect(self._on_localization_completed)
-            worker.task_error.connect(self._on_localization_error)
-            self._localization_worker = worker
-            worker.start()
+            self._attach_localization_worker(file_path, worker)
             return
         if not Path(file_path).exists():
             self.video_items[file_path]["widget"].update_status("error", 0, "源视频文件不存在")
@@ -2537,11 +2757,7 @@ class MainWindow(QMainWindow):
             file_path, srt_path, file_path,
             self._localization_config, self.output_dir,
         )
-        worker.progress_updated.connect(self._on_localization_progress)
-        worker.task_completed.connect(self._on_localization_completed)
-        worker.task_error.connect(self._on_localization_error)
-        self._localization_worker = worker
-        worker.start()
+        self._attach_localization_worker(file_path, worker)
 
     def _on_localization_progress(self, file_path, progress, message, status):
         if self._stopped or file_path not in self.video_items:
@@ -2549,6 +2765,8 @@ class MainWindow(QMainWindow):
         self.video_items[file_path]["widget"].update_status(status, progress, message)
 
     def _on_localization_completed(self, file_path, translated_srt):
+        if self._stopped:
+            return
         if file_path not in self.video_items:
             return
         from subtitle_utils import parse_srt_file
@@ -2568,6 +2786,8 @@ class MainWindow(QMainWindow):
         self._update_progress()
 
     def _on_localization_error(self, file_path, error_code, error_msg, error_detail):
+        if self._stopped:
+            return
         if file_path in self.video_items:
             display = error_msg[:80]
             if error_code:

@@ -2,6 +2,7 @@
 import json
 import os
 import subprocess
+import threading
 from pathlib import Path
 
 from whisper_config import (
@@ -190,6 +191,21 @@ if __name__ == "__main__":
 class LocalWhisperTranscriber:
     def __init__(self):
         _create_transcribe_script()
+        self._process = None
+        self._cancel_requested = False
+        self._lock = threading.Lock()
+
+    def cancel(self):
+        with self._lock:
+            self._cancel_requested = True
+            process = self._process
+        if process and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
 
     def transcribe(self, audio_path, language="auto", progress_callback=None):
         env = os.environ.copy()
@@ -208,38 +224,49 @@ class LocalWhisperTranscriber:
         }
         popen_kwargs.update(_hidden_subprocess_kwargs())
         process = subprocess.Popen(cmd, **popen_kwargs)
+        with self._lock:
+            self._cancel_requested = False
+            self._process = process
 
         subtitles = []
         detected_lang = "unknown"
         error_message = ""
 
-        for line in iter(process.stdout.readline, ""):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                data = json.loads(line)
-                msg_type = data.get("type", "")
-                if msg_type == "status":
-                    progress = data.get("progress", 0)
-                    message = data.get("message", "")
-                    if progress_callback:
-                        progress_callback(progress, message, "processing")
-                elif msg_type == "complete":
-                    subtitles = data.get("subtitles", [])
-                    detected_lang = data.get("language", "unknown")
-                    if progress_callback:
-                        progress_callback(100, f"Done! {len(subtitles)} subtitles", "completed")
-                elif msg_type == "error":
-                    error_message = data.get("message", "")
-                    if progress_callback:
-                        progress_callback(0, error_message, "error")
-            except json.JSONDecodeError:
-                continue
+        try:
+            for line in iter(process.stdout.readline, ""):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                    msg_type = data.get("type", "")
+                    if msg_type == "status":
+                        progress = data.get("progress", 0)
+                        message = data.get("message", "")
+                        if progress_callback:
+                            progress_callback(progress, message, "processing")
+                    elif msg_type == "complete":
+                        subtitles = data.get("subtitles", [])
+                        detected_lang = data.get("language", "unknown")
+                        if progress_callback:
+                            progress_callback(100, f"Done! {len(subtitles)} subtitles", "completed")
+                    elif msg_type == "error":
+                        error_message = data.get("message", "")
+                        if progress_callback:
+                            progress_callback(0, error_message, "error")
+                except json.JSONDecodeError:
+                    continue
 
-        process.wait()
+            process.wait()
+        finally:
+            with self._lock:
+                cancelled = self._cancel_requested
+                if self._process is process:
+                    self._process = None
 
         if process.returncode != 0:
+            if cancelled:
+                return [], "cancelled"
             stderr = process.stderr.read()
             error_msg = error_message or (stderr[-300:] if stderr else "Unknown error")
             if progress_callback:

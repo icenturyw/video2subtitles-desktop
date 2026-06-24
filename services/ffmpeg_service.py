@@ -165,7 +165,7 @@ class FFmpegProcess:
             **hidden_subprocess_kwargs(),
         )
 
-    def wait(self, timeout: Optional[float] = None) -> Tuple[bool, str, str]:
+    def wait(self, timeout: Optional[float] = None, cancel_checker=None) -> Tuple[bool, str, str]:
         """Wait for process to complete.
 
         Returns:
@@ -174,16 +174,28 @@ class FFmpegProcess:
         if not self._process:
             return False, "", "Process not started"
 
+        deadline = time.monotonic() + timeout if timeout is not None else None
+
         try:
-            stdout, stderr = self._process.communicate(timeout=timeout)
-            out = stdout.decode("utf-8", errors="replace") if stdout else ""
-            err = stderr.decode("utf-8", errors="replace") if stderr else ""
+            while True:
+                if cancel_checker and cancel_checker():
+                    self.cancel()
+                    return False, "", "Cancelled"
 
-            if self._log_path:
-                self._append_log(err[:2000])
+                try:
+                    stdout, stderr = self._process.communicate(timeout=0.25)
+                    out = stdout.decode("utf-8", errors="replace") if stdout else ""
+                    err = stderr.decode("utf-8", errors="replace") if stderr else ""
 
-            success = self._process.returncode == 0
-            return success, out, err
+                    if self._log_path:
+                        self._append_log(err[:2000])
+
+                    success = self._process.returncode == 0
+                    return success, out, err
+                except subprocess.TimeoutExpired:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        self._terminate()
+                        return False, "", "Process timed out"
         except subprocess.TimeoutExpired:
             self._terminate()
             return False, "", "Process timed out"
@@ -280,10 +292,9 @@ def render_hardsub(
     process.start()
 
     try:
-        success, stdout, stderr = process.wait(timeout=None)
+        success, stdout, stderr = process.wait(timeout=None, cancel_checker=cancel_checker)
 
-        if cancel_checker and cancel_checker():
-            process.cancel()
+        if process.is_cancelled() or stderr == "Cancelled":
             if partial_path.exists():
                 partial_path.unlink(missing_ok=True)
             return {"success": False, "error": "Cancelled", "cancelled": True}
@@ -360,10 +371,9 @@ def render_softsub(
     process.start()
 
     try:
-        success, stdout, stderr = process.wait(timeout=None)
+        success, stdout, stderr = process.wait(timeout=None, cancel_checker=cancel_checker)
 
-        if cancel_checker and cancel_checker():
-            process.cancel()
+        if process.is_cancelled() or stderr == "Cancelled":
             if partial_path.exists():
                 partial_path.unlink(missing_ok=True)
             return {"success": False, "error": "Cancelled", "cancelled": True}

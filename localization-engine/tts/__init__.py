@@ -7,6 +7,7 @@ from tts.base import TTSProvider, TTSCache, TTSResult
 from tts.edge_tts import EdgeTTSProvider
 from tts.qwen3_tts import Qwen3TTSProvider
 from tts.sapi_tts import SapiTTSProvider
+from tts.volcengine_tts import VolcengineDoubaoTTSProvider
 
 _PROVIDER_CACHE: dict = {}
 _DEFAULT_EDGE_CACHE: Optional[TTSCache] = None
@@ -38,6 +39,10 @@ def get_provider(name: str = "edge-tts",
         provider = Qwen3TTSProvider(cache=_get_edge_cache(cache_dir))
     elif name in ("sapi", "windows-sapi", "windows_sapi"):
         provider = SapiTTSProvider(cache=_get_edge_cache(cache_dir))
+    elif name in (
+        "volcengine-doubao", "volcengine", "volcano", "doubao-tts", "doubao",
+    ):
+        provider = VolcengineDoubaoTTSProvider(cache=_get_edge_cache(cache_dir))
     else:
         raise ValueError(f"Unknown TTS provider: {name}")
 
@@ -81,5 +86,10 @@ def list_available_providers() -> list[dict]:
         "name": "sapi",
         "available": __import__("os").name == "nt",
         "local": True,
+    })
+    providers.append({
+        "name": "volcengine-doubao",
+        "available": True,
+        "remote": True,
     })
     return providers

@@ -40,6 +40,25 @@ class TestAssWriter(unittest.TestCase):
         self.assertIn("第二行", content)
         self.assertIn("Hello World", content)
 
+    def test_ass_bilingual_uses_foreground_translation_layer(self):
+        segs = [
+            SubtitleSegment(index=1, start=0, end=1, text="Source", translation="Target")
+        ]
+        content = segments_to_ass(segs, self.style, mode="bilingual")
+        lines = content.splitlines()
+        source_dialog = next(line for line in lines if line.endswith(",Source"))
+        translation_dialog = next(line for line in lines if line.endswith(",Target"))
+
+        self.assertTrue(source_dialog.startswith("Dialogue: 10,"))
+        self.assertTrue(translation_dialog.startswith("Dialogue: 20,"))
+        self.assertLess(lines.index(source_dialog), lines.index(translation_dialog))
+
+        source_style = next(line for line in lines if line.startswith("Style: Source,"))
+        translation_style = next(line for line in lines if line.startswith("Style: Translation,"))
+        source_fields = source_style.replace("Style: ", "", 1).split(",")
+        translation_fields = translation_style.replace("Style: ", "", 1).split(",")
+        self.assertGreater(int(source_fields[21]), int(translation_fields[21]))
+
     def test_ass_bilingual_fallback_no_translation(self):
         segs = [SubtitleSegment(index=1, start=0, end=1, text="Only source")]
         content = segments_to_ass(segs, self.style, mode="bilingual")

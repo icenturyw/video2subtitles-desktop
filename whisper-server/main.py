@@ -51,6 +51,10 @@ SUPPORTED_DOWNLOAD_MODES = {"video", "transcribe_only", "audio"}
 SUPPORTED_DOWNLOAD_QUALITIES = {"best", "720p", "480p"}
 
 
+class TaskCancelled(RuntimeError):
+    """Raised inside worker threads when a task has been cancelled."""
+
+
 class TranscribeRequest(BaseModel):
     video_url: Optional[str] = None
     language: str = "auto"
@@ -155,6 +159,8 @@ def _client_video_id_from_url(url: str) -> str:
 def _update_task(task_id: str, status: str, progress: int, message: str, **extra: Any) -> None:
     with TASK_LOCK:
         existing = TASKS.get(task_id, {})
+        if existing.get("status") == "cancelled" and status not in {"cancelled", "pending"}:
+            return
         payload = {
             **existing,
             "task_id": task_id,
@@ -165,6 +171,20 @@ def _update_task(task_id: str, status: str, progress: int, message: str, **extra
         }
         payload.update(extra)
         TASKS[task_id] = payload
+
+
+def _is_task_cancelled(task_id: str) -> bool:
+    with TASK_LOCK:
+        return TASKS.get(task_id, {}).get("status") == "cancelled"
+
+
+def _raise_if_cancelled(task_id: str) -> None:
+    if _is_task_cancelled(task_id):
+        raise TaskCancelled(f"Task {task_id} cancelled")
+
+
+def _mark_task_cancelled(task_id: str, message: str = "任务已取消") -> None:
+    _update_task(task_id, "cancelled", 0, message)
 
 
 def _get_task(task_id: str) -> Optional[Dict[str, Any]]:
@@ -288,23 +308,51 @@ def _ensure_client_video_alias(media_path: Path, video_url: str, task_id: str) -
     return media_path
 
 
-def _run_ytdlp(cmd: list[str]) -> None:
+def _run_ytdlp_once(cmd: list[str], run_kwargs: Dict[str, Any], task_id: Optional[str]) -> None:
+    started = time.monotonic()
+    process = subprocess.Popen(cmd, **run_kwargs)
+    while True:
+        if task_id and _is_task_cancelled(task_id):
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+            raise TaskCancelled(f"Task {task_id} cancelled")
+
+        try:
+            stdout, stderr = process.communicate(timeout=0.5)
+            break
+        except subprocess.TimeoutExpired:
+            if time.monotonic() - started > 1800:
+                process.kill()
+                process.wait(timeout=5)
+                raise subprocess.TimeoutExpired(cmd, 1800)
+
+    if process.returncode != 0:
+        raise subprocess.CalledProcessError(
+            process.returncode, cmd, output=stdout, stderr=stderr,
+        )
+
+
+def _run_ytdlp(cmd: list[str], task_id: Optional[str] = None) -> None:
     run_kwargs = {
         "cwd": str(SERVER_DIR),
-        "capture_output": True,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
         "text": True,
-        "check": True,
-        "timeout": 1800,
     }
     run_kwargs.update(_hidden_subprocess_kwargs())
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     run_kwargs["env"] = env
     try:
-        subprocess.run(cmd, **run_kwargs)
+        _run_ytdlp_once(cmd, run_kwargs, task_id)
     except FileNotFoundError:
         cmd = [sys.executable, "-m", "yt_dlp", *cmd[1:]]
-        subprocess.run(cmd, **run_kwargs)
+        _run_ytdlp_once(cmd, run_kwargs, task_id)
     except subprocess.CalledProcessError as exc:
         detail = (exc.stderr or exc.stdout or str(exc))[-1600:].strip()
         sys.stderr.write(f"[yt-dlp] command failed: {' '.join(cmd[:8])}...\n")
@@ -460,6 +508,7 @@ def _fetch_youtube_captions(video_url: str, language: str, task_id: str) -> tupl
 
 
 def _download_audio(video_url: str, task_id: str) -> Path:
+    _raise_if_cancelled(task_id)
     _update_task(task_id, "downloading", 8, "正在下载音频...")
     base_name = _safe_name(task_id)
     output_template = str(TEMP_DIR / f"{base_name}.%(ext)s")
@@ -483,7 +532,7 @@ def _download_audio(video_url: str, task_id: str) -> Path:
     cmd.append(video_url)
 
     try:
-        _run_ytdlp(cmd)
+        _run_ytdlp(cmd, task_id)
     except FileNotFoundError as exc:
         raise RuntimeError("未找到 yt-dlp，请运行 pip install -r requirements.txt") from exc
     except subprocess.CalledProcessError as exc:
@@ -500,6 +549,7 @@ def _download_audio(video_url: str, task_id: str) -> Path:
 
 
 def _download_video(video_url: str, task_id: str, quality: str = "best") -> Path:
+    _raise_if_cancelled(task_id)
     _update_task(task_id, "downloading", 8, "正在下载视频...")
     base_name = _safe_name(task_id)
     output_template = str(TEMP_DIR / f"{base_name}.%(ext)s")
@@ -521,13 +571,13 @@ def _download_video(video_url: str, task_id: str, quality: str = "best") -> Path
     ]
 
     try:
-        _run_ytdlp(cmd)
+        _run_ytdlp(cmd, task_id)
     except FileNotFoundError as exc:
         raise RuntimeError("未找到 yt-dlp，请运行 pip install -r requirements.txt") from exc
     except subprocess.CalledProcessError as first_exc:
         fallback_cmd = [*common, "-f", "b[ext=mp4]/best", video_url]
         try:
-            _run_ytdlp(fallback_cmd)
+            _run_ytdlp(fallback_cmd, task_id)
         except subprocess.CalledProcessError as second_exc:
             stderr_combined = (second_exc.stderr or "") + (first_exc.stderr or "")
             detail = (second_exc.stderr or second_exc.stdout or first_exc.stderr or first_exc.stdout or str(second_exc))[-800:]
@@ -545,6 +595,7 @@ def _download_video(video_url: str, task_id: str, quality: str = "best") -> Path
 
 
 def _download_media(video_url: str, task_id: str, mode: str = "video", quality: str = "best") -> Path:
+    _raise_if_cancelled(task_id)
     mode = _clean_download_mode(mode)
     if mode == "audio":
         return _download_audio(video_url, task_id)
@@ -645,8 +696,10 @@ def _split_text(text: str, max_len: int = 32) -> list[str]:
 
 
 def _transcribe_file(path: Path, task_id: str, language: str = "auto") -> tuple[list[dict[str, Any]], str]:
+    _raise_if_cancelled(task_id)
     _update_task(task_id, "transcribing", 20, "正在加载 Whisper 模型...")
     model = _get_model()
+    _raise_if_cancelled(task_id)
     _update_task(task_id, "transcribing", 30, "正在本地识别...")
 
     segments, info = model.transcribe(
@@ -663,6 +716,7 @@ def _transcribe_file(path: Path, task_id: str, language: str = "auto") -> tuple[
     subtitles: list[dict[str, Any]] = []
 
     for segment in segments:
+        _raise_if_cancelled(task_id)
         text = (getattr(segment, "text", "") or "").strip()
         if not text:
             continue
@@ -719,6 +773,7 @@ def _process_task(
         language = _clean_language(language)
         download_mode = _clean_download_mode(download_mode)
         download_quality = _clean_download_quality(download_quality)
+        _raise_if_cancelled(task_id)
         cached = _load_cache(task_id)
         if cached and cached.get("subtitles"):
             media_path = None
@@ -745,8 +800,10 @@ def _process_task(
             return
 
         media_path = source_path
+        _raise_if_cancelled(task_id)
         if video_url:
             media_path = _download_media(video_url, task_id, download_mode, download_quality)
+        _raise_if_cancelled(task_id)
         if not media_path or not media_path.exists():
             raise RuntimeError("找不到可转写的音视频文件")
         if media_path.suffix.lower() not in MEDIA_EXTS:
@@ -759,8 +816,11 @@ def _process_task(
         caption_error: Optional[Exception] = None
         if video_url:
             try:
+                _raise_if_cancelled(task_id)
                 subtitles, detected_lang = _fetch_youtube_captions(video_url, language, task_id)
             except Exception as exc:
+                if isinstance(exc, TaskCancelled):
+                    raise
                 caption_error = exc
                 subtitles, detected_lang = [], ""
         if not subtitles:
@@ -768,7 +828,9 @@ def _process_task(
                 raise RuntimeError(
                     f"YouTube {language} 字幕下载失败，未回退为其他语言字幕: {caption_error}"
                 ) from caption_error
+            _raise_if_cancelled(task_id)
             subtitles, detected_lang = _transcribe_file(media_path, task_id, language)
+        _raise_if_cancelled(task_id)
         if not subtitles:
             raise RuntimeError("未识别到有效语音内容")
 
@@ -786,6 +848,7 @@ def _process_task(
             "updated_at": _now(),
         }
         _save_cache(task_id, result)
+        _raise_if_cancelled(task_id)
         _update_task(
             task_id,
             "completed",
@@ -800,8 +863,13 @@ def _process_task(
         )
         if video_url:
             _cleanup_transcribe_only_media(media_path, video_url, task_id, download_mode, keep_video)
+    except TaskCancelled:
+        _mark_task_cancelled(task_id)
     except Exception as exc:
-        _update_task(task_id, "error", 0, str(exc)[:1000], subtitles=[])
+        if _is_task_cancelled(task_id):
+            _mark_task_cancelled(task_id)
+        else:
+            _update_task(task_id, "error", 0, str(exc)[:1000], subtitles=[])
 
 
 def _start_background(
@@ -916,6 +984,19 @@ def get_task_status(task_id: str):
     if cached:
         return cached
     return {"task_id": task_id, "status": "not_found", "message": "No existing data for this task", "progress": 0}
+
+
+@app.post("/cancel/{task_id}")
+@app.post("/task/{task_id}/cancel")
+@app.post("/tasks/{task_id}/cancel")
+def cancel_task(task_id: str, auth: str = Depends(verify_api_key)):
+    task = _get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+    if task.get("status") in {"completed", "error", "cancelled"}:
+        return {"task_id": task_id, "status": task.get("status"), "message": task.get("message", "")}
+    _mark_task_cancelled(task_id, "取消请求已发送")
+    return {"task_id": task_id, "status": "cancelled", "message": "取消请求已发送"}
 
 
 @app.delete("/cache/{task_id}")

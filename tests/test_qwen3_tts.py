@@ -14,9 +14,12 @@ To run engine module tests:
 from __future__ import annotations
 
 import os
+import base64
+import io
 import json
 import subprocess
 import sys
+import urllib.error
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -29,6 +32,8 @@ if _LOCALIZATION_ENGINE not in sys.path:
 
 from tts.qwen3_tts import Qwen3TTSProvider, LANG_MAP, DEFAULT_STABLE_SEED
 from tts.sapi_tts import SapiTTSProvider
+from tts.base import TTSAuthError
+from tts.volcengine_tts import VolcengineDoubaoTTSProvider
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +313,113 @@ class TestSapiTTSProvider:
 
         assert result.duration_seconds == 1.25
         assert result.output_path.name == "out.wav"
+
+
+class TestVolcengineDoubaoTTSProvider:
+    @patch("tts.volcengine_tts._get_audio_duration", return_value=1.25)
+    @patch("tts.volcengine_tts.urllib.request.urlopen")
+    def test_synthesize_sends_v3_headers_and_decodes_stream(
+        self, mock_urlopen, mock_duration, tmp_path
+    ):
+        captured = {}
+        audio_bytes = b"mp3-audio-bytes"
+        body = (
+            json.dumps({"code": 0, "data": base64.b64encode(audio_bytes).decode("ascii")})
+            + "\n"
+            + json.dumps({"code": 20000000, "message": "ok"})
+        ).encode("utf-8")
+
+        class FakeResponse:
+            headers = {"Content-Type": "application/json"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return body
+
+        def fake_urlopen(req, timeout=0):
+            captured["timeout"] = timeout
+            captured["url"] = req.full_url
+            captured["payload"] = json.loads(req.data.decode("utf-8"))
+            headers = {}
+            headers.update(getattr(req, "headers", {}))
+            headers.update(getattr(req, "unredirected_hdrs", {}))
+            captured["headers"] = {str(k).lower(): v for k, v in headers.items()}
+            return FakeResponse()
+
+        mock_urlopen.side_effect = fake_urlopen
+        provider = VolcengineDoubaoTTSProvider()
+        out_path = tmp_path / "out.mp3"
+
+        result = provider.synthesize(
+            "hello",
+            "zh-CN",
+            "zh_female_vv_uranus_bigtts",
+            out_path,
+            {
+                "volcengine_endpoint": "https://example.test/tts",
+                "volcengine_api_key": "volc-key",
+                "volcengine_resource_id": "seed-tts-2.0",
+                "volcengine_model": "seed-tts-2.0-expressive",
+                "volcengine_format": "mp3",
+                "volcengine_sample_rate": 24000,
+                "volcengine_speech_rate": 5,
+                "volcengine_loudness_rate": -3,
+                "timeout": 15,
+            },
+        )
+
+        assert captured["url"] == "https://example.test/tts"
+        assert captured["timeout"] == 15
+        assert captured["headers"]["x-api-key"] == "volc-key"
+        assert captured["headers"]["x-api-resource-id"] == "seed-tts-2.0"
+        assert captured["payload"]["req_params"]["text"] == "hello"
+        assert captured["payload"]["req_params"]["speaker"] == "zh_female_vv_uranus_bigtts"
+        assert captured["payload"]["req_params"]["audio_params"]["format"] == "mp3"
+        assert captured["payload"]["req_params"]["audio_params"]["sample_rate"] == 24000
+        assert captured["payload"]["req_params"]["speech_rate"] == 5
+        assert captured["payload"]["req_params"]["loudness_rate"] == -3
+        assert out_path.read_bytes() == audio_bytes
+        assert result.duration_seconds == 1.25
+
+    def test_synthesize_requires_credentials(self, tmp_path):
+        provider = VolcengineDoubaoTTSProvider()
+        with patch.dict(os.environ, {}, clear=True):
+            with pytest.raises(TTSAuthError):
+                provider.synthesize(
+                    "hello",
+                    "zh-CN",
+                    "zh_female_vv_uranus_bigtts",
+                    tmp_path / "out.mp3",
+                    {},
+                )
+
+    @patch("tts.volcengine_tts.urllib.request.urlopen")
+    def test_synthesize_maps_http_401_to_auth_error(self, mock_urlopen, tmp_path):
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            "https://example.test/tts",
+            401,
+            "Unauthorized",
+            {},
+            io.BytesIO(b'{"message":"Invalid X-Api-Key"}'),
+        )
+        provider = VolcengineDoubaoTTSProvider()
+
+        with pytest.raises(TTSAuthError, match="HTTP 401"):
+            provider.synthesize(
+                "hello",
+                "zh-CN",
+                "zh_female_vv_uranus_bigtts",
+                tmp_path / "out.mp3",
+                {
+                    "volcengine_endpoint": "https://example.test/tts",
+                    "volcengine_api_key": "bad-key",
+                },
+            )
 
 
 # ---------------------------------------------------------------------------

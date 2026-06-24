@@ -71,6 +71,41 @@ class TestTranslationParser(unittest.TestCase):
         }
         self.assertEqual(_extract_response_content(result), '[{"id": 1, "text": "你好"}]')
 
+    def test_openai_compatible_requests_include_user_agent(self):
+        captured_headers = {}
+
+        class FakeClient:
+            def post(self, url, json, headers, timeout):
+                captured_headers.update(headers)
+                return httpx.Response(
+                    200,
+                    json={
+                        "choices": [
+                            {"message": {"content": '[{"id": 1, "text": "ok"}]'}}
+                        ]
+                    },
+                    request=httpx.Request("POST", url),
+                )
+
+        provider = OpenAICompatibleProvider()
+        provider._client = FakeClient()
+        config = TranslationConfig(
+            provider="openai_compatible",
+            base_url="https://example.test/v1",
+            model="test-model",
+            api_type="chat_completions",
+            timeout=10,
+        )
+
+        provider.translate_batch(
+            [{"id": 1, "text": "hello"}],
+            config,
+            "en",
+            "zh-CN",
+        )
+
+        self.assertEqual(captured_headers["User-Agent"], "Video2Subtitles/1.0")
+
     def test_extract_newapi_data_wrapped_choices_response(self):
         result = {
             "data": {

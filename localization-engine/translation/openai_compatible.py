@@ -286,6 +286,7 @@ class OpenAICompatibleProvider(TranslationProvider):
 
         headers = {
             "Content-Type": "application/json",
+            "User-Agent": "Video2Subtitles/1.0",
         }
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"

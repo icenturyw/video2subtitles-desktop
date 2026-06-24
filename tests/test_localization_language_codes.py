@@ -33,6 +33,7 @@ def test_tts_voice_defaults_follow_provider_and_language():
     assert _default_tts_voice("edge-tts", "zh-CN") == "zh-CN-XiaoxiaoNeural"
     assert _default_tts_voice("edge-tts", "ja") == "ja-JP-NanamiNeural"
     assert _default_tts_voice("qwen3-tts", "en") == "Vivian"
+    assert _default_tts_voice("volcengine-doubao", "zh-CN") == "zh_female_vv_uranus_bigtts"
     assert _default_tts_voice("sapi", "zh-CN") == "default"
 
 
@@ -145,3 +146,32 @@ def test_saved_dub_mode_includes_qwen3_tts_options():
     assert opts["top_p"] == 0.8
     assert opts["max_new_tokens"] == 512
     assert opts["tts_segment_gap"] == 0.08
+
+
+def test_saved_dub_mode_includes_volcengine_tts_options():
+    cfg = localization_runtime_config({
+        "localization_mode": "dub",
+        "target_language_dialog": "zh-CN (简体中文)",
+        "tts_provider": "volcengine-doubao",
+        "tts_voice": "zh_female_vv_uranus_bigtts",
+        "tts_volcengine_endpoint": "https://example.test/tts",
+        "tts_volcengine_api_key": "volc-key",
+        "tts_volcengine_resource_id": "seed-tts-2.0",
+        "tts_volcengine_model": "seed-tts-2.0-expressive",
+        "tts_volcengine_format": "mp3",
+        "tts_volcengine_sample_rate": "24000",
+        "tts_volcengine_speech_rate": "5",
+        "tts_volcengine_loudness_rate": "-3",
+    })
+
+    assert cfg is not None
+    assert cfg["tts_provider"] == "volcengine-doubao"
+    opts = cfg["tts_options"]
+    assert opts["volcengine_endpoint"] == "https://example.test/tts"
+    assert opts["volcengine_api_key"] == "volc-key"
+    assert opts["volcengine_resource_id"] == "seed-tts-2.0"
+    assert opts["volcengine_model"] == "seed-tts-2.0-expressive"
+    assert opts["volcengine_format"] == "mp3"
+    assert opts["volcengine_sample_rate"] == 24000
+    assert opts["volcengine_speech_rate"] == 5
+    assert opts["volcengine_loudness_rate"] == -3

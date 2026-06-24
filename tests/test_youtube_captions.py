@@ -94,6 +94,20 @@ def test_task_id_includes_requested_language():
     assert server._task_id_from_url(url, "zh") == "cJpxcGIbseg_zh"
 
 
+def test_cancel_task_preserves_cancelled_status():
+    server = _load_whisper_server()
+    server.TASKS.clear()
+    server._update_task("job-1", "pending", 0, "waiting")
+
+    result = server.cancel_task("job-1")
+
+    assert result["status"] == "cancelled"
+    server._update_task("job-1", "completed", 100, "done", subtitles=[{"text": "late"}])
+    task = server._get_task("job-1")
+    assert task["status"] == "cancelled"
+    assert "subtitles" not in task
+
+
 def test_youtube_cookie_detection_requires_youtube_or_google_domain(tmp_path):
     server = _load_whisper_server()
 

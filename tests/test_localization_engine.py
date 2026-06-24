@@ -482,6 +482,90 @@ class TestPipelineTranslationConcurrency(unittest.TestCase):
         self.assertGreaterEqual(max_active, 2)
         self.assertEqual([s.translation for s in segments], [f"tx-{i}" for i in range(1, 6)])
 
+    def test_dubbing_fails_when_translation_falls_back_to_source(self):
+        from job_models import SubtitleSegment
+
+        class EmptyProvider:
+            def translate_batch(self, segments, config, source_lang, target_lang, glossary=None):
+                return []
+
+            def close(self):
+                pass
+
+        ws = Path(self.tmpdir)
+        runner = PipelineRunner(TaskStore(ws / "data"), ProgressTracker())
+        runner._store.create("job-missing-translation", {"workspace_dir": str(ws)})
+        segments = [
+            SubtitleSegment(index=1, start=0.0, end=1.0, text="source text")
+        ]
+
+        with patch("engine.pipeline.get_provider", return_value=EmptyProvider()):
+            ok = runner._run_translation(
+                "job-missing-translation",
+                ws,
+                segments,
+                {
+                    "dubbing_enabled": True,
+                    "translation": {
+                        "provider": "openai_compatible",
+                        "max_batch_items": 1,
+                        "retry_count": 0,
+                    },
+                },
+                "ja",
+                "zh-CN",
+                CancellationToken(),
+            )
+
+        self.assertFalse(ok)
+        rec = runner._store.get("job-missing-translation")
+        self.assertEqual(rec.error_code, "TRANSLATION_INCOMPLETE")
+        self.assertFalse((ws / "translation" / "checkpoints" / "completed_ids.json").exists())
+
+    def test_translation_checkpoint_ignored_when_segment_translations_missing(self):
+        from job_models import SubtitleSegment
+
+        calls = 0
+
+        class FakeProvider:
+            def translate_batch(self, segments, config, source_lang, target_lang, glossary=None):
+                nonlocal calls
+                calls += 1
+                return [{"id": item["id"], "text": f"tx-{item['id']}"} for item in segments]
+
+            def close(self):
+                pass
+
+        ws = Path(self.tmpdir)
+        checkpoint_dir = ws / "translation" / "checkpoints"
+        checkpoint_dir.mkdir(parents=True)
+        (checkpoint_dir / "completed_ids.json").write_text(
+            json.dumps({"completed_ids": [1]}),
+            encoding="utf-8",
+        )
+        runner = PipelineRunner(TaskStore(ws / "data"), ProgressTracker())
+        segments = [SubtitleSegment(index=1, start=0.0, end=1.0, text="source text")]
+
+        with patch("engine.pipeline.get_provider", return_value=FakeProvider()):
+            ok = runner._run_translation(
+                "job-checkpoint",
+                ws,
+                segments,
+                {
+                    "translation": {
+                        "provider": "openai_compatible",
+                        "max_batch_items": 1,
+                    },
+                },
+                "ja",
+                "zh-CN",
+                CancellationToken(),
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(calls, 1)
+        self.assertEqual(segments[0].translation, "tx-1")
+
 
 class TestPipelineTTSConcurrency(unittest.TestCase):
 
@@ -569,7 +653,12 @@ class TestPipelineTTSConcurrency(unittest.TestCase):
                 "job-tts",
                 ws,
                 segments,
-                {"tts_provider": "fake", "tts_voice": "voice", "tts_concurrency": 1},
+                {
+                    "tts_provider": "fake",
+                    "tts_voice": "voice",
+                    "tts_concurrency": 1,
+                    "tts_consistency_mode": "fast",
+                },
                 "zh-CN",
                 CancellationToken(),
             )
@@ -577,6 +666,61 @@ class TestPipelineTTSConcurrency(unittest.TestCase):
         self.assertTrue(ok)
         self.assertAlmostEqual(targets[0], 0.96, places=2)
         self.assertAlmostEqual(targets[1], 1.0, places=2)
+
+    def test_stable_tts_chunks_extract_segment_windows(self):
+        from job_models import SubtitleSegment
+        from tts.base import TTSResult
+
+        synthesized_texts = []
+
+        class FakeTTSProvider:
+            def synthesize(self, text, language, voice, output_path, options):
+                synthesized_texts.append(text)
+                Path(output_path).write_bytes(b"chunk")
+                return TTSResult(output_path=Path(output_path), duration_seconds=4.0)
+
+            def list_voices(self, language=None):
+                return []
+
+        ws = Path(self.tmpdir)
+        segments = [
+            SubtitleSegment(index=1, start=0.0, end=2.0, text="src-1", translation="hello"),
+            SubtitleSegment(index=2, start=2.0, end=4.0, text="src-2", translation="world"),
+        ]
+        runner = PipelineRunner(TaskStore(ws / "data"), ProgressTracker())
+        extractions = []
+        adjusted_inputs = []
+
+        def fake_extract(input_audio, output_audio, start_offset, duration):
+            extractions.append((Path(input_audio).name, Path(output_audio).name, start_offset, duration))
+            Path(output_audio).write_bytes(b"slice")
+            return True
+
+        def fake_adjust(input_audio, output_audio, actual_duration, target_duration):
+            adjusted_inputs.append(Path(input_audio).name)
+            Path(output_audio).write_bytes(b"seg")
+            return target_duration, "", 1.0
+
+        with patch("tts.get_provider", return_value=FakeTTSProvider()), \
+             patch("tts.timing.extract_audio_window", side_effect=fake_extract), \
+             patch("tts.timing.adjust_timing", side_effect=fake_adjust):
+            ok = runner._run_tts(
+                "job-tts",
+                ws,
+                segments,
+                {"tts_provider": "fake", "tts_voice": "voice", "tts_consistency_mode": "stable"},
+                "zh-CN",
+                CancellationToken(),
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(synthesized_texts, ["hello world"])
+        self.assertEqual(len(extractions), 2)
+        self.assertEqual([item[0] for item in extractions], ["chunk_0000.wav", "chunk_0000.wav"])
+        self.assertGreater(extractions[1][2], extractions[0][2])
+        self.assertEqual(adjusted_inputs, ["chunk_0000_seg_0001.wav", "chunk_0000_seg_0002.wav"])
+        self.assertTrue((ws / "audio" / "tts" / "seg_0001.wav").exists())
+        self.assertTrue((ws / "audio" / "tts" / "seg_0002.wav").exists())
 
     def test_tts_skip_removes_stale_segment_audio(self):
         from job_models import SubtitleSegment
@@ -787,9 +931,36 @@ class TestPipelineTTSConcurrency(unittest.TestCase):
 
         self.assertFalse(ok)
         rec = runner._store.get("job-broken-tts")
-        self.assertIn(rec.error_code, ("TTS_GENERATION_FAILED", "TTS_NO_AUDIO_OUTPUT"))
+        self.assertEqual(rec.error_code, "TTS_GENERATION_FAILED")
 
-    def test_tts_no_audio_files_returns_no_audio_output(self):
+    def test_tts_auth_error_returns_auth_failed(self):
+        from job_models import SubtitleSegment
+        from tts.base import TTSAuthError
+
+        class BrokenProvider:
+            def synthesize(self, text, language, voice, output_path, options):
+                raise TTSAuthError("Invalid API key")
+            def list_voices(self, language=None):
+                return []
+
+        ws = Path(self.tmpdir)
+        runner = PipelineRunner(TaskStore(ws / "data"), ProgressTracker())
+        runner._store.create("job-auth-tts", {"workspace_dir": str(ws)})
+        segments = [SubtitleSegment(index=1, start=0.0, end=1.0, text="hello", translation="浣犲ソ")]
+
+        with patch("tts.get_provider", return_value=BrokenProvider()):
+            ok = runner._run_tts(
+                "job-auth-tts", ws, segments,
+                {"tts_provider": "broken", "tts_voice": "v", "tts_concurrency": 1},
+                "zh-CN", CancellationToken(),
+            )
+
+        self.assertFalse(ok)
+        rec = runner._store.get("job-auth-tts")
+        self.assertEqual(rec.error_code, "TTS_AUTH_FAILED")
+        self.assertIn("Invalid API key", rec.error_detail)
+
+    def test_tts_provider_exception_returns_generation_failed(self):
         from job_models import SubtitleSegment
 
         class BrokenProvider:
@@ -812,7 +983,7 @@ class TestPipelineTTSConcurrency(unittest.TestCase):
 
         self.assertFalse(ok)
         rec = runner._store.get("job-no-out")
-        self.assertEqual(rec.error_code, "TTS_NO_AUDIO_OUTPUT")
+        self.assertEqual(rec.error_code, "TTS_GENERATION_FAILED")
 
     def test_tts_zero_byte_files_returns_zero_byte_audio(self):
         from job_models import SubtitleSegment
@@ -1092,6 +1263,98 @@ class TestPipelineAudioMix(unittest.TestCase):
         burned = [item for item in artifacts if item["kind"] == "burned_video"]
         self.assertTrue(burned)
         self.assertTrue(burned[0]["path"].endswith("_dubbed_hardsub.mp4"))
+
+    def test_resume_tts_loads_existing_translated_srt(self):
+        ws = Path(self.tmpdir)
+        (ws / "source").mkdir(parents=True)
+        (ws / "subtitles").mkdir(parents=True)
+        source_video = ws / "source" / "source.mp4"
+        source_sub = ws / "subtitles" / "source.srt"
+        translated_sub = ws / "subtitles" / "zh-CN.srt"
+        source_video.write_bytes(b"video")
+        source_sub.write_text(
+            "1\n00:00:00,000 --> 00:00:01,000\nhello\n",
+            encoding="utf-8",
+        )
+        translated_sub.write_text(
+            "1\n00:00:00,000 --> 00:00:01,000\n你好\n",
+            encoding="utf-8",
+        )
+
+        runner = PipelineRunner(TaskStore(ws / "data"), ProgressTracker())
+        runner._store.create("job-resume-tts", {})
+
+        def fake_tts(job_id, workspace, segments, request, target_lang, token):
+            self.assertEqual(segments[0].translation, "你好")
+            return False
+
+        with patch.object(PipelineRunner, "_run_translation") as mock_translation, \
+             patch.object(PipelineRunner, "_run_tts", side_effect=fake_tts) as mock_tts:
+            runner._execute(
+                "job-resume-tts",
+                {
+                    "workspace_dir": str(ws),
+                    "source_video": str(source_video),
+                    "source_subtitle": str(source_sub),
+                    "source_language": "en",
+                    "target_language": "zh-CN",
+                    "subtitle_mode": "bilingual",
+                    "dubbing_enabled": True,
+                    "burn_subtitles": False,
+                    "resume_stage": "tts",
+                },
+                CancellationToken(),
+            )
+
+        mock_translation.assert_not_called()
+        self.assertTrue(mock_tts.called)
+
+    def test_resume_render_reuses_existing_dubbed_video(self):
+        ws = Path(self.tmpdir)
+        (ws / "source").mkdir(parents=True)
+        (ws / "subtitles").mkdir(parents=True)
+        (ws / "rendered").mkdir(parents=True)
+        source_video = ws / "source" / "source.mp4"
+        source_sub = ws / "subtitles" / "source.srt"
+        source_ass = ws / "subtitles" / "source_en.ass"
+        dubbed_video = ws / "rendered" / f"{ws.name}_en_dubbed.mp4"
+        source_video.write_bytes(b"video")
+        source_sub.write_text(
+            "1\n00:00:00,000 --> 00:00:01,000\nhello\n",
+            encoding="utf-8",
+        )
+        source_ass.write_text("[Script Info]\n", encoding="utf-8")
+        dubbed_video.write_bytes(b"dubbed")
+
+        runner = PipelineRunner(TaskStore(ws / "data"), ProgressTracker())
+        runner._store.create("job-resume-render", {})
+
+        def fake_render_hardsub(**kwargs):
+            kwargs["output_path"].write_bytes(b"rendered")
+            return {"success": True, "output_path": str(kwargs["output_path"])}
+
+        with patch.object(PipelineRunner, "_run_tts") as mock_tts, \
+             patch.object(PipelineRunner, "_run_audio_mix") as mock_mix, \
+             patch("engine.pipeline.render_hardsub", side_effect=fake_render_hardsub) as mock_render:
+            runner._execute(
+                "job-resume-render",
+                {
+                    "workspace_dir": str(ws),
+                    "source_video": str(source_video),
+                    "source_subtitle": str(source_sub),
+                    "source_language": "en",
+                    "target_language": "en",
+                    "subtitle_mode": "source",
+                    "dubbing_enabled": True,
+                    "burn_subtitles": True,
+                    "resume_stage": "render",
+                },
+                CancellationToken(),
+            )
+
+        mock_tts.assert_not_called()
+        mock_mix.assert_not_called()
+        self.assertEqual(mock_render.call_args.kwargs["video_path"], dubbed_video)
 
     def test_low_vram_qwen_dub_unloads_tts_around_pipeline_stages(self):
         ws = Path(self.tmpdir)
