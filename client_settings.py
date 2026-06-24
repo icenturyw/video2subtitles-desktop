@@ -46,6 +46,8 @@ DEFAULT_SETTINGS = {
     "translation_concurrency": "2",
     "translation_max_batch_items": "10",
     "translation_quality": "fast",
+    "translation_preset_id": "",
+    "tts_preset_id": "",
     "default_target_language": "zh-CN",
     "subtitle_style_preset": "default",
     "tts_provider": "",

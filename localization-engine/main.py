@@ -207,10 +207,24 @@ def create_job(req: CreateJobRequest):
         "tts_provider": req.tts_provider,
         "tts_voice": req.tts_voice,
         "tts_concurrency": req.tts_concurrency,
-        "tts_options": req.tts_options,
+        "tts_options": dict(req.tts_options or {}),
         "original_volume": req.original_volume,
         "low_vram_mode": req.low_vram_mode,
+        "translation_preset_id": req.translation_preset_id,
+        "translation_preset_name": req.translation_preset_name,
+        "tts_preset_id": req.tts_preset_id,
+        "tts_preset_name": req.tts_preset_name,
     }
+    tts_secret_env = {
+        "volcengine_api_key": "VOLCENGINE_TTS_API_KEY",
+        "volcengine_app_id": "VOLCENGINE_TTS_APP_ID",
+        "volcengine_access_key": "VOLCENGINE_TTS_ACCESS_KEY",
+    }
+    for option_key, env_name in tts_secret_env.items():
+        secret = str(request_payload["tts_options"].get(option_key, "") or "").strip()
+        if secret:
+            os.environ[env_name] = secret
+            request_payload["tts_options"].pop(option_key, None)
     if req.translation:
         if req.translation.api_key:
             key_env = req.translation.api_key_env or "V2S_TRANSLATION_API_KEY"

@@ -61,6 +61,10 @@ class CreateJobRequest(BaseModel):
     original_volume: float = 0.0
     low_vram_mode: bool = True
     translation: Optional[TranslationRequest] = None
+    translation_preset_id: str = ""
+    translation_preset_name: str = ""
+    tts_preset_id: str = ""
+    tts_preset_name: str = ""
     style: Optional[StyleRequest] = None
 
 

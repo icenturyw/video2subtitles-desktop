@@ -1,0 +1,164 @@
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from provider_presets import (
+    ProviderPreset,
+    apply_translation_preset_to_settings,
+    apply_tts_preset_to_settings,
+    duplicate_provider_preset,
+    export_presets,
+    import_presets,
+    load_provider_presets,
+    migrate_legacy_settings_to_presets,
+    save_provider_presets,
+    set_default_provider_preset,
+)
+
+
+class TestProviderPresets(unittest.TestCase):
+    def test_save_load_and_single_default(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "presets.json"
+            presets = [
+                ProviderPreset(
+                    id="a",
+                    type="translation",
+                    name="A",
+                    provider="openai_compatible",
+                    isDefault=True,
+                    config={"apiKey": "k1"},
+                ),
+                ProviderPreset(
+                    id="b",
+                    type="translation",
+                    name="B",
+                    provider="openai_compatible",
+                    isDefault=True,
+                    config={"apiKey": "k2"},
+                ),
+            ]
+            save_provider_presets(presets, path)
+            loaded = load_provider_presets(path, migrate=False)
+            self.assertEqual(len(loaded), 2)
+            self.assertEqual(sum(1 for p in loaded if p.isDefault), 1)
+
+    def test_migrate_legacy_settings(self):
+        settings = {
+            "translation_provider": "openai_compatible",
+            "translation_base_url": "https://api.test/v1",
+            "translation_model": "gpt-test",
+            "translation_api_key": "secret",
+            "target_language_dialog": "zh-CN (简体中文)",
+            "tts_provider": "volcengine-doubao",
+            "tts_voice": "voice-a",
+            "tts_volcengine_api_key": "tts-secret",
+            "tts_volcengine_model": "seed",
+        }
+        presets = migrate_legacy_settings_to_presets(settings)
+        self.assertEqual({p.type for p in presets}, {"translation", "tts"})
+        trans = next(p for p in presets if p.type == "translation")
+        self.assertEqual(trans.config["baseUrl"], "https://api.test/v1")
+        tts = next(p for p in presets if p.type == "tts")
+        self.assertEqual(tts.config["voice"], "voice-a")
+
+    def test_apply_presets_to_settings(self):
+        settings = {}
+        trans = ProviderPreset(
+            id="t1",
+            type="translation",
+            name="Trans",
+            provider="openai_compatible",
+            config={
+                "apiKey": "secret",
+                "baseUrl": "https://api.test",
+                "model": "m",
+                "targetLanguage": "ja",
+                "concurrency": 4,
+            },
+        )
+        tts = ProviderPreset(
+            id="v1",
+            type="tts",
+            name="Voice",
+            provider="volcengine-doubao",
+            config={
+                "apiKey": "tts-secret",
+                "baseUrl": "https://tts.test",
+                "model": "seed",
+                "voice": "voice-b",
+                "sampleRate": 24000,
+                "minSentenceGapMs": 150,
+            },
+        )
+        applied = apply_translation_preset_to_settings(settings, trans)
+        applied = apply_tts_preset_to_settings(applied, tts)
+        self.assertEqual(applied["translation_api_key"], "secret")
+        self.assertEqual(applied["default_target_language"], "ja")
+        self.assertEqual(applied["tts_provider"], "volcengine-doubao")
+        self.assertEqual(applied["tts_segment_gap"], "0.15")
+
+    def test_duplicate_set_default_and_export_redacts_keys(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "presets.json"
+            export_path = Path(td) / "export.json"
+            save_provider_presets([
+                ProviderPreset(
+                    id="a",
+                    type="tts",
+                    name="Voice",
+                    provider="volcengine-doubao",
+                    isDefault=True,
+                    config={"apiKey": "secret", "volcengineAccessKey": "access"},
+                )
+            ], path)
+            clone = duplicate_provider_preset("a", path)
+            self.assertIsNotNone(clone)
+            set_default_provider_preset(clone.id, path)
+            loaded = load_provider_presets(path, migrate=False)
+            self.assertTrue(next(p for p in loaded if p.id == clone.id).isDefault)
+            export_presets(export_path, loaded)
+            exported = json.loads(export_path.read_text(encoding="utf-8"))
+            for item in exported["presets"]:
+                self.assertEqual(item["config"].get("apiKey"), "")
+                self.assertEqual(item["config"].get("volcengineAccessKey"), "")
+
+    def test_import_presets_renames_and_preserves_existing(self):
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "target.json"
+            source = Path(td) / "source.json"
+            save_provider_presets([
+                ProviderPreset(
+                    id="existing",
+                    type="translation",
+                    name="默认翻译配置",
+                    provider="openai_compatible",
+                    isDefault=True,
+                    config={},
+                )
+            ], target)
+            source.write_text(json.dumps({
+                "presets": [{
+                    "id": "incoming",
+                    "type": "translation",
+                    "name": "默认翻译配置",
+                    "provider": "openai_compatible",
+                    "enabled": True,
+                    "isDefault": True,
+                    "config": {},
+                }]
+            }, ensure_ascii=False), encoding="utf-8")
+            count = import_presets(source, target)
+            loaded = load_provider_presets(target, migrate=False)
+            self.assertEqual(count, 1)
+            self.assertEqual(len(loaded), 2)
+            self.assertEqual(sum(1 for p in loaded if p.isDefault), 1)
+            self.assertTrue(any("导入副本" in p.name for p in loaded))
+
+
+if __name__ == "__main__":
+    unittest.main()

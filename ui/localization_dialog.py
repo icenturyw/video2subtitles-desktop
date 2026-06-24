@@ -23,6 +23,14 @@ from PyQt5.QtWidgets import QButtonGroup
 
 from client_settings import apply_settings_to_env, get_effective_settings, save_settings
 from job_models import SubtitleStyle, TranslationConfig
+from provider_presets import (
+    apply_translation_preset_to_settings,
+    apply_tts_preset_to_settings,
+    get_default_provider_preset,
+    get_provider_preset,
+    load_provider_presets,
+)
+from ui.provider_presets_dialog import ProviderPresetsDialog
 
 try:
     import edge_tts
@@ -218,6 +226,7 @@ def _format_voice_label(voice: dict) -> str:
 
 def localization_runtime_config(settings: dict) -> dict | None:
     """Convert persisted localization settings into the config used by workers."""
+    settings = dict(settings or {})
     mode = str(settings.get("localization_mode", "subtitle") or "subtitle").strip()
     if mode == "subtitle":
         has_translation_config = bool(
@@ -231,6 +240,31 @@ def localization_runtime_config(settings: dict) -> dict | None:
             mode = "translate"
     if mode not in {"translate", "dub"}:
         return None
+
+    translation_preset_id = str(settings.get("translation_preset_id", "") or "").strip()
+    translation_preset = get_provider_preset(translation_preset_id, "translation") if translation_preset_id else None
+    if translation_preset and not translation_preset.enabled:
+        translation_preset = None
+    if not translation_preset:
+        translation_preset = get_default_provider_preset("translation")
+        if translation_preset:
+            translation_preset_id = translation_preset.id
+    if translation_preset:
+        settings = apply_translation_preset_to_settings(settings, translation_preset)
+        settings["translation_preset_id"] = translation_preset.id
+
+    tts_preset_id = str(settings.get("tts_preset_id", "") or "").strip()
+    tts_preset = get_provider_preset(tts_preset_id, "tts") if tts_preset_id else None
+    if tts_preset and not tts_preset.enabled:
+        tts_preset = None
+    if mode == "dub":
+        if not tts_preset:
+            tts_preset = get_default_provider_preset("tts")
+            if tts_preset:
+                tts_preset_id = tts_preset.id
+        if tts_preset:
+            settings = apply_tts_preset_to_settings(settings, tts_preset)
+            settings["tts_preset_id"] = tts_preset.id
 
     target_language = _language_code(
         settings.get("target_language_dialog", settings.get("default_target_language", "zh-CN")),
@@ -331,6 +365,10 @@ def localization_runtime_config(settings: dict) -> dict | None:
             "concurrency": int(settings.get("translation_concurrency", "2") or 2),
             "max_batch_items": int(settings.get("translation_max_batch_items", "10") or 10),
         },
+        "translation_preset_id": translation_preset.id if translation_preset else "",
+        "translation_preset_name": translation_preset.name if translation_preset else "",
+        "tts_preset_id": tts_preset.id if tts_preset else "",
+        "tts_preset_name": tts_preset.name if tts_preset else "",
     }
 
 
@@ -349,9 +387,11 @@ class LocalizationDialog(QDialog):
         self._settings = get_effective_settings()
         self._voice_request_id = 0
         self._preferred_tts_voice = self._settings.get("tts_voice", "")
+        self._loading_presets = False
         self._voices_loaded.connect(self._on_tts_voices_loaded)
         self._preview_done.connect(self._on_tts_preview_done)
         self._setup_ui()
+        self._refresh_preset_selectors()
         self._load_settings_to_ui()
 
     def _setup_ui(self):
@@ -411,6 +451,19 @@ class LocalizationDialog(QDialog):
         trans_form.setVerticalSpacing(10)
         trans_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.trans_group.setEnabled(True)
+
+        trans_preset_row = QWidget()
+        trans_preset_layout = QHBoxLayout(trans_preset_row)
+        trans_preset_layout.setContentsMargins(0, 0, 0, 0)
+        trans_preset_layout.setSpacing(6)
+        self.translation_preset_combo = QComboBox()
+        self.translation_preset_combo.setMinimumWidth(300)
+        self.translation_preset_combo.currentIndexChanged.connect(self._on_translation_preset_changed)
+        trans_preset_layout.addWidget(self.translation_preset_combo, 1)
+        self.translation_preset_manage_btn = QPushButton("管理")
+        self.translation_preset_manage_btn.clicked.connect(self._open_provider_presets)
+        trans_preset_layout.addWidget(self.translation_preset_manage_btn)
+        trans_form.addRow("翻译配置:", trans_preset_row)
 
         self.source_lang = QComboBox()
         self.source_lang.setMinimumWidth(360)
@@ -480,6 +533,19 @@ class LocalizationDialog(QDialog):
         tts_form.setVerticalSpacing(10)
         tts_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.tts_group.setEnabled(False)
+
+        tts_preset_row = QWidget()
+        tts_preset_layout = QHBoxLayout(tts_preset_row)
+        tts_preset_layout.setContentsMargins(0, 0, 0, 0)
+        tts_preset_layout.setSpacing(6)
+        self.tts_preset_combo = QComboBox()
+        self.tts_preset_combo.setMinimumWidth(300)
+        self.tts_preset_combo.currentIndexChanged.connect(self._on_tts_preset_changed)
+        tts_preset_layout.addWidget(self.tts_preset_combo, 1)
+        self.tts_preset_manage_btn = QPushButton("管理")
+        self.tts_preset_manage_btn.clicked.connect(self._open_provider_presets)
+        tts_preset_layout.addWidget(self.tts_preset_manage_btn)
+        tts_form.addRow("TTS 配置:", tts_preset_row)
 
         self.tts_provider = QComboBox()
         self.tts_provider.setMinimumWidth(360)
@@ -752,6 +818,145 @@ class LocalizationDialog(QDialog):
         buttons.rejected.connect(self.reject)
         root_layout.addWidget(buttons)
 
+    def _refresh_preset_selectors(self):
+        if not hasattr(self, "translation_preset_combo"):
+            return
+        self._loading_presets = True
+        try:
+            presets = load_provider_presets()
+            saved_translation_id = str(self._settings.get("translation_preset_id", "") or "")
+            saved_tts_id = str(self._settings.get("tts_preset_id", "") or "")
+
+            def fill(combo: QComboBox, preset_type: str, saved_id: str, empty_text: str):
+                combo.blockSignals(True)
+                combo.clear()
+                typed = [p for p in presets if p.type == preset_type and p.enabled]
+                if not typed:
+                    combo.addItem(empty_text, "")
+                    combo.setEnabled(False)
+                    combo.blockSignals(False)
+                    return
+                combo.setEnabled(True)
+                default_id = ""
+                for preset in typed:
+                    label = preset.name + ("（默认）" if preset.isDefault else "")
+                    combo.addItem(label, preset.id)
+                    if preset.isDefault:
+                        default_id = preset.id
+                target_id = saved_id if any(p.id == saved_id for p in typed) else default_id
+                if not target_id and typed:
+                    target_id = typed[0].id
+                for idx in range(combo.count()):
+                    if combo.itemData(idx) == target_id:
+                        combo.setCurrentIndex(idx)
+                        break
+                combo.blockSignals(False)
+
+            fill(self.translation_preset_combo, "translation", saved_translation_id, "请先添加翻译服务配置")
+            fill(self.tts_preset_combo, "tts", saved_tts_id, "请先添加 TTS 配音服务配置")
+        finally:
+            self._loading_presets = False
+
+    def _selected_translation_preset_id(self) -> str:
+        if not hasattr(self, "translation_preset_combo"):
+            return ""
+        return str(self.translation_preset_combo.currentData() or "").strip()
+
+    def _selected_tts_preset_id(self) -> str:
+        if not hasattr(self, "tts_preset_combo"):
+            return ""
+        return str(self.tts_preset_combo.currentData() or "").strip()
+
+    def _open_provider_presets(self):
+        dialog = ProviderPresetsDialog(self)
+        dialog.exec_()
+        self._refresh_preset_selectors()
+        self._apply_selected_translation_preset()
+        self._apply_selected_tts_preset()
+
+    def _on_translation_preset_changed(self, *_args):
+        if self._loading_presets:
+            return
+        self._apply_selected_translation_preset()
+
+    def _on_tts_preset_changed(self, *_args):
+        if self._loading_presets:
+            return
+        self._apply_selected_tts_preset()
+
+    def _apply_selected_translation_preset(self):
+        preset_id = self._selected_translation_preset_id()
+        preset = get_provider_preset(preset_id, "translation") if preset_id else None
+        if not preset:
+            return
+        settings = apply_translation_preset_to_settings(self._settings, preset)
+        self._settings.update(settings)
+        idx = self.trans_provider.findText(settings.get("translation_provider", "openai_compatible"))
+        if idx >= 0:
+            self.trans_provider.setCurrentIndex(idx)
+        self.trans_base_url.setText(settings.get("translation_base_url", ""))
+        self.trans_model.setText(settings.get("translation_model", ""))
+        self.trans_api_key.setText(settings.get("translation_api_key", ""))
+        idx = self.trans_api_type.findText(_api_type_label(settings.get("translation_api_type", "auto")))
+        if idx >= 0:
+            self.trans_api_type.setCurrentIndex(idx)
+        self.trans_timeout.setValue(int(settings.get("translation_timeout", 60) or 60))
+        self.trans_concurrency.setValue(int(settings.get("translation_concurrency", 2) or 2))
+        source = settings.get("source_language_dialog", "")
+        target = settings.get("target_language_dialog", "")
+        if source:
+            idx = self.source_lang.findText(source)
+            if idx >= 0:
+                self.source_lang.setCurrentIndex(idx)
+            elif self.source_lang.isEditable():
+                self.source_lang.setCurrentText(source)
+        if target:
+            idx = self.target_lang.findText(target)
+            if idx >= 0:
+                self.target_lang.setCurrentIndex(idx)
+
+    def _apply_selected_tts_preset(self):
+        preset_id = self._selected_tts_preset_id()
+        preset = get_provider_preset(preset_id, "tts") if preset_id else None
+        if not preset:
+            return
+        settings = apply_tts_preset_to_settings(self._settings, preset)
+        self._settings.update(settings)
+        provider = _provider_key(settings.get("tts_provider", "edge-tts"))
+        self.tts_provider.blockSignals(True)
+        for idx in range(self.tts_provider.count()):
+            if _provider_key(self.tts_provider.itemText(idx)) == provider:
+                self.tts_provider.setCurrentIndex(idx)
+                break
+        self.tts_provider.blockSignals(False)
+        self._preferred_tts_voice = settings.get("tts_voice", "")
+        self.tts_concurrency.setValue(int(settings.get("tts_concurrency", 1) or 1))
+        consistency_mode = str(settings.get("tts_consistency_mode", "stable") or "stable").lower()
+        for idx in range(self.tts_consistency_mode.count()):
+            if self.tts_consistency_mode.itemText(idx).startswith(consistency_mode):
+                self.tts_consistency_mode.setCurrentIndex(idx)
+                break
+        for idx in range(self.qwen_mode.count()):
+            if self.qwen_mode.itemText(idx).startswith(settings.get("tts_qwen_mode", "auto")):
+                self.qwen_mode.setCurrentIndex(idx)
+                break
+        self.qwen_instruct.setText(settings.get("tts_qwen_instruct", ""))
+        self.qwen_ref_audio.setText(settings.get("tts_qwen_ref_audio", ""))
+        self.qwen_ref_text.setText(settings.get("tts_qwen_ref_text", ""))
+        self.qwen_seed.setValue(int(settings.get("tts_qwen_seed", "42") or 42))
+        self.volcengine_endpoint.setText(settings.get("tts_volcengine_endpoint", _VOLCENGINE_DEFAULT_ENDPOINT))
+        self.volcengine_api_key.setText(settings.get("tts_volcengine_api_key", ""))
+        self.volcengine_app_id.setText(settings.get("tts_volcengine_app_id", ""))
+        self.volcengine_access_key.setText(settings.get("tts_volcengine_access_key", ""))
+        self.volcengine_resource_id.setText(settings.get("tts_volcengine_resource_id", _VOLCENGINE_DEFAULT_RESOURCE_ID))
+        self.volcengine_model.setText(settings.get("tts_volcengine_model", _VOLCENGINE_DEFAULT_MODEL))
+        idx = self.volcengine_format.findText(settings.get("tts_volcengine_format", "mp3"))
+        self.volcengine_format.setCurrentIndex(idx if idx >= 0 else 0)
+        self.volcengine_sample_rate.setValue(int(settings.get("tts_volcengine_sample_rate", "24000") or 24000))
+        self.volcengine_speech_rate.setValue(int(settings.get("tts_volcengine_speech_rate", "0") or 0))
+        self.volcengine_loudness_rate.setValue(int(settings.get("tts_volcengine_loudness_rate", "0") or 0))
+        self._on_tts_provider_changed(self.tts_provider.currentIndex())
+
     def _on_mode_changed(self):
         btn = self._mode_group.checkedButton()
         if btn is None:
@@ -865,6 +1070,8 @@ class LocalizationDialog(QDialog):
                 break
         self.tts_provider.blockSignals(False)
         self._on_tts_provider_changed(self.tts_provider.currentIndex())
+        self._apply_selected_translation_preset()
+        self._apply_selected_tts_preset()
 
     def _choose_qwen_ref_audio(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -1262,6 +1469,13 @@ class LocalizationDialog(QDialog):
         self._refresh_tts_voices()
 
     def _on_accept(self):
+        if (self.mode_translate.isChecked() or self.mode_dub.isChecked()) and not self._selected_translation_preset_id():
+            QMessageBox.warning(self, "缺少翻译配置", "请先添加翻译服务配置。")
+            return
+        if self.mode_dub.isChecked() and not self._selected_tts_preset_id():
+            QMessageBox.warning(self, "缺少 TTS 配置", "请先添加 TTS 配音服务配置。")
+            return
+
         # Save all dialog state
         if self.mode_translate.isChecked():
             self._settings["localization_mode"] = "translate"
@@ -1279,6 +1493,8 @@ class LocalizationDialog(QDialog):
         self._settings["translation_timeout"] = str(self.trans_timeout.value())
         self._settings["translation_concurrency"] = str(self.trans_concurrency.value())
         self._settings["translation_api_key"] = self.trans_api_key.text().strip()
+        self._settings["translation_preset_id"] = self._selected_translation_preset_id()
+        self._settings["tts_preset_id"] = self._selected_tts_preset_id()
         self._settings["subtitle_mode_dialog"] = self.subtitle_mode.currentText()
         self._settings["export_srt"] = "true" if self.export_srt.isChecked() else "false"
         self._settings["export_ass"] = "true" if self.export_ass.isChecked() else "false"
@@ -1374,6 +1590,8 @@ class LocalizationDialog(QDialog):
         self._settings["localization_mode"] = (
             "dub" if self.is_dub_mode else "translate" if self.is_translate_mode else "subtitle"
         )
+        self._settings["translation_preset_id"] = self._selected_translation_preset_id()
+        self._settings["tts_preset_id"] = self._selected_tts_preset_id()
         self._settings["source_language_dialog"] = self.source_lang.currentText()
         self._settings["target_language_dialog"] = self.target_lang.currentText()
         self._settings["subtitle_mode_dialog"] = self.subtitle_mode.currentText()

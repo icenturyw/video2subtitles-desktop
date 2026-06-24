@@ -1343,6 +1343,10 @@ class LocalizationWorker(QThread):
                 original_volume=cfg.get("original_volume", 0.0),
                 low_vram_mode=cfg.get("low_vram_mode", True),
                 translation=cfg.get("translation_config"),
+                translation_preset_id=cfg.get("translation_preset_id", ""),
+                translation_preset_name=cfg.get("translation_preset_name", ""),
+                tts_preset_id=cfg.get("tts_preset_id", ""),
+                tts_preset_name=cfg.get("tts_preset_name", ""),
             )
 
             if "error" in result:
@@ -2597,6 +2601,13 @@ class MainWindow(QMainWindow):
             is_url = entry.get("is_url", False)
             name = entry.get("title") or (Path(key).name if not is_url else key)
             detail = f"{lang} · {count} 条 · {time.strftime('%m-%d %H:%M', time.localtime(entry.get('timestamp', 0)))}"
+            preset_names = [
+                str(entry.get("translation_preset_name", "") or "").strip(),
+                str(entry.get("tts_preset_name", "") or "").strip(),
+            ]
+            preset_detail = " / ".join(p for p in preset_names if p)
+            if preset_detail:
+                detail = f"{detail} · 配置: {preset_detail}"
             item = QListWidgetItem(f"{name[:120]}\n{detail}")
             item.setToolTip(key)
             item.setData(Qt.UserRole, out_dir if out_dir and Path(out_dir).exists() else "")
@@ -2697,6 +2708,10 @@ class MainWindow(QMainWindow):
             entry["target_language"] = self._localization_config.get(
                 "target_language", entry.get("target_language", "")
             )
+            entry["translation_preset_id"] = self._localization_config.get("translation_preset_id", "")
+            entry["translation_preset_name"] = self._localization_config.get("translation_preset_name", "")
+            entry["tts_preset_id"] = self._localization_config.get("tts_preset_id", "")
+            entry["tts_preset_name"] = self._localization_config.get("tts_preset_name", "")
         self.history.put(file_path, entry)
 
     def _start_localization(self, file_path, srt_path):
@@ -2861,6 +2876,12 @@ class SettingsDialog(QDialog):
         self.service_combo.addItems(["local (本地 Whisper)", "groq (Groq API)", "openai (OpenAI API)"])
         form2.addRow("识别服务:", self.service_combo)
 
+        provider_btn = QPushButton("管理翻译 / TTS 服务配置")
+        provider_btn.setObjectName("btn_secondary")
+        provider_btn.setFixedHeight(34)
+        provider_btn.clicked.connect(self._open_provider_presets)
+        form2.addRow("服务配置:", provider_btn)
+
         layout.addWidget(group2)
 
         group3 = QGroupBox("输出设置")
@@ -2937,3 +2958,9 @@ class SettingsDialog(QDialog):
         else:
             self.conn_status.setText("❌ 连接失败，请检查服务器是否启动")
             self.conn_status.setStyleSheet(f"color: {THEME['error']}; font-weight: 600;")
+
+    def _open_provider_presets(self):
+        from ui.provider_presets_dialog import ProviderPresetsDialog
+
+        dialog = ProviderPresetsDialog(self)
+        dialog.exec_()

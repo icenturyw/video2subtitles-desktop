@@ -77,6 +77,10 @@ class LocalizationClient:
         original_volume: float = 0.0,
         low_vram_mode: bool = True,
         translation: Optional[Dict[str, Any]] = None,
+        translation_preset_id: str = "",
+        translation_preset_name: str = "",
+        tts_preset_id: str = "",
+        tts_preset_name: str = "",
         style: Optional[Dict[str, Any]] = None,
         job_id: str = "",
     ) -> Dict[str, Any]:
@@ -100,6 +104,10 @@ class LocalizationClient:
             "tts_options": tts_options or {},
             "original_volume": original_volume,
             "low_vram_mode": low_vram_mode,
+            "translation_preset_id": translation_preset_id,
+            "translation_preset_name": translation_preset_name,
+            "tts_preset_id": tts_preset_id,
+            "tts_preset_name": tts_preset_name,
         }
         if job_id:
             payload["job_id"] = job_id

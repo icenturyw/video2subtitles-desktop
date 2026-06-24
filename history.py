@@ -104,6 +104,10 @@ class HistoryManager:
         mode="subtitle",
         source_language="auto",
         target_language="",
+        translation_preset_id="",
+        translation_preset_name="",
+        tts_preset_id="",
+        tts_preset_name="",
         language="unknown",
         subtitle_count=0,
         srt_path="",
@@ -128,6 +132,10 @@ class HistoryManager:
             "mode": mode,
             "source_language": source_language,
             "target_language": target_language,
+            "translation_preset_id": translation_preset_id,
+            "translation_preset_name": translation_preset_name,
+            "tts_preset_id": tts_preset_id,
+            "tts_preset_name": tts_preset_name,
             "timestamp": time.time(),
         }
 
