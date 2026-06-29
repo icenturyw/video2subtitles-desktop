@@ -17,9 +17,18 @@ def adjust_timing(
     output_audio: Path,
     actual_duration: float,
     target_duration: float,
+    *,
+    hard_clip: bool = False,
+    max_overflow_sec: float = 0.12,
+    fade_out_sec: float = 0.035,
 ) -> Tuple[float, str, float]:
-    """Apply atempo (and optional fade-out) to approach the target duration.
-    
+    """Apply atempo to approach the target duration.
+
+    When ``hard_clip`` is enabled, the adjusted audio is also bounded to the
+    target window with a very short fade-out.  This mirrors VideoLingo's
+    practical dubbing guardrail: speed up first, but never let a segment bleed
+    far into the next subtitle window.
+
     Returns:
         (adjusted_duration, warning, speed_ratio) where speed_ratio is
         the applied tempo (1.0 = no change).
@@ -45,7 +54,24 @@ def adjust_timing(
         speed = required_speed
         warning = ""
 
+    adjusted = actual_duration / speed if speed else actual_duration
     filters = _atempo_chain(speed)
+
+    overflow = adjusted - target_duration
+    should_clip = bool(hard_clip and overflow > max(0.0, float(max_overflow_sec)))
+    if should_clip:
+        fade = max(0.0, min(float(fade_out_sec), target_duration / 3.0))
+        if fade > 0.001:
+            fade_start = max(0.0, target_duration - fade)
+            filters.append(f"afade=t=out:st={fade_start:.3f}:d={fade:.3f}")
+        filters.append(f"atrim=duration={target_duration:.3f}")
+        filters.append("asetpts=N/SR/TB")
+        clip_note = (
+            f"hard clipped overflow {overflow:.2f}s to target window "
+            f"{target_duration:.2f}s"
+        )
+        warning = f"{warning}; {clip_note}" if warning else f"timing_warning: {clip_note}"
+        adjusted = target_duration
 
     try:
         subprocess.run(
@@ -59,10 +85,6 @@ def adjust_timing(
             check=True,
             **hidden_subprocess_kwargs(),
         )
-        if required_speed > MAX_SPEED:
-            adjusted = actual_duration / speed if speed else actual_duration
-            return adjusted, warning, speed
-        adjusted = actual_duration / speed if speed else actual_duration
         return adjusted, warning, speed
     except Exception as e:
         import shutil

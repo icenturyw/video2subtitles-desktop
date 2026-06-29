@@ -1,7 +1,16 @@
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
+
+import unittest
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+try:
+    import PyQt5  # noqa: F401
+except Exception as exc:  # pragma: no cover - optional GUI dependency may be absent in CI
+    raise unittest.SkipTest("PyQt5 is not installed") from exc
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "localization-engine"))
@@ -73,7 +82,7 @@ def test_saved_subtitle_mode_disables_localization_runtime_config():
     assert cfg is None
 
 
-def test_subtitle_mode_auto_enables_translation_when_provider_is_configured():
+def test_subtitle_mode_ignores_translation_config():
     cfg = localization_runtime_config({
         "localization_mode": "subtitle",
         "translation_base_url": "https://example.test/v1",
@@ -81,10 +90,7 @@ def test_subtitle_mode_auto_enables_translation_when_provider_is_configured():
         "target_language_dialog": "zh-CN (简体中文)",
     })
 
-    assert cfg is not None
-    assert cfg["is_translate_mode"] is True
-    assert cfg["is_dub_mode"] is False
-    assert cfg["target_language"] == "zh-CN"
+    assert cfg is None
 
 
 def test_saved_dub_mode_sets_dubbing_provider():

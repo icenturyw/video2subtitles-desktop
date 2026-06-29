@@ -38,6 +38,11 @@ if str(PROJECT_DIR) not in sys.path:
 for directory in (TEMP_DIR, CACHE_DIR, RAW_DIR):
     directory.mkdir(parents=True, exist_ok=True)
 
+from subtitle_utils import (  # noqa: E402
+    find_repeated_subtitle_runs,
+    normalize_subtitle_timeline,
+)
+
 API_AUTH_KEY = os.environ.get("API_AUTH_KEY", "")
 MODEL_LOCK = threading.Lock()
 MODEL = None
@@ -695,6 +700,20 @@ def _split_text(text: str, max_len: int = 32) -> list[str]:
     return final or [text]
 
 
+def _initial_prompt_for_language(language: str) -> Optional[str]:
+    """Return a safe Whisper prompt for explicit source languages only.
+
+    The old implementation always used a Simplified Chinese prompt.  That is
+    harmful for Korean/Japanese/English news: Whisper is nudged to hallucinate
+    Chinese-looking text, which later gets dubbed by TTS.  For ``auto`` we avoid
+    any prompt and let language detection do its job.
+    """
+    lang = str(language or "auto").strip().lower()
+    if lang in {"zh", "zh-cn", "zh-hans", "cmn", "yue"}:
+        return "以下是中文普通话音频，请准确转写为简体中文，不要添加原文没有的内容。"
+    return None
+
+
 def _transcribe_file(path: Path, task_id: str, language: str = "auto") -> tuple[list[dict[str, Any]], str]:
     _raise_if_cancelled(task_id)
     _update_task(task_id, "transcribing", 20, "正在加载 Whisper 模型...")
@@ -702,14 +721,20 @@ def _transcribe_file(path: Path, task_id: str, language: str = "auto") -> tuple[
     _raise_if_cancelled(task_id)
     _update_task(task_id, "transcribing", 30, "正在本地识别...")
 
-    segments, info = model.transcribe(
-        str(path),
-        language=None if not language or language == "auto" else language,
-        beam_size=1,
-        vad_filter=True,
-        vad_parameters={"min_silence_duration_ms": 1000},
-        initial_prompt="以下是普通话的句子，请用简体中文。",
-    )
+    prompt = _initial_prompt_for_language(language)
+    transcribe_kwargs = {
+        "language": None if not language or language == "auto" else language,
+        "beam_size": 1,
+        "vad_filter": True,
+        "vad_parameters": {"min_silence_duration_ms": 700},
+        "condition_on_previous_text": False,
+        "compression_ratio_threshold": 2.4,
+        "no_speech_threshold": 0.6,
+    }
+    if prompt:
+        transcribe_kwargs["initial_prompt"] = prompt
+
+    segments, info = model.transcribe(str(path), **transcribe_kwargs)
 
     detected_lang = getattr(info, "language", None) or language or "unknown"
     duration = float(getattr(info, "duration", 0) or 0)
@@ -724,7 +749,7 @@ def _transcribe_file(path: Path, task_id: str, language: str = "auto") -> tuple[
         end = float(getattr(segment, "end", start) or start)
         split_parts = _split_text(text)
         if len(split_parts) <= 1:
-            subtitles.append({"start": round(start, 2), "end": round(end + 0.1, 2), "text": text})
+            subtitles.append({"start": round(start, 3), "end": round(end, 3), "text": text})
         else:
             total_chars = sum(len(p) for p in split_parts) or 1
             cursor = start
@@ -732,12 +757,18 @@ def _transcribe_file(path: Path, task_id: str, language: str = "auto") -> tuple[
             for part in split_parts:
                 part_duration = seg_duration * (len(part) / total_chars)
                 part_end = cursor + part_duration
-                subtitles.append({"start": round(cursor, 2), "end": round(part_end + 0.1, 2), "text": part})
+                subtitles.append({"start": round(cursor, 3), "end": round(part_end, 3), "text": part})
                 cursor = part_end
+        subtitles = normalize_subtitle_timeline(subtitles)
         if duration > 0:
             progress = min(95, 30 + int((end / duration) * 65))
             if progress % 5 == 0:
                 _update_task(task_id, "transcribing", progress, f"正在识别 {int(end)}s / {int(duration)}s...", subtitles=subtitles, detected_language=detected_lang)
+
+    subtitles = normalize_subtitle_timeline(subtitles)
+    repeated_runs = find_repeated_subtitle_runs(subtitles)
+    if repeated_runs:
+        logger.warning("Suspicious repeated subtitle runs detected: %s", repeated_runs[:5])
 
     return subtitles, detected_lang
 

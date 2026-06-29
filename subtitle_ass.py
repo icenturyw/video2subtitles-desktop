@@ -142,8 +142,9 @@ def segments_to_ass(segments: List[SubtitleSegment], style: SubtitleStyle,
         if mode == "source":
             lines.append(_dialog_line(_PRIMARY_LAYER, seg.start, seg.end, "Default", source_text))
         elif mode == "translated":
-            text = trans_text or source_text
-            lines.append(_dialog_line(_PRIMARY_LAYER, seg.start, seg.end, "Default", text))
+            if not trans_text:
+                continue
+            lines.append(_dialog_line(_PRIMARY_LAYER, seg.start, seg.end, "Default", trans_text))
         elif mode == "bilingual":
             if trans_text:
                 lines.append(_dialog_line(_SECONDARY_LAYER, seg.start, seg.end, "Source", source_text))

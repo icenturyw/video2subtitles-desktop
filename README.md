@@ -46,11 +46,16 @@
 - **双语+样式字幕** — 支持原文、译文、双语 ASS/SSA 字幕，可自定义字体、大小、轮廓、阴影和边距
 - **硬字幕烧录** — 通过 FFmpeg 将字幕直接烧录到视频画面，支持质量预设（快速/平衡/高质量）
 - **配音音色与试听** — 配音模式支持 Edge-TTS、本地 Qwen3-TTS 与火山引擎豆包 TTS，目标语言变化时自动刷新音色列表，并可生成试听音频
+- **内置 Qwen3-TTS 默认配置** — 新安装或未创建 TTS Provider Preset 时，会自动提供「本地 Qwen3-TTS」配置，默认音色 Vivian、stable 一致性模式，便于直接启用本地配音
+- **服务配置音色下拉** — TTS Provider Preset 编辑窗口的音色字段改为可编辑下拉框，选择 `qwen3-tts` 时会展示 Vivian、Serena 等内置音色，也支持手动输入自定义音色
+- **当前音色优先** — 生成配音任务时，用户在本地化设置里当前选择的音色优先于 Provider Preset 的默认音色，避免选择 Serena/Dylan 后又被「本地 Qwen3-TTS」默认 Vivian 覆盖
+- **退出自动停止后台服务** — 关闭主窗口时默认停止 Whisper、本地化引擎和 Qwen3-TTS sidecar，避免 Qwen3-TTS 模型继续占用显存；可用 `V2S_STOP_SIDECARS_ON_EXIT=false` 保留后台服务
 - **火山引擎豆包 TTS** — 新增 `VolcengineDoubaoTTSProvider`，支持 X-Api-Key 与 AppId+AccessKey 两种认证方式，可配置资源 ID、模型、音频格式、采样率、语速、音量等参数
 - **流水线阶段重试** — 本地化任务支持从任意阶段（翻译/字幕导出/TTS/音频混合/渲染）重新执行，避免全量重跑
 - **单任务取消** — 右键菜单可单独停止正在进行的任务，不再只有全局停止
 - **精确 TTS 音频裁剪** — 多段合并的 TTS chunk 使用 `atrim` 滤波器按时间窗口精确提取逐段音频，替代原字符比例估算
-- **字幕时间轴保护** — stable/strict 配音分块会按字幕间隔和时间跨度拆分，避免跨长静音合成后把后续语音提前切入；音频混合优先使用本轮 `audio/tts/index.json` 防止旧音频残留混入
+- **字幕时间轴保护** — stable/strict 配音分块会按字幕间隔、时间跨度和语速压力拆分，避免跨长静音合成后把后续语音提前切入；音频混合优先使用本轮 `audio/tts/index.json` 防止旧音频残留混入
+- **TTS 时间规划器** — 新增 `localization-engine/tts/planner.py`，在合成前计算 gap、可借用空白、估算朗读时长、可用时长和 speed pressure，并写入 `tts_timeline_report.json` 方便排查吞音/提前/重叠
 - **翻译完整性保护** — 配音模式下如果翻译缺失导致原文送入 TTS，流水线会以 `TRANSLATION_INCOMPLETE` 明确报错
 - **音频混合可取消** — 所有 FFmpeg 子进程支持回调检测取消信号，混合/合成过程可快速终止
 - **用户视角主界面** — 主界面按「添加视频 → 开始处理 → 查看结果」重排为任务卡片，顶部只保留状态、输出目录、翻译/配音和设置入口，减少按钮拥挤
@@ -108,8 +113,14 @@ python tools/package_source.py --output video2subtitles-source-package.zip
 
 ### 2026-06 — 字幕样式微调、TTS 时序优化与音频混合改进
 
+- **内置 Qwen3-TTS 默认配置**：Provider Presets 现在会在没有 TTS 配置时自动加入「本地 Qwen3-TTS」默认配置；若已有其它默认 TTS 配置，则仅补充 Qwen3-TTS 选项，不覆盖用户默认选择。
+- **服务配置音色下拉修复**：`ProviderPresetEditDialog` 的 TTS 服务商改为可编辑下拉选择，音色字段改为可编辑下拉框；选择 `qwen3-tts` 时会直接列出 Vivian、Serena、Uncle_Fu 等内置音色，并保留自定义音色输入能力。
+- **当前音色优先级修复**：运行配音任务时 `localization_runtime_config()` 会保留用户当前选择的 `tts_voice`，不再让 TTS Provider Preset 的默认 `voice` 覆盖当前选择，修复 Qwen3-TTS 一直使用 Vivian 的问题。
+- **退出自动停止后台服务**：`app.py` 在 `QApplication.aboutToQuit` 和事件循环退出后统一调用 `shutdown_sidecars_on_exit()`，默认停止 Whisper、本地化引擎和 Qwen3-TTS sidecar，防止主窗口关闭后后台进程继续占用端口或显存；如需常驻服务可设置 `V2S_STOP_SIDECARS_ON_EXIT=false`。
 - **安全源码打包脚本**：新增 `tools/package_source.py`，用于生成可发送给 AI 辅助排查的源码 zip；默认排除模型、缓存、输出目录、音视频、cookies、`.env*`、密钥证书、虚拟环境和本地桥接目录，并在压缩包内写入 `PACKAGE_MANIFEST.json` 便于复核；同时修复隐藏文件名前缀被错误去掉的问题。
-- **TTS 字幕同步修复**：stable/strict 模式下 `build_tts_chunks` 会按字幕 gap 和时间跨度拆分 chunk，防止长间隔字幕被合成为连续语音；TTS 阶段新增 `tts_timeline_report.json`，音频混合阶段优先使用本轮 `index.json`，避免旧 `seg_*.wav` 残留造成错配。
+- **TTS 字幕同步修复**：stable/strict 模式下 `build_tts_chunks` 会按字幕 gap、时间跨度和 planner 语速压力拆分 chunk，防止长间隔字幕或高压缩需求字幕被合成为连续语音；TTS 阶段新增 `tts_timeline_report.json`，音频混合阶段优先使用本轮 `index.json`，避免旧 `seg_*.wav` 残留造成错配。
+- **TTS 时间规划器**：新增 `localization-engine/tts/planner.py`，在合成前为每条字幕计算 `gap_to_next`、`tolerance`、`available_duration`、`estimated_duration`、`speed_factor` 和 `speed_pressure`，并生成 chunk 级 `keep_gaps` / `split_reason` 诊断信息，借鉴 VideoLingo 的配音规划思路但保持原字幕时间轴不变。
+- **Qwen3-TTS 音色选择修复**：选择 `qwen3-tts` 后会立即显示内置默认音色并保持下拉框可选，即使本地 Qwen3-TTS 服务未启动或 `/voices` 响应较慢，也不会卡在“加载中...”导致无法选择音色；后台刷新成功后会自动替换为服务返回音色。
 - **字幕字号调整**：所有内置样式预设（default/netflix/youtube/bilingual/mobile_vertical）的 `font_size` 整体下调，以适配更多屏幕尺寸和嵌入场景；`margin_v` 微调，移动端竖屏样式边距从 80 调整为 60。
 - **精确 TTS 时序控制**：速度约束范围收紧（MAX_SPEED 2.0→1.5，MAX_SLOW 0.75→0.8），`atempo` 失败时不再暴力裁剪音频，改为保留原始音频，避免音质劣化。目标时长计算引入 `nominal * 0.9` 下界，使 TTS 朗读节奏更自然。
 - **沉默边界检测切分**：`timing.py` 新增 `detect_silence_boundaries()`，对合并 TTS chunk 使用 FFmpeg silencedetect 探测自然停顿点，实现逐段精确时间窗口划分；沉默检测不足时回退字符比例估算。
@@ -355,6 +366,7 @@ chatgpt_package/      # 生成 ChatGPT 包后出现
 | `V2S_DOWNLOAD_QUALITY` | 可选。下载质量：`best`、`720p`、`480p`；默认 `best` |
 | `V2S_KEEP_DOWNLOADED_VIDEO` | 可选。是否保留下载视频：`true` / `false`；默认 `true` |
 | `V2S_PROXY` | 可选。在线视频标题预取和 yt-dlp 下载使用的代理地址；留空表示直连 |
+| `V2S_STOP_SIDECARS_ON_EXIT` | 可选。关闭主窗口时是否停止 Whisper、本地化引擎和 Qwen3-TTS 后台服务：`true` / `false`；默认 `true` |
 | `VOLCENGINE_TTS_ENDPOINT` | 可选。火山引擎豆包 TTS API 地址；默认 `https://openspeech.bytedance.com/api/v3/tts/unidirectional` |
 | `VOLCENGINE_TTS_API_KEY` | 可选。X-Api-Key 认证密钥（新控制台推荐） |
 | `VOLCENGINE_TTS_APP_ID` | 可选。AppId 认证（旧控制台） |
@@ -412,6 +424,15 @@ python app.py
 
 ```text
 .cache/whisper-service.log
+.cache/localization-service.log
+.cache/qwen3-tts-service.log
+```
+
+默认关闭主窗口时会停止这些后台服务。如果你想在重启桌面端时保留服务和已加载的 Qwen3-TTS 模型，可在启动前设置：
+
+```bat
+set V2S_STOP_SIDECARS_ON_EXIT=false
+python app.py
 ```
 
 如果客户端没有显示在线服务已连接，请优先检查：
@@ -537,7 +558,8 @@ video_2_subtitles/
 │   ├── engine/         # Pipeline 编排 / Pipeline orchestrator
 │   ├── subtitles/      # 字幕读写、标准化、验证 / Subtitle I/O & validation
 │   ├── translation/    # 翻译提供者、批处理、术语表 / Translation providers
-│   ├── tts/            # TTS 提供者（Qwen3 / Volcengine Doubao）/ TTS providers
+│   ├── tts/            # TTS 提供者、时间规划和分块 / TTS providers, planning and chunking
+│   │   ├── planner.py   # TTS 时间规划器 / TTS timeline planner
 │   │   └── volcengine_tts.py # 火山引擎豆包 TTS / Volcengine Doubao TTS
 │   ├── audio/          # 音频混合、标准化 / Audio mixing & normalization
 │   └── rendering/      # FFmpeg 滤镜和编码预设 / FFmpeg filters & presets
@@ -583,6 +605,8 @@ video_2_subtitles/
 2. 在“TTS 配音服务”页点击“新增”。
 3. 填写配置名称、服务商、API 地址、模型、音色、格式、采样率、并发、句间隔和时长对齐等参数。
 4. Qwen3-TTS、Edge-TTS、Windows SAPI、火山引擎豆包 TTS 可以分别保存为不同配置。
+
+如果本机还没有任何 TTS 配置，系统会自动提供「本地 Qwen3-TTS」默认配置：服务商为 `qwen3-tts`，默认音色 `Vivian`，一致性模式 `stable`。如果用户已经有其它默认 TTS 配置，系统只会补充 Qwen3-TTS 选项，不会抢占用户原来的默认配置。编辑 TTS 配置时，服务商和音色都是可编辑下拉框；选择 `qwen3-tts` 后音色下拉会列出 Vivian、Serena、Uncle_Fu、Dylan、Eric、Ryan、Aiden、Ono_Anna、Sohee，同时仍允许输入自定义 speaker 名称。生成任务时，本地化设置中当前选择的音色优先级高于 Provider Preset 的默认音色，因此可以临时从 Vivian 切到 Serena/Dylan 而不必修改预设本身。
 
 ### 设置默认配置
 

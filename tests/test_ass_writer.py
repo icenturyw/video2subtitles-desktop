@@ -32,8 +32,8 @@ class TestAssWriter(unittest.TestCase):
     def test_ass_translated_only(self):
         content = segments_to_ass(self.segments, self.style, mode="translated")
         self.assertIn("第二行", content)
-        # Segments without translation fall back to source text
-        self.assertIn("Hello World", content)
+        # Target-only output must not fall back to source-language text.
+        self.assertNotIn("Hello World", content)
 
     def test_ass_bilingual(self):
         content = segments_to_ass(self.segments, self.style, mode="bilingual")

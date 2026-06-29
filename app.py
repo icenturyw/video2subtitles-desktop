@@ -49,6 +49,33 @@ from services.sidecar_manager import SidecarManager
 _whisper_manager: SidecarManager | None = None
 _localization_manager: SidecarManager | None = None
 _qwen3_tts_manager: SidecarManager | None = None
+_sidecars_shutting_down = False
+_sidecars_shutdown_done = False
+
+
+def _env_flag_enabled(value: str | None, *, default: bool = True) -> bool:
+    """Parse a user-facing boolean environment/config value."""
+    if value is None:
+        return default
+    return str(value).strip().lower() not in ("0", "false", "no", "off", "disable", "disabled")
+
+
+def _should_stop_sidecars_on_exit() -> bool:
+    """Return whether application exit should stop bundled sidecar services.
+
+    Defaults to True because Whisper/Localization/Qwen3-TTS are app-managed
+    helper services and Qwen3-TTS may keep GPU memory allocated after the UI
+    closes. Advanced users can keep services alive by setting either
+    V2S_STOP_SIDECARS_ON_EXIT=false or stop_sidecars_on_exit=false in settings.
+    """
+    env_value = os.environ.get("V2S_STOP_SIDECARS_ON_EXIT")
+    if env_value is not None:
+        return _env_flag_enabled(env_value, default=True)
+    try:
+        settings = get_effective_settings()
+        return _env_flag_enabled(settings.get("stop_sidecars_on_exit"), default=True)
+    except Exception:
+        return True
 
 
 def _set_service_status(status, detail=""):
@@ -133,6 +160,9 @@ def _build_qwen3_tts_manager() -> SidecarManager:
 def _ensure_whisper_server() -> bool:
     """Start the Whisper sidecar. Checks for device mismatch and restarts if needed."""
     global _whisper_manager
+    if _sidecars_shutting_down:
+        _set_service_status("stopping", "应用正在退出，跳过启动本地 Whisper 服务。")
+        return False
     if _whisper_manager is None:
         _whisper_manager = _build_whisper_manager()
 
@@ -167,6 +197,9 @@ def restart_whisper_server():
 def _ensure_localization_engine() -> bool:
     """Start the Localization Engine sidecar if auto-start is enabled."""
     global _localization_manager
+    if _sidecars_shutting_down:
+        _set_localization_status("stopping", "应用正在退出，跳过启动本地化引擎。")
+        return False
 
     settings = get_effective_settings()
     auto_start = settings.get("localization_engine_auto_start", "true")
@@ -183,6 +216,9 @@ def _ensure_localization_engine() -> bool:
 def ensure_qwen3_tts_engine() -> bool:
     """Start the Qwen3-TTS sidecar. Returns True if healthy."""
     global _qwen3_tts_manager
+    if _sidecars_shutting_down:
+        _set_qwen3_tts_status("stopping", "应用正在退出，跳过启动 Qwen3-TTS 服务。")
+        return False
     if _qwen3_tts_manager is None:
         _qwen3_tts_manager = _build_qwen3_tts_manager()
     return _qwen3_tts_manager.ensure_running()
@@ -193,6 +229,56 @@ def shutdown_qwen3_tts_engine():
     global _qwen3_tts_manager
     if _qwen3_tts_manager is not None:
         _qwen3_tts_manager.shutdown()
+        _qwen3_tts_manager = None
+
+
+def _shutdown_manager(manager: SidecarManager | None, name: str) -> None:
+    if manager is None:
+        return
+    try:
+        manager.shutdown()
+    except Exception as exc:
+        try:
+            print(f"停止 {name} 服务失败: {exc}", file=sys.stderr)
+        except Exception:
+            pass
+
+
+def shutdown_sidecars_on_exit() -> None:
+    """Stop app-managed sidecar services when the desktop app exits.
+
+    This intentionally also builds managers for known bundled service ports so
+    services started from secondary windows (for example the Qwen3-TTS manager
+    dialog) are not left orphaned after the main window is closed. Set
+    V2S_STOP_SIDECARS_ON_EXIT=false to keep them running across UI restarts.
+    """
+    global _whisper_manager, _localization_manager, _qwen3_tts_manager
+    global _sidecars_shutting_down, _sidecars_shutdown_done
+
+    if _sidecars_shutdown_done:
+        return
+    _sidecars_shutdown_done = True
+
+    if not _should_stop_sidecars_on_exit():
+        return
+
+    _sidecars_shutting_down = True
+
+    qwen_manager = _qwen3_tts_manager or _build_qwen3_tts_manager()
+    localization_manager = _localization_manager or _build_localization_manager()
+    whisper_manager = _whisper_manager or _build_whisper_manager()
+
+    # Stop high-memory/GPU services first, then supporting services.
+    for manager, name in (
+        (qwen_manager, "Qwen3-TTS"),
+        (localization_manager, "Localization Engine"),
+        (whisper_manager, "Whisper"),
+    ):
+        _shutdown_manager(manager, name)
+
+    _qwen3_tts_manager = None
+    _localization_manager = None
+    _whisper_manager = None
 
 
 def get_qwen3_tts_manager() -> Optional[SidecarManager]:
@@ -240,10 +326,14 @@ def main():
     except Exception:
         pass  # Do not block app startup
 
+    app.aboutToQuit.connect(shutdown_sidecars_on_exit)
+
     window = MainWindow()
     window.show()
 
-    sys.exit(app.exec_())
+    exit_code = app.exec_()
+    shutdown_sidecars_on_exit()
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

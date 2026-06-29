@@ -26,7 +26,9 @@ def segments_to_srt(segments: List[SubtitleSegment], mode: str = "source") -> st
         if mode == "source":
             text = source_text
         elif mode == "translated":
-            text = trans_text or source_text
+            if not trans_text:
+                continue
+            text = trans_text
         elif mode == "bilingual":
             text = source_text
             if trans_text:
@@ -53,7 +55,9 @@ def segments_to_vtt(segments: List[SubtitleSegment], mode: str = "source") -> st
         if mode == "bilingual" and trans_text:
             text = f"{source_text}\n{trans_text}"
         elif mode == "translated":
-            text = trans_text or source_text
+            if not trans_text:
+                continue
+            text = trans_text
         srt_list.append({
             "start": seg.start,
             "end": seg.end,
@@ -72,7 +76,9 @@ def segments_to_txt(segments: List[SubtitleSegment], mode: str = "source") -> st
         if mode == "bilingual" and trans_text:
             text = f"{source_text}\n{trans_text}"
         elif mode == "translated":
-            text = trans_text or source_text
+            if not trans_text:
+                continue
+            text = trans_text
         srt_list.append({
             "start": seg.start,
             "end": seg.end,

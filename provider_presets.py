@@ -16,6 +16,9 @@ ProviderTestStatus = Literal["success", "failed", "unknown"]
 
 PRESETS_PATH = SETTINGS_DIR / "provider-presets.json"
 
+BUILTIN_QWEN3_TTS_PRESET_ID = "builtin-tts-qwen3"
+BUILTIN_QWEN3_TTS_VOICE = "Vivian"
+
 
 @dataclass
 class ProviderPreset:
@@ -82,6 +85,71 @@ def _bool(value: Any, default: bool = False) -> bool:
 def _language_code(text: Any, default: str) -> str:
     value = str(text or "").split("(", 1)[0].strip()
     return value or default
+
+
+def builtin_provider_presets(now: Optional[str] = None) -> List[ProviderPreset]:
+    """Return built-in service presets available on a clean install.
+
+    These presets are safe defaults only; they do not contain API keys or
+    user-specific paths. They make local providers visible before the user has
+    created any custom Provider Presets.
+    """
+    stamp = now or _now()
+    return [
+        ProviderPreset(
+            id=BUILTIN_QWEN3_TTS_PRESET_ID,
+            type="tts",
+            name="本地 Qwen3-TTS",
+            provider="qwen3-tts",
+            enabled=True,
+            isDefault=True,
+            createdAt=stamp,
+            updatedAt=stamp,
+            config={
+                "model": "",
+                "voice": BUILTIN_QWEN3_TTS_VOICE,
+                "sampleRate": 24000,
+                "concurrency": 1,
+                "minSentenceGapMs": 40,
+                "maxAudioStretchRatio": 1.15,
+                "enableDurationAlign": True,
+                "consistencyMode": "stable",
+                "qwenMode": "auto",
+                "qwenInstruct": "",
+                "qwenRefAudio": "",
+                "qwenRefText": "",
+                "qwenSeed": "42",
+                "qwenTemperature": "",
+                "qwenTopP": "",
+                "qwenMaxNewTokens": "",
+                "provider": "qwen3-tts",
+            },
+        )
+    ]
+
+
+def ensure_builtin_provider_presets(presets: List[ProviderPreset]) -> tuple[List[ProviderPreset], bool]:
+    """Merge built-in presets without overriding user-created defaults."""
+    merged = list(presets)
+    changed = False
+    existing_ids = {p.id for p in merged}
+    existing_tts_providers = {p.provider for p in merged if p.type == "tts"}
+    has_tts_default = any(p.type == "tts" and p.enabled and p.isDefault for p in merged)
+
+    for preset in builtin_provider_presets():
+        if preset.id in existing_ids or preset.provider in existing_tts_providers:
+            continue
+        preset.isDefault = not has_tts_default
+        if preset.isDefault:
+            has_tts_default = True
+        merged.append(preset)
+        existing_ids.add(preset.id)
+        existing_tts_providers.add(preset.provider)
+        changed = True
+
+    if changed:
+        merged = _ensure_single_default_per_type(merged)
+    return merged, changed
 
 
 def _normalize_preset(data: Dict[str, Any]) -> Optional[ProviderPreset]:
@@ -160,11 +228,24 @@ def save_provider_presets(presets: List[ProviderPreset], path: Path = PRESETS_PA
     return cleaned
 
 
-def load_provider_presets(path: Path = PRESETS_PATH, migrate: bool = True) -> List[ProviderPreset]:
+def load_provider_presets(
+    path: Path = PRESETS_PATH,
+    migrate: bool = True,
+    include_builtins: Optional[bool] = None,
+) -> List[ProviderPreset]:
     presets = _load_raw(path)
+    should_include_builtins = path == PRESETS_PATH if include_builtins is None else include_builtins
+
     if presets or not migrate:
+        if should_include_builtins:
+            presets, changed = ensure_builtin_provider_presets(presets)
+            if changed and path == PRESETS_PATH:
+                save_provider_presets(presets, path)
         return presets
+
     migrated = migrate_legacy_settings_to_presets()
+    if should_include_builtins:
+        migrated, _ = ensure_builtin_provider_presets(migrated)
     if migrated and path == PRESETS_PATH:
         save_provider_presets(migrated, path)
     return migrated
@@ -315,27 +396,42 @@ def translation_config_from_settings(settings: Dict[str, Any]) -> Dict[str, Any]
         "sourceLanguage": _language_code(settings.get("source_language_dialog"), "auto"),
         "targetLanguage": _language_code(settings.get("target_language_dialog"), _str(settings.get("default_target_language"), "zh-CN") or "zh-CN"),
         "temperature": _float(settings.get("translation_temperature"), 0.3),
-        "maxBatchItems": _int(settings.get("translation_max_batch_items"), 10),
-        "concurrency": _int(settings.get("translation_concurrency"), 2),
+        "maxBatchItems": _int(settings.get("translation_max_batch_items"), 50),
+        "concurrency": _int(settings.get("translation_concurrency"), 4),
         "retries": _int(settings.get("translation_retry_count"), 3),
         "timeout": _int(settings.get("translation_timeout"), 60),
         "qualityMode": _str(settings.get("translation_quality"), "fast") or "fast",
+        "outputFormat": _str(settings.get("translation_output_format"), "compact") or "compact",
     }
 
 
 def tts_config_from_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
     provider = _str(settings.get("tts_provider"), "edge-tts") or "edge-tts"
     gap_seconds = _float(settings.get("tts_segment_gap"), 0.12)
+    if provider in {"openai-compatible", "openai_compatible", "openai", "openai-tts", "openai_tts"}:
+        api_key = _str(settings.get("tts_openai_api_key") or settings.get("tts_volcengine_api_key"))
+        base_url = _str(settings.get("tts_openai_base_url") or settings.get("tts_volcengine_endpoint"))
+        model = _str(settings.get("tts_openai_model") or settings.get("tts_volcengine_model"), "tts-1") or "tts-1"
+        audio_format = _str(settings.get("tts_openai_format") or settings.get("tts_volcengine_format"), "mp3") or "mp3"
+        sample_rate = _int(settings.get("tts_openai_sample_rate") or settings.get("tts_volcengine_sample_rate"), 24000)
+        speed = _float(settings.get("tts_openai_speed") or settings.get("tts_speed"), 1.0)
+    else:
+        api_key = _str(settings.get("tts_volcengine_api_key"))
+        base_url = _str(settings.get("tts_volcengine_endpoint"))
+        model = _str(settings.get("tts_volcengine_model") or settings.get("tts_qwen_model"))
+        audio_format = _str(settings.get("tts_volcengine_format"), "mp3") or "mp3"
+        sample_rate = _int(settings.get("tts_volcengine_sample_rate"), 24000)
+        speed = _float(settings.get("tts_speed"), 1.0)
     return {
-        "apiKey": _str(settings.get("tts_volcengine_api_key")),
-        "baseUrl": _str(settings.get("tts_volcengine_endpoint")),
-        "model": _str(settings.get("tts_volcengine_model") or settings.get("tts_qwen_model")),
+        "apiKey": api_key,
+        "baseUrl": base_url,
+        "model": model,
         "voice": _str(settings.get("tts_voice")),
-        "speed": _float(settings.get("tts_speed"), 1.0),
+        "speed": speed,
         "volume": _int(settings.get("tts_volcengine_loudness_rate"), 0),
         "pitch": _int(settings.get("tts_pitch"), 0),
-        "format": _str(settings.get("tts_volcengine_format"), "mp3") or "mp3",
-        "sampleRate": _int(settings.get("tts_volcengine_sample_rate"), 24000),
+        "format": audio_format,
+        "sampleRate": sample_rate,
         "concurrency": _int(settings.get("tts_concurrency"), 1),
         "minSentenceGapMs": max(0, int(gap_seconds * 1000)),
         "maxAudioStretchRatio": _float(settings.get("tts_max_audio_stretch_ratio"), 1.15),
@@ -353,6 +449,12 @@ def tts_config_from_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
         "volcengineAccessKey": _str(settings.get("tts_volcengine_access_key")),
         "volcengineResourceId": _str(settings.get("tts_volcengine_resource_id"), "seed-tts-2.0") or "seed-tts-2.0",
         "volcengineSpeechRate": _int(settings.get("tts_volcengine_speech_rate"), 0),
+        "openaiApiKey": _str(settings.get("tts_openai_api_key")),
+        "openaiBaseUrl": _str(settings.get("tts_openai_base_url")),
+        "openaiModel": _str(settings.get("tts_openai_model")),
+        "openaiFormat": _str(settings.get("tts_openai_format"), "mp3") or "mp3",
+        "openaiSampleRate": _int(settings.get("tts_openai_sample_rate"), 24000),
+        "openaiSpeed": _float(settings.get("tts_openai_speed"), 1.0),
         "provider": provider,
     }
 
@@ -366,9 +468,10 @@ def apply_translation_preset_to_settings(settings: Dict[str, Any], preset: Provi
     updated["translation_api_key"] = _str(cfg.get("apiKey") or cfg.get("api_key"))
     updated["translation_api_type"] = _str(cfg.get("apiType") or cfg.get("api_type"), "auto") or "auto"
     updated["translation_timeout"] = str(_int(cfg.get("timeout"), 60))
-    updated["translation_concurrency"] = str(_int(cfg.get("concurrency"), 2))
-    updated["translation_max_batch_items"] = str(_int(cfg.get("maxBatchItems") or cfg.get("max_batch_items"), 10))
+    updated["translation_concurrency"] = str(_int(cfg.get("concurrency"), 4))
+    updated["translation_max_batch_items"] = str(_int(cfg.get("maxBatchItems") or cfg.get("max_batch_items"), 50))
     updated["translation_quality"] = _str(cfg.get("qualityMode") or cfg.get("quality_mode"), "fast") or "fast"
+    updated["translation_output_format"] = _str(cfg.get("outputFormat") or cfg.get("output_format"), "compact") or "compact"
     source = _str(cfg.get("sourceLanguage") or cfg.get("source_language"))
     target = _str(cfg.get("targetLanguage") or cfg.get("target_language"))
     if source:
@@ -379,9 +482,16 @@ def apply_translation_preset_to_settings(settings: Dict[str, Any], preset: Provi
     return updated
 
 
-def apply_tts_preset_to_settings(settings: Dict[str, Any], preset: ProviderPreset) -> Dict[str, Any]:
+def apply_tts_preset_to_settings(
+    settings: Dict[str, Any],
+    preset: ProviderPreset,
+    *,
+    preserve_current_voice: bool = False,
+) -> Dict[str, Any]:
     cfg = preset.config or {}
     updated = dict(settings)
+    current_voice = _str(settings.get("tts_voice"))
+    current_provider = _str(settings.get("tts_provider"))
     updated["tts_provider"] = preset.provider
     updated["tts_voice"] = _str(cfg.get("voice"))
     updated["tts_concurrency"] = str(_int(cfg.get("concurrency"), 1))
@@ -406,6 +516,14 @@ def apply_tts_preset_to_settings(settings: Dict[str, Any], preset: ProviderPrese
     updated["tts_volcengine_sample_rate"] = str(_int(cfg.get("sampleRate") or cfg.get("sample_rate"), 24000))
     updated["tts_volcengine_speech_rate"] = str(_int(cfg.get("volcengineSpeechRate") or cfg.get("volcengine_speech_rate") or cfg.get("speed"), 0))
     updated["tts_volcengine_loudness_rate"] = str(_int(cfg.get("volume"), 0))
+    updated["tts_openai_base_url"] = _str(cfg.get("openaiBaseUrl") or cfg.get("openai_base_url") or cfg.get("baseUrl") or cfg.get("base_url"))
+    updated["tts_openai_api_key"] = _str(cfg.get("openaiApiKey") or cfg.get("openai_api_key") or cfg.get("apiKey") or cfg.get("api_key"))
+    updated["tts_openai_model"] = _str(cfg.get("openaiModel") or cfg.get("openai_model") or cfg.get("model"), "tts-1") or "tts-1"
+    updated["tts_openai_format"] = _str(cfg.get("openaiFormat") or cfg.get("openai_format") or cfg.get("format"), "mp3") or "mp3"
+    updated["tts_openai_sample_rate"] = str(_int(cfg.get("openaiSampleRate") or cfg.get("openai_sample_rate") or cfg.get("sampleRate") or cfg.get("sample_rate"), 24000))
+    updated["tts_openai_speed"] = str(_float(cfg.get("openaiSpeed") or cfg.get("openai_speed") or cfg.get("speed"), 1.0))
+    if preserve_current_voice and current_voice and (not current_provider or current_provider == preset.provider):
+        updated["tts_voice"] = current_voice
     return updated
 
 
@@ -415,7 +533,10 @@ def export_presets(path: Path, presets: Optional[List[ProviderPreset]] = None) -
     for preset in presets:
         item = preset.to_dict()
         cfg = dict(item.get("config") or {})
-        for key in ("apiKey", "api_key", "volcengineAccessKey", "volcengine_access_key"):
+        for key in (
+            "apiKey", "api_key", "openaiApiKey", "openai_api_key",
+            "volcengineAccessKey", "volcengine_access_key",
+        ):
             if key in cfg:
                 cfg[key] = ""
         item["config"] = cfg

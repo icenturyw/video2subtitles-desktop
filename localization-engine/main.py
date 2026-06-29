@@ -144,6 +144,9 @@ def health():
     except Exception:
         pass
 
+    if os.environ.get("OPENAI_TTS_API_KEY") or os.environ.get("V2S_TTS_API_KEY"):
+        capabilities["tts"].append("openai-compatible")
+
     # Check for qwen3-tts sidecar
     try:
         import urllib.request
@@ -219,6 +222,9 @@ def create_job(req: CreateJobRequest):
         "volcengine_api_key": "VOLCENGINE_TTS_API_KEY",
         "volcengine_app_id": "VOLCENGINE_TTS_APP_ID",
         "volcengine_access_key": "VOLCENGINE_TTS_ACCESS_KEY",
+        "api_key": "OPENAI_TTS_API_KEY",
+        "openai_api_key": "OPENAI_TTS_API_KEY",
+        "openai_tts_api_key": "OPENAI_TTS_API_KEY",
     }
     for option_key, env_name in tts_secret_env.items():
         secret = str(request_payload["tts_options"].get(option_key, "") or "").strip()

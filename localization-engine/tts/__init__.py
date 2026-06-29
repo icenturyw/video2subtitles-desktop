@@ -5,6 +5,7 @@ from typing import Optional
 
 from tts.base import TTSProvider, TTSCache, TTSResult
 from tts.edge_tts import EdgeTTSProvider
+from tts.openai_compatible_tts import OpenAICompatibleTTSProvider
 from tts.qwen3_tts import Qwen3TTSProvider
 from tts.sapi_tts import SapiTTSProvider
 from tts.volcengine_tts import VolcengineDoubaoTTSProvider
@@ -39,6 +40,11 @@ def get_provider(name: str = "edge-tts",
         provider = Qwen3TTSProvider(cache=_get_edge_cache(cache_dir))
     elif name in ("sapi", "windows-sapi", "windows_sapi"):
         provider = SapiTTSProvider(cache=_get_edge_cache(cache_dir))
+    elif name in (
+        "openai-compatible", "openai_compatible", "openai", "openai-tts",
+        "openai_tts",
+    ):
+        provider = OpenAICompatibleTTSProvider(cache=_get_edge_cache(cache_dir))
     elif name in (
         "volcengine-doubao", "volcengine", "volcano", "doubao-tts", "doubao",
     ):
@@ -86,6 +92,11 @@ def list_available_providers() -> list[dict]:
         "name": "sapi",
         "available": __import__("os").name == "nt",
         "local": True,
+    })
+    providers.append({
+        "name": "openai-compatible",
+        "available": True,
+        "remote": True,
     })
     providers.append({
         "name": "volcengine-doubao",

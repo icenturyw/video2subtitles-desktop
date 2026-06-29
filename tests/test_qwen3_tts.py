@@ -30,10 +30,79 @@ _LOCALIZATION_ENGINE = str(Path(__file__).resolve().parent.parent / "localizatio
 if _LOCALIZATION_ENGINE not in sys.path:
     sys.path.insert(0, _LOCALIZATION_ENGINE)
 
-from tts.qwen3_tts import Qwen3TTSProvider, LANG_MAP, DEFAULT_STABLE_SEED
+from tts.qwen3_tts import (
+    Qwen3TTSProvider, LANG_MAP, DEFAULT_STABLE_SEED, _estimate_max_tokens,
+    QWEN3_VOICE_LANGUAGE_MAP, voice_language, is_voice_compatible,
+    compatible_voice_for,
+)
 from tts.sapi_tts import SapiTTSProvider
 from tts.base import TTSAuthError
+from tts.openai_compatible_tts import OpenAICompatibleTTSProvider
 from tts.volcengine_tts import VolcengineDoubaoTTSProvider
+
+
+# ---------------------------------------------------------------------------
+# Voice-language compatibility tests
+# ---------------------------------------------------------------------------
+
+class TestVoiceLanguageCompatibility:
+    def test_voice_language_map_covers_all_preset_voices(self):
+        for voice in ("Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric",
+                      "Ryan", "Aiden", "Ono_Anna", "Sohee"):
+            assert voice in QWEN3_VOICE_LANGUAGE_MAP, f"{voice} missing from map"
+
+    def test_voice_language_returns_correct_native(self):
+        assert voice_language("Vivian") == "zh"
+        assert voice_language("Uncle_Fu") == "zh"
+        assert voice_language("Serena") == "en"
+        assert voice_language("Ono_Anna") == "ja"
+        assert voice_language("Sohee") == "ko"
+
+    def test_voice_language_returns_none_for_unknown(self):
+        assert voice_language("UnknownVoice") is None
+        assert voice_language("") is None
+
+    def test_is_voice_compatible_when_languages_match(self):
+        assert is_voice_compatible("Vivian", "zh") is True
+        assert is_voice_compatible("Vivian", "zh-CN") is True
+        assert is_voice_compatible("Serena", "en") is True
+        assert is_voice_compatible("Ono_Anna", "ja") is True
+        assert is_voice_compatible("Sohee", "ko") is True
+
+    def test_is_voice_compatible_detects_mismatch(self):
+        # Korean voice for Chinese text — the exact bug that caused
+        # off-language speech and swallowed sounds.
+        assert is_voice_compatible("Sohee", "zh-CN") is False
+        assert is_voice_compatible("Sohee", "zh") is False
+        assert is_voice_compatible("Vivian", "ko") is False
+        assert is_voice_compatible("Ono_Anna", "en") is False
+
+    def test_is_voice_compatible_allows_custom_voices(self):
+        # Custom voices not in the preset map are assumed compatible.
+        assert is_voice_compatible("MyCustomVoice", "zh") is True
+        assert is_voice_compatible("Custom", "en") is True
+
+    def test_compatible_voice_for_returns_preferred_when_compatible(self):
+        assert compatible_voice_for("zh", "Vivian") == "Vivian"
+        assert compatible_voice_for("en", "Serena") == "Serena"
+
+    def test_compatible_voice_for_corrects_mismatch(self):
+        # Sohee (Korean) should not be kept for Chinese.
+        result = compatible_voice_for("zh-CN", "Sohee")
+        assert result != "Sohee"
+        assert voice_language(result) == "zh"
+
+    def test_compatible_voice_for_picks_default_for_target(self):
+        result = compatible_voice_for("zh", "Sohee")
+        assert result == "Vivian"  # first Chinese voice in the map
+
+    def test_compatible_voice_for_japanese(self):
+        result = compatible_voice_for("ja", "Sohee")
+        assert result == "Ono_Anna"
+
+    def test_compatible_voice_for_korean(self):
+        result = compatible_voice_for("ko", "Vivian")
+        assert result == "Sohee"
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +168,10 @@ class TestQwen3TTSProvider:
         assert "voice" in param_names
         assert "output_path" in param_names
         assert "options" in param_names
+
+    def test_estimated_max_tokens_is_small_for_punctuation_only_text(self):
+        assert _estimate_max_tokens("。") <= 48
+        assert _estimate_max_tokens("确定") < _estimate_max_tokens("人工智能正在改变就业格局")
 
     @patch("tts.qwen3_tts._get_wav_duration", return_value=1.2)
     @patch("tts.qwen3_tts.urllib.request.urlopen")
@@ -420,6 +493,139 @@ class TestVolcengineDoubaoTTSProvider:
                     "volcengine_api_key": "bad-key",
                 },
             )
+
+
+class TestOpenAICompatibleTTSProvider:
+    @patch("tts.openai_compatible_tts._get_audio_duration", return_value=1.25)
+    @patch("tts.openai_compatible_tts.urllib.request.urlopen")
+    def test_synthesize_posts_audio_speech_request(self, mock_urlopen, mock_duration, tmp_path):
+        captured = {}
+        audio_bytes = b"mp3-audio-bytes"
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return audio_bytes
+
+        def fake_urlopen(req, timeout=0):
+            captured["timeout"] = timeout
+            captured["url"] = req.full_url
+            captured["payload"] = json.loads(req.data.decode("utf-8"))
+            headers = {}
+            headers.update(getattr(req, "headers", {}))
+            headers.update(getattr(req, "unredirected_hdrs", {}))
+            captured["headers"] = {str(k).lower(): v for k, v in headers.items()}
+            return FakeResponse()
+
+        mock_urlopen.side_effect = fake_urlopen
+        provider = OpenAICompatibleTTSProvider()
+        out_path = tmp_path / "out.mp3"
+
+        result = provider.synthesize(
+            "hello",
+            "zh-CN",
+            "alloy",
+            out_path,
+            {
+                "openai_tts_base_url": "https://example.test/v1",
+                "openai_tts_api_key": "tts-key",
+                "openai_tts_model": "tts-1",
+                "openai_tts_format": "mp3",
+                "openai_tts_sample_rate": 24000,
+                "openai_tts_speed": 1.0,
+                "timeout": 15,
+            },
+        )
+
+        assert captured["url"] == "https://example.test/v1/audio/speech"
+        assert captured["timeout"] == 15
+        assert captured["headers"]["authorization"] == "Bearer tts-key"
+        assert captured["payload"]["model"] == "tts-1"
+        assert captured["payload"]["input"] == "hello"
+        assert captured["payload"]["voice"] == "alloy"
+        assert captured["payload"]["response_format"] == "mp3"
+        assert captured["payload"]["sample_rate"] == 24000
+        assert out_path.read_bytes() == audio_bytes
+        assert result.duration_seconds == 1.25
+
+    @patch("tts.openai_compatible_tts._get_audio_duration", return_value=1.25)
+    @patch("tts.openai_compatible_tts.urllib.request.urlopen")
+    def test_synthesize_mimo_posts_chat_completions_audio_request(self, mock_urlopen, mock_duration, tmp_path):
+        captured = {}
+        audio_bytes = b"wav-audio-bytes"
+        body = json.dumps({
+            "choices": [{
+                "message": {
+                    "audio": {
+                        "data": base64.b64encode(audio_bytes).decode("ascii")
+                    }
+                }
+            }]
+        }).encode("utf-8")
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return body
+
+        def fake_urlopen(req, timeout=0):
+            captured["timeout"] = timeout
+            captured["url"] = req.full_url
+            captured["payload"] = json.loads(req.data.decode("utf-8"))
+            headers = {}
+            headers.update(getattr(req, "headers", {}))
+            headers.update(getattr(req, "unredirected_hdrs", {}))
+            captured["headers"] = {str(k).lower(): v for k, v in headers.items()}
+            return FakeResponse()
+
+        mock_urlopen.side_effect = fake_urlopen
+        provider = OpenAICompatibleTTSProvider()
+        out_path = tmp_path / "out.wav"
+
+        result = provider.synthesize(
+            "你好",
+            "zh-CN",
+            "mimo_default",
+            out_path,
+            {
+                "openai_tts_base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+                "openai_tts_api_key": "tp-key",
+                "openai_tts_model": "mimo-v2.5-tts",
+                "openai_tts_format": "wav",
+                "timeout": 15,
+            },
+        )
+
+        assert captured["url"] == "https://token-plan-cn.xiaomimimo.com/v1/chat/completions"
+        assert captured["headers"]["api-key"] == "tp-key"
+        assert captured["payload"]["model"] == "mimo-v2.5-tts"
+        assert captured["payload"]["messages"][1]["content"] == "你好"
+        assert captured["payload"]["audio"]["format"] == "wav"
+        assert captured["payload"]["audio"]["voice"] == "mimo_default"
+        assert out_path.read_bytes() == audio_bytes
+        assert result.duration_seconds == 1.25
+
+    def test_synthesize_requires_credentials(self, tmp_path):
+        provider = OpenAICompatibleTTSProvider()
+        with patch.dict(os.environ, {}, clear=True):
+            with pytest.raises(TTSAuthError):
+                provider.synthesize(
+                    "hello",
+                    "zh-CN",
+                    "alloy",
+                    tmp_path / "out.mp3",
+                    {},
+                )
 
 
 # ---------------------------------------------------------------------------

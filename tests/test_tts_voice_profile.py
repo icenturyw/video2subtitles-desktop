@@ -20,6 +20,7 @@ if _LOCALIZATION_ENGINE not in sys.path:
 
 from tts.voice_profile import TtsVoiceProfile, voice_profile_hash, profile_to_log_dict
 from tts.chunking import build_tts_chunks, TtsChunk, DEFAULT_CHUNK_OPTIONS
+from tts.planner import build_tts_plan, estimate_speech_duration, normalize_planner_options
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +252,67 @@ class TestBuildTtsChunks:
         chunks = build_tts_chunks(segs, {"max_chars": 50, "min_chars": 1})
         assert len(chunks) >= 2
 
+
+
+
+# ---------------------------------------------------------------------------
+# TTS Planner Tests
+# ---------------------------------------------------------------------------
+
+class TestTtsPlanner:
+    def test_estimate_speech_duration_is_positive_for_cjk_and_latin(self):
+        zh = estimate_speech_duration("这是一个用于测试的中文句子")
+        en = estimate_speech_duration("This is a short English sentence for testing.")
+        assert zh > 0
+        assert en > 0
+
+    def test_plan_records_gap_tolerance_and_pressure(self):
+        segs = [
+            MockSegment(1, "这是一段比较长的中文配音文本，需要评估语速压力", 0.0, 1.0),
+            MockSegment(2, "下一句", 1.5, 2.5),
+        ]
+        plan = build_tts_plan(segs, {"max_gap_sec": 0.8, "max_tolerance_sec": 0.8})
+        assert len(plan.segments) == 2
+        first = plan.segments[0]
+        assert first.gap_to_next == pytest.approx(0.5)
+        assert first.tolerance == pytest.approx(0.5)
+        assert first.available_duration == pytest.approx(1.5)
+        assert first.estimated_duration > 1.0
+        assert first.speed_pressure in {"normal", "mild_fast", "fast", "too_fast"}
+
+    def test_plan_splits_chunks_on_long_gap(self):
+        segs = [
+            MockSegment(1, "First", 0.0, 1.0),
+            MockSegment(2, "Second", 20.0, 21.0),
+        ]
+        plan = build_tts_plan(segs, {"max_gap_sec": 0.8})
+        assert len(plan.chunks) == 2
+        assert plan.chunks[0].segment_indexes == [1]
+        assert plan.chunks[1].segment_indexes == [2]
+        assert "gap>" in plan.chunks[1].split_reason
+
+
+    def test_planner_disables_proportional_chunk_split_by_default(self):
+        opts = normalize_planner_options()
+        assert opts["allow_proportional_chunk_split"] is False
+
+    def test_planner_allows_proportional_chunk_split_opt_in(self):
+        opts = normalize_planner_options({"tts_chunk_allow_proportional_split": "true"})
+        assert opts["allow_proportional_chunk_split"] is True
+
+    def test_plan_splits_when_candidate_chunk_speed_pressure_is_high(self):
+        segs = [
+            MockSegment(1, "第一句非常非常长的文本需要很多朗读时间", 0.0, 0.7),
+            MockSegment(2, "第二句也非常非常长的文本需要很多朗读时间", 0.75, 1.45),
+        ]
+        plan = build_tts_plan(segs, {
+            "max_gap_sec": 0.8,
+            "max_chunk_speed_factor": 1.05,
+            "max_speed_factor": 1.5,
+            "prefer_sentence_end": False,
+        })
+        assert len(plan.chunks) == 2
+        assert plan.chunks[1].split_reason.startswith("chunk_speed>")
 
 # ---------------------------------------------------------------------------
 # Integration: profile hash + chunking

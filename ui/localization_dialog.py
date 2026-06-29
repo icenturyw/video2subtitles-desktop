@@ -94,7 +94,42 @@ _QWEN_DEFAULT_VOICES = [
     "Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric",
     "Ryan", "Aiden", "Ono_Anna", "Sohee",
 ]
+
+# Native language for each Qwen3-TTS preset voice.  Used to label the voice
+# dropdown and warn when the selected voice does not match the target
+# language — a mismatch causes off-language speech and severe hard-clipping.
+_QWEN_VOICE_LANG_LABELS = {
+    "Vivian": "zh",
+    "Uncle_Fu": "zh",
+    "Serena": "en",
+    "Dylan": "en",
+    "Eric": "en",
+    "Ryan": "en",
+    "Aiden": "en",
+    "Ono_Anna": "ja",
+    "Sohee": "ko",
+}
+
+_QWEN_VOICE_LANG_DISPLAY = {
+    "zh": "中文",
+    "en": "English",
+    "ja": "日本語",
+    "ko": "한국어",
+}
 _QWEN_DEFAULT_STABLE_SEED = 42
+
+_OPENAI_TTS_DEFAULT_VOICES = [
+    {"name": "alloy", "locale": "multi", "gender": ""},
+    {"name": "ash", "locale": "multi", "gender": ""},
+    {"name": "ballad", "locale": "multi", "gender": ""},
+    {"name": "coral", "locale": "multi", "gender": ""},
+    {"name": "echo", "locale": "multi", "gender": ""},
+    {"name": "fable", "locale": "multi", "gender": ""},
+    {"name": "nova", "locale": "multi", "gender": ""},
+    {"name": "onyx", "locale": "multi", "gender": ""},
+    {"name": "sage", "locale": "multi", "gender": ""},
+    {"name": "shimmer", "locale": "multi", "gender": ""},
+]
 
 _VOLCENGINE_DEFAULT_ENDPOINT = "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
 _VOLCENGINE_DEFAULT_RESOURCE_ID = "seed-tts-2.0"
@@ -128,6 +163,8 @@ def _provider_key(text: str) -> str:
     value = str(text or "").lower()
     if "qwen3-tts" in value:
         return "qwen3-tts"
+    if "openai" in value:
+        return "openai-compatible"
     if "volcengine" in value or "volcano" in value or "doubao" in value or "火山" in value or "豆包" in value:
         return "volcengine-doubao"
     if "sapi" in value or "windows" in value:
@@ -185,6 +222,8 @@ def _default_tts_voice(provider: str, language: str) -> str:
         return _QWEN_DEFAULT_VOICES[0]
     if provider == "volcengine-doubao":
         return _VOLCENGINE_DEFAULT_VOICE
+    if provider == "openai-compatible":
+        return "alloy"
     if provider == "sapi":
         return "default"
     lower = str(language or "").strip().lower()
@@ -218,26 +257,45 @@ def _preview_text(language: str) -> str:
 
 def _format_voice_label(voice: dict) -> str:
     name = str(voice.get("name") or "").strip()
+    display_lang = str(voice.get("display_lang") or "").strip()
     locale = str(voice.get("locale") or voice.get("language") or "").strip()
     gender = str(voice.get("gender") or "").strip()
-    parts = [p for p in (locale, gender) if p]
-    return f"{name} ({' 路 '.join(parts)})" if parts else name
+    if display_lang:
+        parts = [p for p in (display_lang, gender) if p]
+    else:
+        parts = [p for p in (locale, gender) if p]
+    return f"{name} ({' / '.join(parts)})" if parts else name
+
+
+def _qwen_default_voice_items(language: str) -> list[dict]:
+    target_base = _language_base(language)
+    items = []
+    for name in _QWEN_DEFAULT_VOICES:
+        native = _QWEN_VOICE_LANG_LABELS.get(name, "")
+        display_lang = _QWEN_VOICE_LANG_DISPLAY.get(native, native)
+        items.append({
+            "name": name,
+            "locale": native or language,
+            "gender": "",
+            "native_lang": native,
+            "display_lang": display_lang,
+            "compatible": (not native) or (native == target_base),
+        })
+    return items
+
+
+def _preferred_voice_for_provider(provider: str, language: str, preferred: str) -> str:
+    preferred = str(preferred or "").strip()
+    if provider == "qwen3-tts":
+        names = set(_QWEN_DEFAULT_VOICES)
+        return preferred if preferred in names else _default_tts_voice(provider, language)
+    return preferred or _default_tts_voice(provider, language)
 
 
 def localization_runtime_config(settings: dict) -> dict | None:
     """Convert persisted localization settings into the config used by workers."""
     settings = dict(settings or {})
     mode = str(settings.get("localization_mode", "subtitle") or "subtitle").strip()
-    if mode == "subtitle":
-        has_translation_config = bool(
-            str(settings.get("translation_base_url", "") or "").strip()
-            and (
-                str(settings.get("translation_api_key", "") or "").strip()
-                or os.environ.get("V2S_TRANSLATION_API_KEY", "").strip()
-            )
-        )
-        if has_translation_config:
-            mode = "translate"
     if mode not in {"translate", "dub"}:
         return None
 
@@ -263,7 +321,11 @@ def localization_runtime_config(settings: dict) -> dict | None:
             if tts_preset:
                 tts_preset_id = tts_preset.id
         if tts_preset:
-            settings = apply_tts_preset_to_settings(settings, tts_preset)
+            settings = apply_tts_preset_to_settings(
+                settings,
+                tts_preset,
+                preserve_current_voice=True,
+            )
             settings["tts_preset_id"] = tts_preset.id
 
     target_language = _language_code(
@@ -301,6 +363,10 @@ def localization_runtime_config(settings: dict) -> dict | None:
         "volcengine_resource_id": settings.get("tts_volcengine_resource_id", _VOLCENGINE_DEFAULT_RESOURCE_ID),
         "volcengine_model": settings.get("tts_volcengine_model", _VOLCENGINE_DEFAULT_MODEL),
         "volcengine_format": settings.get("tts_volcengine_format", "mp3"),
+        "openai_tts_base_url": settings.get("tts_openai_base_url", ""),
+        "openai_tts_api_key": settings.get("tts_openai_api_key", ""),
+        "openai_tts_model": settings.get("tts_openai_model", "tts-1"),
+        "openai_tts_format": settings.get("tts_openai_format", "mp3"),
         "tts_segment_gap": float(settings.get("tts_segment_gap", "0.04") or 0.04),
         "tts_consistency_mode": consistency_mode,
     }
@@ -320,6 +386,8 @@ def localization_runtime_config(settings: dict) -> dict | None:
         ("tts_volcengine_sample_rate", "volcengine_sample_rate", int),
         ("tts_volcengine_speech_rate", "volcengine_speech_rate", int),
         ("tts_volcengine_loudness_rate", "volcengine_loudness_rate", int),
+        ("tts_openai_sample_rate", "openai_tts_sample_rate", int),
+        ("tts_openai_speed", "openai_tts_speed", float),
     ]:
         raw = str(settings.get(source_key, "") or "").strip()
         if raw:
@@ -362,8 +430,9 @@ def localization_runtime_config(settings: dict) -> dict | None:
             "api_key_env": "V2S_TRANSLATION_API_KEY",
             "api_key": settings.get("translation_api_key", ""),
             "timeout": int(settings.get("translation_timeout", "60") or 60),
-            "concurrency": int(settings.get("translation_concurrency", "2") or 2),
-            "max_batch_items": int(settings.get("translation_max_batch_items", "10") or 10),
+            "concurrency": int(settings.get("translation_concurrency", "4") or 4),
+            "max_batch_items": int(settings.get("translation_max_batch_items", "50") or 50),
+            "output_format": settings.get("translation_output_format", "compact"),
         },
         "translation_preset_id": translation_preset.id if translation_preset else "",
         "translation_preset_name": translation_preset.name if translation_preset else "",
@@ -519,9 +588,18 @@ class LocalizationDialog(QDialog):
         trans_form.addRow("超时(秒):", self.trans_timeout)
 
         self.trans_concurrency = QSpinBox()
-        self.trans_concurrency.setRange(1, 8)
-        self.trans_concurrency.setValue(int(self._settings.get("translation_concurrency", 2)))
+        self.trans_concurrency.setRange(1, 16)
+        self.trans_concurrency.setValue(int(self._settings.get("translation_concurrency", 4)))
         trans_form.addRow("并发线程数:", self.trans_concurrency)
+
+        self.trans_output_format = QComboBox()
+        self.trans_output_format.addItem("紧凑文本（省 token，推荐）", "compact")
+        self.trans_output_format.addItem("JSON（兼容）", "json")
+        current_format = self._settings.get("translation_output_format", "compact")
+        idx = self.trans_output_format.findData(current_format)
+        if idx >= 0:
+            self.trans_output_format.setCurrentIndex(idx)
+        trans_form.addRow("输出格式:", self.trans_output_format)
 
         layout.addWidget(self.trans_group)
 
@@ -552,6 +630,7 @@ class LocalizationDialog(QDialog):
         self.tts_provider.addItems([
             "edge-tts",
             "qwen3-tts（本地 Qwen3-TTS）",
+            "openai-compatible（OpenAI 兼容 TTS）",
             "volcengine-doubao（火山引擎豆包 TTS）",
             "sapi（Windows 本地 TTS）",
         ])
@@ -580,6 +659,7 @@ class LocalizationDialog(QDialog):
         self.tts_voice = QComboBox()
         self.tts_voice.setMinimumWidth(360)
         self.tts_voice.setEditable(True)
+        self.tts_voice.currentIndexChanged.connect(self._on_tts_voice_selection_changed)
         voice_layout.addWidget(self.tts_voice, 1)
 
         self.tts_voice_refresh_btn = QPushButton("刷新")
@@ -901,7 +981,7 @@ class LocalizationDialog(QDialog):
         if idx >= 0:
             self.trans_api_type.setCurrentIndex(idx)
         self.trans_timeout.setValue(int(settings.get("translation_timeout", 60) or 60))
-        self.trans_concurrency.setValue(int(settings.get("translation_concurrency", 2) or 2))
+        self.trans_concurrency.setValue(int(settings.get("translation_concurrency", 4) or 4))
         source = settings.get("source_language_dialog", "")
         target = settings.get("target_language_dialog", "")
         if source:
@@ -1006,7 +1086,11 @@ class LocalizationDialog(QDialog):
         if idx >= 0:
             self.trans_api_type.setCurrentIndex(idx)
         self.trans_timeout.setValue(int(s.get("translation_timeout", 60)))
-        self.trans_concurrency.setValue(int(s.get("translation_concurrency", 2)))
+        self.trans_concurrency.setValue(int(s.get("translation_concurrency", 4)))
+        fmt = s.get("translation_output_format", "compact")
+        idx = self.trans_output_format.findData(fmt)
+        if idx >= 0:
+            self.trans_output_format.setCurrentIndex(idx)
 
         saved_key = s.get("translation_api_key", "")
         if saved_key:
@@ -1087,10 +1171,11 @@ class LocalizationDialog(QDialog):
         provider = self._current_tts_provider()
         is_qwen3 = provider == "qwen3-tts"
         is_volcengine = provider == "volcengine-doubao"
+        is_openai = provider == "openai-compatible"
         self.tts_manage_btn.setVisible(is_qwen3)
         self.tts_qwen3_status.setVisible(is_qwen3)
         self.qwen_advanced.setVisible(is_qwen3)
-        self.volcengine_group.setVisible(is_volcengine)
+        self.volcengine_group.setVisible(is_volcengine or is_openai)
         if is_qwen3:
             self._refresh_qwen3_status()
         self._refresh_tts_voices()
@@ -1119,20 +1204,31 @@ class LocalizationDialog(QDialog):
             return
         provider = self._current_tts_provider()
         language = self.target_language
-        preferred = self._selected_tts_voice() or self._preferred_tts_voice
-        if not preferred:
-            preferred = _default_tts_voice(provider, language)
+        preferred = _preferred_voice_for_provider(
+            provider, language, self._selected_tts_voice() or self._preferred_tts_voice,
+        )
 
         self._voice_request_id += 1
         request_id = self._voice_request_id
-        self._set_voice_loading("正在加载音色...")
+        self._preferred_tts_voice = preferred
+
+        if provider == "qwen3-tts":
+            # Qwen3-TTS 的音色是本地固定 speaker 名称。服务未启动、模型未加载
+            # 或 /voices 请求较慢时，也应该允许用户立即选择默认音色，
+            # 避免下拉框长时间停留在“加载中...”禁用状态。后台刷新成功后再替换为服务返回值。
+            self._on_tts_voices_loaded(
+                request_id,
+                _qwen_default_voice_items(language),
+                "Qwen3-TTS 服务未运行时仍可选择默认音色；正在尝试刷新服务音色...",
+            )
+        else:
+            self._set_voice_loading("正在加载音色...")
 
         def _run():
             voices, error = self._load_tts_voices(provider, language)
             self._voices_loaded.emit(request_id, voices, error)
 
         threading.Thread(target=_run, daemon=True).start()
-        self._preferred_tts_voice = preferred
 
     def _load_tts_voices(self, provider: str, language: str) -> tuple[list[dict], str]:
         if provider == "sapi":
@@ -1166,14 +1262,16 @@ class LocalizationDialog(QDialog):
                     return voices, ""
             except Exception:
                 pass
-            return [
-                {"name": name, "locale": language, "gender": ""}
-                for name in _QWEN_DEFAULT_VOICES
-            ], "Qwen3-TTS 服务未运行，已显示默认音色"
+            return _qwen_default_voice_items(language), "Qwen3-TTS 服务未运行，已显示默认音色"
 
         if provider == "volcengine-doubao":
             return list(_VOLCENGINE_DEFAULT_VOICES), (
                 "火山音色需与 ResourceId 匹配；可直接输入控制台音色名"
+            )
+
+        if provider == "openai-compatible":
+            return list(_OPENAI_TTS_DEFAULT_VOICES), (
+                "OpenAI 兼容 TTS 音色可直接输入服务支持的 voice 名称"
             )
 
         if not _EDGE_TTS_AVAILABLE:
@@ -1224,11 +1322,55 @@ class LocalizationDialog(QDialog):
         self.tts_voice.blockSignals(False)
         self.tts_voice.setEnabled(True)
         self.tts_preview_btn.setEnabled(True)
-        if error:
+
+        # Voice-language mismatch warning for Qwen3-TTS.  Using a voice
+        # whose native language differs from the target language causes
+        # off-language speech, abnormally long audio, and severe clipping.
+        provider = self._current_tts_provider()
+        language = self.target_language
+        mismatch_warning = ""
+        if provider == "qwen3-tts":
+            selected_voice = self._selected_tts_voice()
+            native = _QWEN_VOICE_LANG_LABELS.get(selected_voice, "")
+            if native:
+                target_base = _language_base(language)
+                if native != target_base:
+                    display = _QWEN_VOICE_LANG_DISPLAY.get(native, native)
+                    mismatch_warning = (
+                        f"⚠ 音色「{selected_voice}」母语为 {display}，与目标语言不匹配，"
+                        f"可能导致非目标语言语音和吞音；建议选择 {target_base} 音色"
+                    )
+
+        if mismatch_warning:
+            self.tts_voice_status.setText(mismatch_warning)
+            self.tts_voice_status.setStyleSheet("color: #f87171; font-size: 11px;")
+        elif error:
             self.tts_voice_status.setText(error)
             self.tts_voice_status.setStyleSheet(f"color: #fbbf24; font-size: 11px;")
         else:
             self.tts_voice_status.setText(f"已加载 {len(voice_items)} 个音色")
+            self.tts_voice_status.setStyleSheet(f"color: {_THEME['text_muted']}; font-size: 11px;")
+
+    def _on_tts_voice_selection_changed(self, _index: int):
+        """Update voice-language mismatch warning when the user picks a voice."""
+        provider = self._current_tts_provider()
+        if provider != "qwen3-tts":
+            return
+        language = self.target_language
+        selected_voice = self._selected_tts_voice()
+        native = _QWEN_VOICE_LANG_LABELS.get(selected_voice, "")
+        if not native:
+            return
+        target_base = _language_base(language)
+        if native != target_base:
+            display = _QWEN_VOICE_LANG_DISPLAY.get(native, native)
+            self.tts_voice_status.setText(
+                f"⚠ 音色「{selected_voice}」母语为 {display}，与目标语言不匹配，"
+                f"可能导致非目标语言语音和吞音；建议选择 {target_base} 音色"
+            )
+            self.tts_voice_status.setStyleSheet("color: #f87171; font-size: 11px;")
+        else:
+            self.tts_voice_status.setText(f"音色 {selected_voice} 与目标语言匹配")
             self.tts_voice_status.setStyleSheet(f"color: {_THEME['text_muted']}; font-size: 11px;")
 
     def _preview_tts_voice(self):
@@ -1271,6 +1413,23 @@ class LocalizationDialog(QDialog):
         if provider == "qwen3-tts":
             return self._generate_qwen3_preview(text, language, voice, preview_dir)
 
+        if provider == "openai-compatible":
+            engine_dir = Path(__file__).resolve().parent.parent / "localization-engine"
+            if str(engine_dir) not in sys.path:
+                sys.path.insert(0, str(engine_dir))
+            from tts import get_provider
+            safe_voice = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in voice)
+            suffix = self.volcengine_format.currentText().strip() or "mp3"
+            output_path = preview_dir / f"openai_tts_{safe_voice}.{suffix}"
+            get_provider("openai-compatible", cache_dir=preview_dir).synthesize(
+                text,
+                language,
+                voice,
+                output_path,
+                self._openai_tts_options_from_ui(),
+            )
+            return output_path
+
         if provider == "volcengine-doubao":
             engine_dir = Path(__file__).resolve().parent.parent / "localization-engine"
             if str(engine_dir) not in sys.path:
@@ -1297,6 +1456,22 @@ class LocalizationDialog(QDialog):
         communicate = edge_tts.Communicate(text, voice)
         asyncio.run(communicate.save(str(output_path)))
         return output_path
+
+    def _openai_tts_options_from_ui(self) -> dict:
+        speed = self.volcengine_speech_rate.value()
+        if speed == 0:
+            speed_value = 1.0
+        else:
+            speed_value = max(0.25, min(4.0, speed / 100.0 if abs(speed) > 4 else float(speed)))
+        return {
+            "openai_tts_base_url": self.volcengine_endpoint.text().strip(),
+            "openai_tts_api_key": self.volcengine_api_key.text().strip(),
+            "openai_tts_model": self.volcengine_model.text().strip() or "tts-1",
+            "openai_tts_format": self.volcengine_format.currentText().strip() or "mp3",
+            "openai_tts_sample_rate": self.volcengine_sample_rate.value(),
+            "openai_tts_speed": speed_value,
+            "timeout": 120,
+        }
 
     def _volcengine_options_from_ui(self) -> dict:
         return {
@@ -1492,6 +1667,7 @@ class LocalizationDialog(QDialog):
         self._settings["translation_api_type"] = _api_type_key(self.trans_api_type.currentText())
         self._settings["translation_timeout"] = str(self.trans_timeout.value())
         self._settings["translation_concurrency"] = str(self.trans_concurrency.value())
+        self._settings["translation_output_format"] = self.trans_output_format.currentData()
         self._settings["translation_api_key"] = self.trans_api_key.text().strip()
         self._settings["translation_preset_id"] = self._selected_translation_preset_id()
         self._settings["tts_preset_id"] = self._selected_tts_preset_id()
@@ -1584,6 +1760,7 @@ class LocalizationDialog(QDialog):
             api_type=_api_type_key(self.trans_api_type.currentText()),
             timeout=self.trans_timeout.value(),
             concurrency=self.trans_concurrency.value(),
+            output_format=self.trans_output_format.currentData(),
         )
 
     def get_settings(self) -> dict:

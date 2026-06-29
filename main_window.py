@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import time
 import threading
 import webbrowser
@@ -28,7 +29,13 @@ from PyQt5.QtWidgets import (
 from api_client import WhisperApiClient
 from local_whisper import LocalWhisperTranscriber, WHISPER_SERVER
 from history import HistoryManager
-from subtitle_utils import format_subtitle_time, sanitize_filename
+from subtitle_utils import (
+    align_keyframe_points_to_scene_changes,
+    choose_subtitle_keyframe_points,
+    format_subtitle_time,
+    parse_srt_file,
+    sanitize_filename,
+)
 from localization_client import LocalizationClient
 from client_settings import get_effective_settings
 from process_utils import hidden_subprocess_kwargs
@@ -1053,6 +1060,130 @@ class ChatGPTPackageWorker(QThread):
         self.progress.emit(message)
         self.progress_detail.emit(message, int(percent))
 
+    def _extract_single_frame(self, subprocess, ffmpeg, timestamp, output_path, run_kwargs):
+        subprocess.run(
+            [
+                ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                "-ss", f"{max(0.0, float(timestamp)):.3f}",
+                "-i", str(self.source_video),
+                "-frames:v", "1",
+                "-vf", "scale=-2:720,format=yuvj420p",
+                "-q:v", "4", str(output_path),
+            ],
+            **run_kwargs,
+        )
+        return output_path.exists() and output_path.stat().st_size > 0
+
+    def _detect_scene_change_points(self, subprocess, ffmpeg, run_kwargs):
+        detect_kwargs = dict(run_kwargs)
+        detect_kwargs.update({
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+        })
+        try:
+            completed = subprocess.run(
+                [
+                    ffmpeg, "-hide_banner", "-loglevel", "info",
+                    "-i", str(self.source_video),
+                    "-an",
+                    "-vf", "scale=320:-2,select='gt(scene,0.32)',showinfo",
+                    "-f", "null", "-",
+                ],
+                **detect_kwargs,
+            )
+        except subprocess.CalledProcessError:
+            return []
+
+        output = "\n".join([
+            str(completed.stdout or ""),
+            str(completed.stderr or ""),
+        ])
+        points = []
+        for match in re.finditer(r"pts_time:([0-9]+(?:\.[0-9]+)?)", output):
+            timestamp = round(float(match.group(1)), 3)
+            if points and timestamp - points[-1] < 0.4:
+                continue
+            points.append(timestamp)
+            if len(points) >= 400:
+                break
+        return points
+
+    def _extract_subtitle_aligned_frames(self, subprocess, ffmpeg, frames_dir, run_kwargs):
+        points = choose_subtitle_keyframe_points(
+            parse_srt_file(self.srt_path),
+            target_interval=30,
+            min_gap=8,
+            max_frames=80,
+        )
+        if not points:
+            return [], [], 0
+
+        scene_points = self._detect_scene_change_points(subprocess, ffmpeg, run_kwargs)
+        if scene_points:
+            points = align_keyframe_points_to_scene_changes(
+                points,
+                scene_points,
+                max_offset=2.0,
+                post_scene_offset=0.4,
+            )
+
+        frame_records = []
+        for index, point in enumerate(points, 1):
+            frame_path = frames_dir / f"frame_{index:04d}.jpg"
+            try:
+                ok = self._extract_single_frame(
+                    subprocess,
+                    ffmpeg,
+                    point.get("timestamp", 0),
+                    frame_path,
+                    run_kwargs,
+                )
+            except subprocess.CalledProcessError:
+                ok = False
+            if not ok:
+                continue
+
+            text = str(point.get("subtitle_text", "") or "").replace("\n", " ").strip()
+            if len(text) > 240:
+                text = text[:237] + "..."
+            frame_records.append({
+                "file": frame_path.name,
+                "timestamp": point.get("timestamp", 0),
+                "subtitle_index": point.get("subtitle_index"),
+                "subtitle_start": point.get("subtitle_start"),
+                "subtitle_end": point.get("subtitle_end"),
+                "subtitle_text": text,
+                "selection_score": point.get("score"),
+            })
+            for key in ("original_timestamp", "scene_timestamp", "visual_anchor"):
+                if key in point:
+                    frame_records[-1][key] = point.get(key)
+        return sorted(frames_dir.glob("frame_*.jpg")), frame_records, len(scene_points)
+
+    def _extract_fixed_interval_frames(self, subprocess, ffmpeg, frames_dir, run_kwargs):
+        subprocess.run(
+            [
+                ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                "-i", str(self.source_video),
+                "-vf", "fps=1/30,scale=-2:720,format=yuvj420p",
+                "-q:v", "4", str(frames_dir / "frame_%04d.jpg"),
+            ],
+            **run_kwargs,
+        )
+        frames = sorted(frames_dir.glob("frame_*.jpg"))
+        records = [
+            {
+                "file": frame.name,
+                "timestamp": round((index - 1) * 30.0, 3),
+                "subtitle_index": None,
+            }
+            for index, frame in enumerate(frames, 1)
+        ]
+        return frames, records
+
     def run(self):
         import shutil
         import subprocess
@@ -1098,29 +1229,52 @@ class ChatGPTPackageWorker(QThread):
             self._emit_progress("正在抽取关键帧...", 50)
             for old_frame in frames_dir.glob("frame_*.jpg"):
                 old_frame.unlink(missing_ok=True)
-            subprocess.run(
-                [
-                    ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-                    "-i", str(self.source_video),
-                    "-vf", "fps=1/30,scale=-2:720,format=yuvj420p",
-                    "-q:v", "4", str(frames_dir / "frame_%04d.jpg"),
-                ],
-                **run_kwargs,
+            frames, frame_records, scene_change_count = self._extract_subtitle_aligned_frames(
+                subprocess,
+                ffmpeg,
+                frames_dir,
+                run_kwargs,
             )
-
-            frames = sorted(frames_dir.glob("frame_*.jpg"))
+            frame_strategy = "subtitle_scene_aligned" if scene_change_count else "subtitle_aligned"
             if not frames:
-                subprocess.run(
-                    [
-                        ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-                        "-i", str(self.source_video),
-                        "-frames:v", "1",
-                        "-vf", "scale=-2:720,format=yuvj420p",
-                        "-q:v", "4", str(frames_dir / "frame_0001.jpg"),
-                    ],
-                    **run_kwargs,
+                frame_strategy = "fixed_interval_fallback"
+                scene_change_count = 0
+                frames, frame_records = self._extract_fixed_interval_frames(
+                    subprocess,
+                    ffmpeg,
+                    frames_dir,
+                    run_kwargs,
                 )
+            if not frames:
+                frame_strategy = "first_frame_fallback"
+                scene_change_count = 0
+                frame_path = frames_dir / "frame_0001.jpg"
+                self._extract_single_frame(subprocess, ffmpeg, 0, frame_path, run_kwargs)
                 frames = sorted(frames_dir.glob("frame_*.jpg"))
+                frame_records = [
+                    {
+                        "file": frame.name,
+                        "timestamp": 0.0,
+                        "subtitle_index": None,
+                    }
+                    for frame in frames
+                ]
+
+            frames_manifest = {
+                "strategy": frame_strategy,
+                "target_interval_seconds": 30,
+                "min_gap_seconds": 8,
+                "max_frames": 80,
+                "scene_change_count": scene_change_count,
+                "scene_threshold": 0.32,
+                "scene_alignment_window_seconds": 2.0,
+                "frames": frame_records,
+            }
+            frames_manifest_path = package_dir / "frames_manifest.json"
+            frames_manifest_path.write_text(
+                json.dumps(frames_manifest, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
             self._emit_progress("正在写入包清单 manifest.json...", 68)
             manifest = {
                 "title": self.title,
@@ -1129,8 +1283,14 @@ class ChatGPTPackageWorker(QThread):
                 "proxy_video": proxy_video.name,
                 "light_upload_zip": "chatgpt_upload_light.zip",
                 "full_upload_zip": "chatgpt_upload_full.zip",
+                "frame_strategy": frame_strategy,
+                "frame_target_interval_seconds": 30,
+                "frame_scene_change_count": scene_change_count,
+                "frame_scene_threshold": 0.32,
+                "frame_scene_alignment_window_seconds": 2.0,
                 "frame_interval_seconds": 30,
                 "frames_dir": "frames",
+                "frames_manifest": "frames_manifest.json",
                 "frame_count": len(frames),
                 "recommended_upload_to_chatgpt": [
                     "chatgpt_upload_light.zip",
@@ -1154,6 +1314,7 @@ class ChatGPTPackageWorker(QThread):
             with zipfile.ZipFile(light_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
                 zf.write(package_srt, package_srt.name)
                 zf.write(package_dir / "manifest.json", "manifest.json")
+                zf.write(frames_manifest_path, "frames_manifest.json")
                 for frame in frames:
                     zf.write(frame, f"frames/{frame.name}")
 
@@ -1162,6 +1323,7 @@ class ChatGPTPackageWorker(QThread):
                 zf.write(package_srt, package_srt.name)
                 zf.write(proxy_video, proxy_video.name)
                 zf.write(package_dir / "manifest.json", "manifest.json")
+                zf.write(frames_manifest_path, "frames_manifest.json")
                 for frame in frames:
                     zf.write(frame, f"frames/{frame.name}")
 

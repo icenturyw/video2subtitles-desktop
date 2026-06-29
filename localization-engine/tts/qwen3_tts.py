@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import tempfile
 import time
 import urllib.error
@@ -31,6 +32,56 @@ LANG_MAP = {
 }
 
 DEFAULT_VOICE = "Vivian"
+
+# Qwen3-TTS preset speakers and their native languages.
+# Using a voice whose native language does not match the target language
+# causes the model to produce abnormally long, accented, or off-language
+# speech (e.g. Korean "Sohee" reading Chinese text), which in turn triggers
+# severe hard-clipping and "swallowed sound" artifacts after atempo.
+QWEN3_VOICE_LANGUAGE_MAP: Dict[str, str] = {
+    "Vivian": "zh",
+    "Uncle_Fu": "zh",
+    "Serena": "en",
+    "Dylan": "en",
+    "Eric": "en",
+    "Ryan": "en",
+    "Aiden": "en",
+    "Ono_Anna": "ja",
+    "Sohee": "ko",
+}
+
+
+def voice_language(voice: str) -> Optional[str]:
+    """Return the native language code for a Qwen3-TTS preset voice."""
+    return QWEN3_VOICE_LANGUAGE_MAP.get(str(voice or "").strip())
+
+
+def is_voice_compatible(voice: str, target_language: str) -> bool:
+    """Check whether a preset voice is compatible with the target language."""
+    native = voice_language(voice)
+    if native is None:
+        return True  # custom voice, assume compatible
+    if not target_language:
+        return True
+    target_base = str(target_language).strip().lower().split("-", 1)[0]
+    return native.lower() == target_base
+
+
+def compatible_voice_for(target_language: str, preferred: str = "") -> str:
+    """Return a Qwen3-TTS voice compatible with the target language.
+
+    If *preferred* is already compatible, return it unchanged.  Otherwise pick
+    the default voice for the target language.
+    """
+    if preferred and is_voice_compatible(preferred, target_language):
+        return preferred
+    if not target_language:
+        return DEFAULT_VOICE
+    base = str(target_language).strip().lower().split("-", 1)[0]
+    for voice, native in QWEN3_VOICE_LANGUAGE_MAP.items():
+        if native.lower() == base:
+            return voice
+    return DEFAULT_VOICE
 DEFAULT_MODEL_BY_MODE = {
     "auto": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
     "custom_voice": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
@@ -38,6 +89,16 @@ DEFAULT_MODEL_BY_MODE = {
     "voice_design": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
 }
 DEFAULT_STABLE_SEED = 42
+DEFAULT_STABLE_TEMPERATURE = 0.6
+DEFAULT_STABLE_TOP_P = 0.8
+
+_ZERO_WIDTH_RE = re.compile(r"[\u200b\u200c\u200d\ufeff]")
+_ASS_TAG_RE = re.compile(r"\{[^{}]*\}")
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_SPACE_RE = re.compile(r"[ \t\r\f\v]+")
+_PUNCT_RE = re.compile(
+    r"[\s\u3000\.,!?;:'\"`~\-—–_()\[\]{}<>/\\|@#$%^&*+=，。！？；：、“”‘’（）【】《》…·￥]+"
+)
 
 
 def _clean_options(options: dict) -> Dict:
@@ -68,24 +129,53 @@ def _clean_options(options: dict) -> Dict:
             else:
                 cleaned["seed"] = seed_int
                 cleaned["seed_policy"] = str(cleaned.get("seed_policy") or "explicit")
+    if cleaned.get("temperature") in ("", None):
+        cleaned["temperature"] = DEFAULT_STABLE_TEMPERATURE
+        cleaned["temperature_policy"] = "default_stable"
+    if cleaned.get("top_p") in ("", None):
+        cleaned["top_p"] = DEFAULT_STABLE_TOP_P
+        cleaned["top_p_policy"] = "default_stable"
     return cleaned
 
 
-def _estimate_max_tokens(text: str) -> int:
-    """Estimate a safe max_new_tokens value for a given text.
+def _clean_tts_text(text: str) -> str:
+    value = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    value = _ZERO_WIDTH_RE.sub("", value)
+    value = _ASS_TAG_RE.sub("", value)
+    value = _HTML_TAG_RE.sub("", value)
+    lines = [_SPACE_RE.sub(" ", line).strip() for line in value.split("\n")]
+    return "\n".join(line for line in lines if line).strip()
 
-    Conservative estimates per character:
-        - CJK: ~2 tokens per character
-        - Latin/Cyrillic: ~1.5 tokens per character
-        - Fallback: ~2 tokens per character + margin
+
+def _speech_units(text: str) -> tuple[int, int]:
+    cleaned = _clean_tts_text(text)
+    semantic = _PUNCT_RE.sub("", cleaned)
+    cjk_chars = sum(
+        1 for c in semantic
+        if '\u4e00' <= c <= '\u9fff'
+        or '\u3040' <= c <= '\u30ff'
+        or '\uac00' <= c <= '\ud7af'
+    )
+    other_chars = max(0, len(semantic) - cjk_chars)
+    return cjk_chars, other_chars
+
+
+def _estimate_max_tokens(text: str) -> int:
+    """Estimate a bounded ``max_new_tokens`` for Qwen3-TTS.
+
+    The bundled Qwen3-TTS models are 12Hz speech-token models.  A very large
+    floor such as 256 tokens gives a one-character or punctuation-only prompt a
+    long budget to free-run, which sounds like repeated hums/fillers.  Estimate
+    from speech-bearing characters instead and keep a smaller safety margin.
     """
-    if not text:
-        return 256
-    cjk_chars = sum(1 for c in text if '\u4e00' <= c <= '\u9fff'
-                    or '\u3040' <= c <= '\u30ff' or '\uac00' <= c <= '\ud7af')
-    other_chars = len(text) - cjk_chars
-    estimated = int(cjk_chars * 2.0 + other_chars * 1.5) + 256
-    return max(256, min(4096, estimated))
+    cjk_chars, other_chars = _speech_units(text)
+    if cjk_chars + other_chars <= 0:
+        return 32
+    # Roughly 4 CJK chars/s or 12 latin chars/s, then 12 speech tokens/s plus
+    # a small margin.  This is a ceiling, not a target duration.
+    speech_seconds = (cjk_chars / 4.0) + (other_chars / 12.0)
+    estimated = int(speech_seconds * 16) + 40
+    return max(48, min(2048, estimated))
 
 
 def _generation_options(options: dict, text: str = "") -> Dict:
@@ -194,6 +284,7 @@ class Qwen3TTSProvider:
             )
 
         options = _clean_options(options)
+        text = _clean_tts_text(text)
         self._ensure_model_loaded(options)
         lang = LANG_MAP.get(language.lower(), language.lower())
         speaker = voice or DEFAULT_VOICE

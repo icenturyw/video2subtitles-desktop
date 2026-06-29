@@ -83,6 +83,55 @@ def parse_translation_response(response_text: str,
     return translations, errors
 
 
+def parse_translation_response_compact(response_text: str,
+                                        expected_ids: List[int]) -> Tuple[List[Dict], List[str]]:
+    """Parse a line-format translation response, with JSON fallback.
+
+    Compat mode: if the stripped response starts with '[', delegates to
+    parse_translation_response (JSON fallback).
+
+    Compact mode: splits by newline, strips each line, pairs with expected_ids
+    in order.  Returns the same (translations, errors) tuple shape.
+    """
+    cleaned = response_text.strip()
+    if cleaned.startswith("[") or cleaned.startswith("{"):
+        return parse_translation_response(response_text, expected_ids)
+
+    cleaned = _clean_response(cleaned)
+    errors: List[str] = []
+
+    lines = [line.strip() for line in cleaned.split("\n")]
+    lines = [line for line in lines if line or (
+        len([l for l in lines if not (l or "").strip()]) <= len(expected_ids)
+    )]
+    actual_len = len(lines)
+    expected_len = len(expected_ids)
+
+    if actual_len < expected_len:
+        errors.append(f"Missing translations: expected {expected_len} lines, got {actual_len}")
+        padding = [""] * (expected_len - actual_len)
+        lines = lines[:expected_len] + padding
+    elif actual_len > expected_len:
+        errors.append(f"Extra output lines: expected {expected_len}, got {actual_len} (truncated)")
+        lines = lines[:expected_len]
+
+    translations: List[Dict] = []
+    empty_ids: List[int] = []
+    for idx, line in enumerate(lines):
+        item_id = expected_ids[idx]
+        translations.append({"id": item_id, "text": line})
+        if not line:
+            empty_ids.append(item_id)
+
+    if empty_ids:
+        errors.append(f"Empty translations for IDs: {empty_ids}")
+
+    if not translations:
+        return [], ["No valid translations found in response"]
+
+    return translations, errors
+
+
 def _clean_response(text: str) -> str:
     """Remove markdown code fences and leading/trailing whitespace."""
     cleaned = text.strip()

@@ -7,9 +7,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from provider_presets import (
+    BUILTIN_QWEN3_TTS_PRESET_ID,
     ProviderPreset,
     apply_translation_preset_to_settings,
     apply_tts_preset_to_settings,
+    builtin_provider_presets,
+    ensure_builtin_provider_presets,
     duplicate_provider_preset,
     export_presets,
     import_presets,
@@ -21,6 +24,44 @@ from provider_presets import (
 
 
 class TestProviderPresets(unittest.TestCase):
+
+    def test_builtin_qwen3_tts_preset_available(self):
+        presets = builtin_provider_presets(now="2026-06-24T00:00:00")
+        self.assertEqual(len(presets), 1)
+        preset = presets[0]
+        self.assertEqual(preset.id, BUILTIN_QWEN3_TTS_PRESET_ID)
+        self.assertEqual(preset.type, "tts")
+        self.assertEqual(preset.provider, "qwen3-tts")
+        self.assertTrue(preset.isDefault)
+        self.assertEqual(preset.config["voice"], "Vivian")
+        self.assertEqual(preset.config["qwenMode"], "auto")
+        self.assertEqual(preset.config["consistencyMode"], "stable")
+
+    def test_load_provider_presets_includes_builtin_qwen3_tts(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "presets.json"
+            loaded = load_provider_presets(path, migrate=False, include_builtins=True)
+            self.assertEqual(len(loaded), 1)
+            self.assertEqual(loaded[0].provider, "qwen3-tts")
+            self.assertTrue(loaded[0].isDefault)
+
+    def test_builtin_qwen3_tts_does_not_override_existing_tts_default(self):
+        presets, changed = ensure_builtin_provider_presets([
+            ProviderPreset(
+                id="edge",
+                type="tts",
+                name="Edge 默认",
+                provider="edge-tts",
+                enabled=True,
+                isDefault=True,
+                config={"voice": "zh-CN-XiaoxiaoNeural"},
+            )
+        ])
+        self.assertTrue(changed)
+        self.assertEqual(len(presets), 2)
+        self.assertTrue(next(p for p in presets if p.provider == "edge-tts").isDefault)
+        self.assertFalse(next(p for p in presets if p.provider == "qwen3-tts").isDefault)
+
     def test_save_load_and_single_default(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "presets.json"
@@ -101,6 +142,56 @@ class TestProviderPresets(unittest.TestCase):
         self.assertEqual(applied["default_target_language"], "ja")
         self.assertEqual(applied["tts_provider"], "volcengine-doubao")
         self.assertEqual(applied["tts_segment_gap"], "0.15")
+
+
+    def test_apply_tts_preset_can_preserve_current_voice(self):
+        settings = {
+            "tts_provider": "qwen3-tts",
+            "tts_voice": "Serena",
+        }
+        preset = ProviderPreset(
+            id="qwen",
+            type="tts",
+            name="本地 Qwen3-TTS",
+            provider="qwen3-tts",
+            config={
+                "voice": "Vivian",
+                "qwenMode": "auto",
+                "concurrency": 1,
+            },
+        )
+
+        applied = apply_tts_preset_to_settings(
+            settings,
+            preset,
+            preserve_current_voice=True,
+        )
+
+        self.assertEqual(applied["tts_provider"], "qwen3-tts")
+        self.assertEqual(applied["tts_voice"], "Serena")
+        self.assertEqual(applied["tts_qwen_mode"], "auto")
+
+    def test_apply_tts_preset_does_not_preserve_voice_across_providers(self):
+        settings = {
+            "tts_provider": "edge-tts",
+            "tts_voice": "zh-CN-XiaoxiaoNeural",
+        }
+        preset = ProviderPreset(
+            id="qwen",
+            type="tts",
+            name="本地 Qwen3-TTS",
+            provider="qwen3-tts",
+            config={"voice": "Vivian"},
+        )
+
+        applied = apply_tts_preset_to_settings(
+            settings,
+            preset,
+            preserve_current_voice=True,
+        )
+
+        self.assertEqual(applied["tts_provider"], "qwen3-tts")
+        self.assertEqual(applied["tts_voice"], "Vivian")
 
     def test_duplicate_set_default_and_export_redacts_keys(self):
         with tempfile.TemporaryDirectory() as td:

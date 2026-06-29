@@ -13,6 +13,7 @@ import os
 import json
 import shutil
 import threading
+from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -37,6 +38,7 @@ from engine.workspace import (
 try:
     from tts.voice_profile import TtsVoiceProfile, voice_profile_hash, profile_to_log_dict
     from tts.chunking import build_tts_chunks, TtsChunk
+    from tts.planner import build_tts_plan
     from audio.normalize import normalize_tts_audio
     _HAS_VOICE_PROFILE = True
 except ImportError:
@@ -45,6 +47,7 @@ except ImportError:
     voice_profile_hash = None
     profile_to_log_dict = None
     build_tts_chunks = None
+    build_tts_plan = None
     TtsChunk = None
     normalize_tts_audio = None
 
@@ -61,18 +64,28 @@ if str(_ENGINE_DIR_FOR_IMPORT) not in sys.path:
 try:
     from job_models import (
         Artifact, PipelineStage, ProcessingMode, SubtitleMode, SubtitleSegment,
-        SubtitleStyle, TaskResult, TranslationConfig,
+        SubtitleStyle, TaskResult, TranslationConfig, segments_from_srt_dicts,
     )
     from subtitle_ass import segments_to_ass, save_ass
     from services.ffmpeg_service import find_ffmpeg, render_hardsub, render_softsub
     from subtitles.normalize import read_subtitle_file
     from subtitles.srt_writer import write_srt, write_vtt, write_txt
     from subtitles.validate import validate_timeline, validate_translation
+    from subtitle_utils import (
+        find_repeated_subtitle_runs,
+        is_speech_subtitle_text,
+        normalize_subtitle_text,
+        normalize_subtitle_timeline,
+        reconstruct_split_words,
+    )
     from translation.batching import (
         CheckpointManager, batch_segments, batch_to_request,
     )
     from translation.glossary import Glossary as Gloss
     from translation.openai_compatible import get_provider
+    from translation.quality import (
+        has_blocking_issues, punctuation_only, validate_translation_items,
+    )
 except ImportError as e:
     logger.warning("Pipeline import error (some features may be unavailable): %s", e)
 
@@ -156,6 +169,30 @@ class PipelineRunner:
                        "Unable to read source subtitle file")
             return
 
+        raw_subtitle_dicts = [seg.to_srt_dict() for seg in segments]
+        normalized_subtitle_dicts = normalize_subtitle_timeline(raw_subtitle_dicts)
+        normalized_subtitle_dicts = reconstruct_split_words(normalized_subtitle_dicts)
+        if len(normalized_subtitle_dicts) != len(raw_subtitle_dicts) or any(
+            abs(float(normalized_subtitle_dicts[i].get("start", 0)) - float(raw_subtitle_dicts[i].get("start", 0))) > 0.001
+            or abs(float(normalized_subtitle_dicts[i].get("end", 0)) - float(raw_subtitle_dicts[i].get("end", 0))) > 0.001
+            or str(normalized_subtitle_dicts[i].get("text", "")) != str(raw_subtitle_dicts[i].get("text", ""))
+            for i in range(min(len(normalized_subtitle_dicts), len(raw_subtitle_dicts)))
+        ):
+            write_log(
+                ws,
+                f"  Subtitle timeline normalized: {len(raw_subtitle_dicts)} -> "
+                f"{len(normalized_subtitle_dicts)} segments",
+            )
+            segments = segments_from_srt_dicts(normalized_subtitle_dicts)
+
+        repeated_runs = find_repeated_subtitle_runs([seg.to_srt_dict() for seg in segments])
+        if repeated_runs:
+            write_log(
+                ws,
+                "  Subtitle quality warning: repeated text runs detected "
+                f"{json.dumps(repeated_runs[:5], ensure_ascii=False)}",
+            )
+
         warnings = validate_timeline(segments)
         for w in warnings:
             write_log(ws, f"  Timeline warning [{w[0]}]: {w[1]}")
@@ -194,9 +231,19 @@ class PipelineRunner:
                 return
 
         if target_lang and source_lang.lower() != target_lang.lower():
-            report = self._write_translation_quality_report(ws, segments)
+            self._normalize_translation_segments(ws, segments, target_lang)
+            translation_warnings = validate_translation(segments, target_lang)
+            report = self._write_translation_quality_report(
+                ws, segments, target_lang, translation_warnings,
+            )
             if report:
                 self._store.add_artifact(job_id, report)
+            if dubbing and self._has_blocking_translation_warnings(translation_warnings):
+                self._fail(
+                    job_id, ws, "TRANSLATION_QUALITY_FAILED",
+                    "翻译结果仍包含源语言残留/异常片段，已停止配音和烧录；请检查 translation_quality_report.json 后重新翻译",
+                )
+                return
 
         # --- SUBTITLE_EXPORT ---
         if should_run("subtitle_export"):
@@ -391,12 +438,24 @@ class PipelineRunner:
         if seed in ("", None):
             prepared["seed"] = _QWEN3_DEFAULT_STABLE_SEED
             prepared["seed_policy"] = "default_stable"
+            if prepared.get("temperature") in ("", None):
+                prepared["temperature"] = 0.6
+                prepared["temperature_policy"] = "default_stable"
+            if prepared.get("top_p") in ("", None):
+                prepared["top_p"] = 0.8
+                prepared["top_p_policy"] = "default_stable"
             return prepared
         try:
             seed_int = int(seed)
         except (TypeError, ValueError):
             prepared["seed"] = _QWEN3_DEFAULT_STABLE_SEED
             prepared["seed_policy"] = "default_stable"
+            if prepared.get("temperature") in ("", None):
+                prepared["temperature"] = 0.6
+                prepared["temperature_policy"] = "default_stable"
+            if prepared.get("top_p") in ("", None):
+                prepared["top_p"] = 0.8
+                prepared["top_p_policy"] = "default_stable"
             return prepared
         if seed_int < 0:
             prepared.pop("seed", None)
@@ -404,6 +463,12 @@ class PipelineRunner:
         else:
             prepared["seed"] = seed_int
             prepared["seed_policy"] = "explicit"
+        if prepared.get("temperature") in ("", None):
+            prepared["temperature"] = 0.6
+            prepared["temperature_policy"] = "default_stable"
+        if prepared.get("top_p") in ("", None):
+            prepared["top_p"] = 0.8
+            prepared["top_p_policy"] = "default_stable"
         return prepared
 
     def _unload_qwen3_tts(self, ws: Path, reason: str) -> None:
@@ -483,7 +548,8 @@ class PipelineRunner:
                     close()
 
         def complete_translations(batch_index: int,
-                                  batch: List[SubtitleSegment]) -> List[Dict]:
+                                  batch: List[SubtitleSegment],
+                                  depth: int = 0) -> List[Dict]:
             try:
                 translations = request_translation(batch)
             except Exception as exc:
@@ -502,18 +568,21 @@ class PipelineRunner:
                     f"  Batch {batch_index}: translation response invalid; splitting {len(batch)} segments",
                 )
                 return (
-                    complete_translations(batch_index, batch[:mid])
-                    + complete_translations(batch_index, batch[mid:])
+                    complete_translations(batch_index, batch[:mid], depth + 1)
+                    + complete_translations(batch_index, batch[mid:], depth + 1)
                 )
 
+            batch_ids = {s.index for s in batch}
             valid_by_id = {
-                int(t["id"]): str(t.get("text", ""))
+                int(t["id"]): self._clean_translation_text(str(t.get("text", "")))
                 for t in translations
                 if isinstance(t, dict)
                 and str(t.get("id", "")).isdigit()
-                and int(t.get("id")) in {s.index for s in batch}
+                and int(t.get("id")) in batch_ids
                 and str(t.get("text", "")).strip()
             }
+            fallback_ids = set()
+
             missing = [seg for seg in batch if seg.index not in valid_by_id]
             if missing:
                 if len(batch) <= 1:
@@ -523,20 +592,18 @@ class PipelineRunner:
                         f"  Batch {batch_index}: segment {seg.index} missing/empty translation; using source text",
                     )
                     valid_by_id[seg.index] = seg.text
-                    fallback_ids = {seg.index}
+                    fallback_ids.add(seg.index)
                 else:
                     write_log(
                         ws,
                         f"  Batch {batch_index}: retrying {len(missing)} missing/empty translations",
                     )
-                    fallback_ids = set()
-                    for item in complete_translations(batch_index, missing):
+                    for item in complete_translations(batch_index, missing, depth + 1):
                         if str(item.get("text", "")).strip():
-                            valid_by_id[int(item["id"])] = str(item["text"])
-                            if item.get("_fallback_source"):
-                                fallback_ids.add(int(item["id"]))
-            else:
-                fallback_ids = set()
+                            item_id = int(item["id"])
+                            valid_by_id[item_id] = self._clean_translation_text(str(item["text"]))
+                            if item.get("_fallback_source") or item.get("_quality_failed"):
+                                fallback_ids.add(item_id)
 
             result = []
             for seg in batch:
@@ -545,6 +612,54 @@ class PipelineRunner:
                 if seg.index in fallback_ids:
                     item["_fallback_source"] = True
                 result.append(item)
+
+            source_by_id = {seg.index: seg.text for seg in batch}
+            issues_by_id = validate_translation_items(result, source_by_id, target_lang)
+            bad_ids = {
+                item_id
+                for item_id, issues in issues_by_id.items()
+                if has_blocking_issues(issues)
+            }
+
+            if bad_ids and depth < 3 and len(batch) > 1:
+                bad_batch = [seg for seg in batch if seg.index in bad_ids]
+                write_log(
+                    ws,
+                    f"  Batch {batch_index}: retrying {len(bad_batch)} target-language quality failures",
+                )
+                for item in complete_translations(batch_index, bad_batch, depth + 1):
+                    item_id = int(item["id"])
+                    valid_by_id[item_id] = self._clean_translation_text(str(item.get("text", "")))
+                    if item.get("_fallback_source") or item.get("_quality_failed"):
+                        fallback_ids.add(item_id)
+                    else:
+                        fallback_ids.discard(item_id)
+                result = []
+                for seg in batch:
+                    text = valid_by_id.get(seg.index, seg.text)
+                    item = {"id": seg.index, "text": text}
+                    if seg.index in fallback_ids:
+                        item["_fallback_source"] = True
+                    result.append(item)
+                issues_by_id = validate_translation_items(result, source_by_id, target_lang)
+                bad_ids = {
+                    item_id
+                    for item_id, issues in issues_by_id.items()
+                    if has_blocking_issues(issues)
+                }
+
+            if bad_ids:
+                for item in result:
+                    item_id = int(item["id"])
+                    if item_id in bad_ids:
+                        joined = "; ".join(issue.code for issue in issues_by_id.get(item_id, []))
+                        item["_quality_failed"] = joined or "TARGET_LANGUAGE_QUALITY_FAILED"
+                        item["_fallback_source"] = True
+                        write_log(
+                            ws,
+                            f"  Batch {batch_index}: segment {item_id} failed target-language check: {item['_quality_failed']}",
+                        )
+
             return result
 
         def translate_one(batch_index: int,
@@ -582,7 +697,7 @@ class PipelineRunner:
 
                     if self._has_source_fallback_translations(batch, translations, request):
                         self._fail(job_id, ws, "TRANSLATION_INCOMPLETE",
-                                   "翻译结果不完整，部分字幕未翻译，已停止配音以避免把源语言文本送入 TTS")
+                                   "翻译结果不完整或目标语言校验失败，已停止配音以避免把源语言/脏字幕送入 TTS")
                         for pending_future in futures:
                             pending_future.cancel()
                         return False
@@ -619,7 +734,7 @@ class PipelineRunner:
 
             if self._has_source_fallback_translations(batch, translations, request):
                 self._fail(job_id, ws, "TRANSLATION_INCOMPLETE",
-                           "翻译结果不完整，部分字幕未翻译，已停止配音以避免把源语言文本送入 TTS")
+                           "翻译结果不完整或目标语言校验失败，已停止配音以避免把源语言/脏字幕送入 TTS")
                 return False
             self._apply_translation_result(batch, translations)
             checkpoints.mark_completed([s.index for s in batch])
@@ -643,7 +758,7 @@ class PipelineRunner:
             for t in translations
             if isinstance(t, dict)
             and str(t.get("id", "")).isdigit()
-            and t.get("_fallback_source")
+            and (t.get("_fallback_source") or t.get("_quality_failed"))
         }
         if fallback_ids:
             return True
@@ -884,12 +999,74 @@ class PipelineRunner:
                            "Qwen3-TTS 本地服务未运行，请在 设置 → Qwen3-TTS 管理 中点击「启动服务」后重试")
                 return False
 
+            # Voice-language compatibility preflight.  Using a voice whose
+            # native language differs from the target language (e.g. Korean
+            # "Sohee" for Chinese text) makes Qwen3-TTS produce abnormally
+            # long, accented, or off-language speech, which then gets
+            # hard-clipped and sounds like swallowed/incorrect audio.
+            try:
+                from tts.qwen3_tts import (
+                    is_voice_compatible,
+                    compatible_voice_for,
+                    voice_language,
+                    QWEN3_VOICE_LANGUAGE_MAP,
+                )
+            except ImportError:
+                is_voice_compatible = None  # type: ignore[assignment]
+            if callable(is_voice_compatible) and tts_voice and target_lang:
+                if not is_voice_compatible(tts_voice, target_lang):
+                    native_lang = voice_language(tts_voice) if callable(voice_language) else "?"
+                    corrected_voice = compatible_voice_for(target_lang, tts_voice) if callable(compatible_voice_for) else tts_voice
+                    write_log(
+                        ws,
+                        f"  TTS voice-language mismatch: voice '{tts_voice}' is native "
+                        f"for '{native_lang}' but target language is '{target_lang}'. "
+                        f"Auto-correcting to '{corrected_voice}' to avoid off-language "
+                        f"speech and severe hard-clipping.",
+                    )
+                    tts_voice = corrected_voice
+
         tts_segments: List[Tuple[int, Path, float]] = []
         speed_ratios = {}
-        candidates = [
-            seg for seg in segments
-            if (seg.translation or seg.text or "").strip()
-        ]
+        candidates = []
+        skipped_tts_inputs: List[Dict[str, Any]] = []
+        source_lang = str(request.get("source_language", "") or "").strip().lower()
+        translation_required_for_tts = bool(
+            target_lang
+            and source_lang
+            and source_lang not in {"auto", "unknown"}
+            and source_lang != str(target_lang).strip().lower()
+        )
+        missing_tts_translations: List[int] = []
+        for seg in segments:
+            if seg.translation:
+                raw_text = seg.translation
+            elif translation_required_for_tts and is_speech_subtitle_text(seg.text):
+                missing_tts_translations.append(seg.index)
+                continue
+            else:
+                raw_text = seg.text or ""
+            clean_text = normalize_subtitle_text(raw_text)
+            if not is_speech_subtitle_text(clean_text):
+                if clean_text:
+                    skipped_tts_inputs.append({
+                        "index": seg.index,
+                        "start": seg.start,
+                        "end": seg.end,
+                        "text": clean_text,
+                        "reason": "non_speech_text",
+                    })
+                continue
+            if seg.translation:
+                candidates.append(replace(seg, translation=clean_text))
+            else:
+                candidates.append(replace(seg, text=clean_text))
+        if missing_tts_translations:
+            self._fail(
+                job_id, ws, "TTS_TRANSLATION_MISSING",
+                f"有 {len(missing_tts_translations)} 条字幕缺少目标语言翻译，已停止配音，避免把源语言文本送入 TTS",
+            )
+            return False
         candidates.sort(key=lambda seg: (seg.start, seg.index))
         total = len(candidates)
         completed = 0
@@ -904,21 +1081,19 @@ class PipelineRunner:
         tts_gap = max(0.0, min(0.25, tts_gap))
         min_tts_duration = 0.02
 
-        target_durations = {}
-        for i, seg in enumerate(candidates):
-            nominal = max(min_tts_duration, seg.end - seg.start)
-            if i + 1 < len(candidates):
-                next_start = candidates[i + 1].start
-                available = next_start - seg.start - tts_gap
-                if available >= min_tts_duration:
-                    target_durations[seg.index] = max(nominal * 0.9, min(nominal, available))
-                else:
-                    target_durations[seg.index] = min(nominal * 0.9, max(nominal / 1.5, min_tts_duration))
-            else:
-                target_durations[seg.index] = nominal
+        # Filled after the timeline-aware planner has calculated each segment's
+        # safe tolerance/budget. Keeping this here documents the data shape for
+        # the nested synthesis helpers below.
+        target_durations: Dict[int, float] = {}
 
         write_log(ws, f"  TTS engine: {tts_provider_name}, voice: {tts_voice}, language: {target_lang}")
         write_log(ws, f"  TTS segments: {total}, concurrency: {tts_concurrency}")
+        if skipped_tts_inputs:
+            write_log(
+                ws,
+                f"  TTS skipped {len(skipped_tts_inputs)} non-speech subtitle inputs "
+                "(punctuation/filler only)",
+            )
         write_log(ws, f"  TTS output_dir: {tts_dir}")
 
         options = {
@@ -1005,8 +1180,105 @@ class PipelineRunner:
                 "tts_chunk_max_timeline_span_sec", "max_timeline_span_sec",
                 default=12.0, minimum=2.0, maximum=60.0,
             ),
+            "max_tolerance_sec": _float_option(
+                "tts_chunk_max_tolerance_sec", "max_tolerance_sec",
+                default=0.8, minimum=0.0, maximum=5.0,
+            ),
+            "soft_speed_factor": _float_option(
+                "tts_soft_speed_factor", "soft_speed_factor",
+                default=1.15, minimum=1.0, maximum=2.5,
+            ),
+            "max_speed_factor": _float_option(
+                "tts_max_speed_factor", "max_speed_factor",
+                default=1.5, minimum=1.0, maximum=3.0,
+            ),
+            "max_chunk_speed_factor": _float_option(
+                "tts_max_chunk_speed_factor", "max_chunk_speed_factor",
+                default=1.35, minimum=1.0, maximum=3.0,
+            ),
+            "allow_proportional_chunk_split": _bool_option(
+                "tts_chunk_allow_proportional_split",
+                "allow_proportional_chunk_split",
+                default=False,
+            ),
         }
         chunk_max_gap_sec = float(chunk_options["max_gap_sec"])
+        allow_proportional_chunk_split = bool(chunk_options["allow_proportional_chunk_split"])
+        tts_hard_clip = _bool_option("tts_hard_clip", "hard_clip_tts", default=True)
+        tts_hard_clip_overflow_sec = _float_option(
+            "tts_hard_clip_overflow_sec", "max_overflow_sec",
+            default=0.08, minimum=0.0, maximum=1.0,
+        )
+        duration_budget_mode = str(
+            tts_options.get(
+                "tts_duration_budget_mode",
+                request.get("tts_duration_budget_mode", "borrow_gap"),
+            ) or "borrow_gap"
+        ).strip().lower()
+
+        tts_plan = build_tts_plan(candidates, chunk_options) if callable(build_tts_plan) else None
+        plan_segments_by_index: Dict[int, Dict[str, Any]] = {}
+        plan_chunks_by_index: Dict[int, Dict[str, Any]] = {}
+        if tts_plan is not None:
+            plan_segments_by_index = {
+                int(item.index): item.to_dict()
+                for item in getattr(tts_plan, "segments", [])
+            }
+            plan_chunks_by_index = {
+                int(item.chunk_index): item.to_dict()
+                for item in getattr(tts_plan, "chunks", [])
+            }
+
+        def _target_duration_for_segment(i: int, seg: SubtitleSegment) -> float:
+            """Return the safe speech window for one subtitle segment.
+
+            The useful VideoLingo-inspired idea here is to plan the dubbing
+            budget before synthesis: a line may borrow a small following gap,
+            but it must not bleed into the next subtitle. This keeps TTS output
+            from being globally over-compressed while preserving subtitle starts.
+            """
+            nominal = max(min_tts_duration, float(seg.end) - float(seg.start))
+            next_start = float(candidates[i + 1].start) if i + 1 < len(candidates) else None
+            max_safe = nominal
+            if next_start is not None:
+                max_safe = max(min_tts_duration, next_start - float(seg.start) - tts_gap)
+
+            seg_plan = plan_segments_by_index.get(int(seg.index), {})
+            planned_available = seg_plan.get("available_duration")
+            planned_estimated = seg_plan.get("estimated_duration")
+            try:
+                available_budget = float(planned_available)
+            except (TypeError, ValueError):
+                available_budget = nominal
+            try:
+                estimated_budget = float(planned_estimated)
+            except (TypeError, ValueError):
+                estimated_budget = nominal
+
+            if duration_budget_mode in {"strict", "subtitle", "subtitle_only"}:
+                desired = nominal
+            elif duration_budget_mode in {"estimate", "speech_estimate"}:
+                desired = max(nominal * 0.65, min(available_budget, estimated_budget))
+            else:
+                # Default: borrow only the planner-approved tolerance from a
+                # short following gap. Long visual pauses still split chunks and
+                # remain silent instead of being swallowed by TTS.
+                desired = max(nominal, available_budget)
+
+            if next_start is not None:
+                desired = min(desired, max_safe)
+            return max(min_tts_duration, desired)
+
+        target_durations = {
+            int(seg.index): _target_duration_for_segment(i, seg)
+            for i, seg in enumerate(candidates)
+        }
+        if candidates:
+            write_log(
+                ws,
+                f"  TTS duration budget: mode={duration_budget_mode}, "
+                f"hard_clip={tts_hard_clip}, overflow={tts_hard_clip_overflow_sec:.2f}s",
+            )
 
         segment_by_index = {seg.index: seg for seg in candidates}
         next_start_by_index: Dict[int, Optional[float]] = {}
@@ -1022,11 +1294,17 @@ class PipelineRunner:
 
         if use_chunking:
             raw_chunks = build_tts_chunks(candidates, chunk_options)
+            pressure_summary: Dict[str, int] = {}
+            for item in plan_segments_by_index.values():
+                pressure = str(item.get("speed_pressure") or "unknown")
+                pressure_summary[pressure] = pressure_summary.get(pressure, 0) + 1
             write_log(
                 ws,
                 f"  TTS chunks: {len(candidates)} segments -> {len(raw_chunks)} chunks "
                 f"(mode={consistency_mode}, max_gap={chunk_options['max_gap_sec']}s, "
-                f"max_span={chunk_options['max_timeline_span_sec']}s)",
+                f"max_span={chunk_options['max_timeline_span_sec']}s, "
+                f"allow_proportional_split={allow_proportional_chunk_split}, "
+                f"pressure={pressure_summary})",
             )
             for c in raw_chunks:
                 c_segs = [seg for seg in candidates if seg.index in c.segment_indexes]
@@ -1049,6 +1327,8 @@ class PipelineRunner:
         ) -> Dict[str, Any]:
             next_start = next_start_by_index.get(seg.index)
             gap_to_next = None if next_start is None else max(0.0, float(next_start) - float(seg.end))
+            seg_plan = plan_segments_by_index.get(int(seg.index), {})
+            chunk_plan = plan_chunks_by_index.get(int(chunk_index)) if chunk_index is not None else None
             return {
                 "subtitle_start": float(seg.start),
                 "subtitle_end": float(seg.end),
@@ -1061,6 +1341,17 @@ class PipelineRunner:
                 "source_window_duration": source_window_duration,
                 "overlay_start": float(seg.start),
                 "overlay_start_matches_subtitle_start": True,
+                "planned_tolerance": seg_plan.get("tolerance"),
+                "planned_available_duration": seg_plan.get("available_duration"),
+                "planned_estimated_duration": seg_plan.get("estimated_duration"),
+                "planned_target_duration": target_durations.get(int(seg.index)),
+                "duration_budget_mode": duration_budget_mode,
+                "planned_speed_factor": seg_plan.get("speed_factor"),
+                "speed_pressure": seg_plan.get("speed_pressure"),
+                "chunk_speed_factor": (chunk_plan or {}).get("speed_factor"),
+                "chunk_speed_pressure": (chunk_plan or {}).get("speed_pressure"),
+                "chunk_keep_gaps": (chunk_plan or {}).get("keep_gaps"),
+                "chunk_split_reason": (chunk_plan or {}).get("split_reason"),
             }
 
         def record_report(result: Dict[str, Any]) -> None:
@@ -1088,6 +1379,17 @@ class PipelineRunner:
                 "source_window_duration": result.get("source_window_duration"),
                 "overlay_start": start,
                 "overlay_start_matches_subtitle_start": overlay_matches,
+                "planned_tolerance": result.get("planned_tolerance"),
+                "planned_available_duration": result.get("planned_available_duration"),
+                "planned_estimated_duration": result.get("planned_estimated_duration"),
+                "planned_target_duration": result.get("planned_target_duration"),
+                "duration_budget_mode": result.get("duration_budget_mode"),
+                "planned_speed_factor": result.get("planned_speed_factor"),
+                "speed_pressure": result.get("speed_pressure"),
+                "chunk_speed_factor": result.get("chunk_speed_factor"),
+                "chunk_speed_pressure": result.get("chunk_speed_pressure"),
+                "chunk_keep_gaps": result.get("chunk_keep_gaps"),
+                "chunk_split_reason": result.get("chunk_split_reason"),
                 "mode": result.get("mode", options.get("qwen_mode", "")),
                 "cached": bool(result.get("cached", False)),
                 "target_duration": result.get("target_duration"),
@@ -1130,15 +1432,53 @@ class PipelineRunner:
             speed = None
             warning = ""
 
+            # Detect abnormally long TTS output early.  A voice-language
+            # mismatch (e.g. Korean voice reading Chinese) often makes the
+            # model produce 2-5x longer audio than estimated, which leads to
+            # severe hard-clipping and "swallowed sound" artifacts.
+            seg_plan = plan_segments_by_index.get(int(seg.index), {})
+            try:
+                estimated_dur = float(seg_plan.get("estimated_duration") or 0.0)
+            except (TypeError, ValueError):
+                estimated_dur = 0.0
+            if actual_dur > 0 and estimated_dur > 0 and actual_dur > estimated_dur * 2.0:
+                write_log(
+                    ws,
+                    f"  TTS abnormal duration | index={seg.index} "
+                    f"actual={actual_dur:.2f}s estimated={estimated_dur:.2f}s "
+                    f"ratio={actual_dur / estimated_dur:.1f}x — possible voice-language "
+                    f"mismatch or model issue; text_preview={text.strip()[:80]}",
+                )
+                warning = (
+                    f"abnormal_duration: actual {actual_dur:.2f}s is "
+                    f"{actual_dur / estimated_dur:.1f}x longer than estimated "
+                    f"{estimated_dur:.2f}s"
+                )
+
             result_path = normalize_tts_audio(temp_path) if callable(normalize_tts_audio) else None
             normalized_path = Path(result_path) if result_path else temp_path
 
             if actual_dur > 0 and target_dur > 0:
-                adj_dur, warning, speed = adjust_timing(
+                adj_dur, warning, speed = _adjust_timing_for_window(
                     normalized_path, seg_path, actual_dur, target_dur,
                 )
                 if not seg_path.exists():
                     shutil.copy2(str(normalized_path), str(seg_path))
+                # Warn prominently when hard-clipping removes a large portion
+                # of the speech, which is the direct cause of "吞音".
+                if actual_dur > 0 and adj_dur > 0:
+                    post_speed_dur = actual_dur / (speed or 1.0)
+                    clipped_sec = post_speed_dur - adj_dur
+                    if clipped_sec > 0.25 and clipped_sec / post_speed_dur > 0.25:
+                        write_log(
+                            ws,
+                            f"  TTS severe clipping | index={seg.index} "
+                            f"actual={actual_dur:.2f}s speed={speed or 1.0:.2f}x "
+                            f"post_speed={post_speed_dur:.2f}s "
+                            f"target={target_dur:.2f}s "
+                            f"clipped={clipped_sec:.2f}s ({clipped_sec / post_speed_dur * 100:.0f}%) — "
+                            f"speech truncated, audio will not match subtitle",
+                        )
             else:
                 shutil.copy2(str(normalized_path), str(seg_path))
 
@@ -1158,6 +1498,23 @@ class PipelineRunner:
             return payload
 
         _wav_dur_cache: Dict[str, float] = {}
+
+
+        def _adjust_timing_for_window(input_audio: Path, output_audio: Path,
+                                      actual_duration: float,
+                                      target_duration: float) -> Tuple[float, str, float]:
+            try:
+                return adjust_timing(
+                    input_audio, output_audio, actual_duration, target_duration,
+                    hard_clip=tts_hard_clip,
+                    max_overflow_sec=tts_hard_clip_overflow_sec,
+                )
+            except TypeError as exc:
+                # Backward compatibility for tests/plugins that monkeypatch an
+                # older adjust_timing signature without hard_clip kwargs.
+                if "unexpected keyword" not in str(exc):
+                    raise
+                return adjust_timing(input_audio, output_audio, actual_duration, target_duration)
 
         def _get_wav_duration_cached(path: Path) -> float:
             key = str(path.resolve())
@@ -1194,11 +1551,37 @@ class PipelineRunner:
             target_boundary_count = len(csegs) - 1
 
             if len(boundaries) >= target_boundary_count and target_boundary_count >= 1:
-                # Use silence detection: pick the most evenly distributed boundaries
+                # Prefer real silence boundaries closest to the text-proportional
+                # expected split points.  This is safer than taking evenly spaced
+                # silences when the TTS model inserts extra pauses inside a line.
                 if len(boundaries) > target_boundary_count:
-                    step = len(boundaries) / (target_boundary_count + 1)
-                    picked = [boundaries[int((i + 1) * step)]
-                              for i in range(target_boundary_count)]
+                    text_units = [
+                        max(1, len((seg.translation or seg.text or "").strip()))
+                        for seg in csegs
+                    ]
+                    total_units = max(1, sum(text_units))
+                    expected_points: List[float] = []
+                    cursor_units = 0
+                    for units in text_units[:-1]:
+                        cursor_units += units
+                        expected_points.append(chunk_dur * (cursor_units / total_units))
+
+                    picked = []
+                    remaining = list(boundaries)
+                    lower_bound = 0.0
+                    for expected in expected_points:
+                        viable = [point for point in remaining if point > lower_bound + 0.03]
+                        if not viable:
+                            break
+                        chosen = min(viable, key=lambda point: abs(point - expected))
+                        picked.append(chosen)
+                        lower_bound = chosen
+                        remaining = [point for point in remaining if point > chosen + 0.001]
+
+                    if len(picked) != target_boundary_count:
+                        step = len(boundaries) / (target_boundary_count + 1)
+                        picked = [boundaries[int((i + 1) * step)]
+                                  for i in range(target_boundary_count)]
                 else:
                     picked = boundaries.copy()
 
@@ -1210,9 +1593,20 @@ class PipelineRunner:
                     windows[seg.index] = (max(0.0, start_offset), max(0.001, duration))
                 return windows
 
-            # Silence detection insufficient; use character-proportion only for
-            # compact chunks. Long internal gaps indicate the chunk should have
-            # been split and per-segment synthesis is safer.
+            # Silence detection insufficient. Proportional slicing is the
+            # classic source of speech running ahead of subtitles: if the TTS
+            # model pauses differently from our character-count guess, words
+            # from line N+1 can be extracted into line N. Default to a safe
+            # per-segment fallback; allow opting in only for experiments.
+            if target_boundary_count >= 1 and not allow_proportional_chunk_split:
+                write_log(
+                    ws,
+                    f"  TTS chunk {getattr(chunk, 'chunk_index', '?')} has "
+                    f"{len(boundaries)}/{target_boundary_count} usable silence boundaries; "
+                    "falling back to per-segment synthesis for subtitle sync",
+                )
+                return None
+
             if target_boundary_count >= 1 and _max_segment_gap(csegs) > chunk_max_gap_sec:
                 write_log(
                     ws,
@@ -1246,12 +1640,12 @@ class PipelineRunner:
 
             seg_path = tts_dir / f"seg_{seg.index:04d}.wav"
             temp_path = tts_dir / f"seg_{seg.index:04d}_raw.wav"
-            text = seg.translation or seg.text
-            if not text.strip():
+            text = normalize_subtitle_text(seg.translation or seg.text)
+            if not is_speech_subtitle_text(text):
                 seg_path.unlink(missing_ok=True)
                 temp_path.unlink(missing_ok=True)
                 return {"skipped": True, "index": seg.index, "start": seg.start,
-                        "target_duration": 0, "reason": "empty text"}
+                        "target_duration": 0, "reason": "non-speech text"}
             target_dur_val = target_durations.get(seg.index, seg.end - seg.start)
             if target_dur_val <= 0:
                 seg_path.unlink(missing_ok=True)
@@ -1388,11 +1782,27 @@ class PipelineRunner:
                     source_duration = estimated_dur
 
                 if source_duration > 0:
-                    adj_dur, warning, speed = adjust_timing(
+                    adj_dur, warning, speed = _adjust_timing_for_window(
                         source_audio, seg_path, source_duration, seg_target,
                     )
                     if not seg_path.exists():
                         shutil.copy2(str(source_audio), str(seg_path))
+                    # Warn prominently when hard-clipping removes a large
+                    # portion of the speech in chunk mode too.
+                    if source_duration > 0 and adj_dur > 0:
+                        post_speed_dur = source_duration / (speed or 1.0)
+                        clipped_sec = post_speed_dur - adj_dur
+                        if clipped_sec > 0.25 and clipped_sec / post_speed_dur > 0.25:
+                            write_log(
+                                ws,
+                                f"  TTS severe clipping | index={seg.index} "
+                                f"chunk={chunk.chunk_index} "
+                                f"source={source_duration:.2f}s speed={speed or 1.0:.2f}x "
+                                f"post_speed={post_speed_dur:.2f}s "
+                                f"target={seg_target:.2f}s "
+                                f"clipped={clipped_sec:.2f}s ({clipped_sec / post_speed_dur * 100:.0f}%) — "
+                                f"speech truncated, audio will not match subtitle",
+                            )
                 else:
                     shutil.copy2(str(source_audio), str(seg_path))
                     warning = ""
@@ -1561,6 +1971,7 @@ class PipelineRunner:
             chunk_count=len(chunks),
             chunk_fallback_count=chunk_fallback_count,
             chunk_options=chunk_options,
+            tts_plan=tts_plan.to_dict() if tts_plan is not None else None,
         )
         if timeline_artifact:
             self._store.add_artifact(job_id, timeline_artifact)
@@ -1593,14 +2004,87 @@ class PipelineRunner:
             write_log(ws, f"  Qwen3 voice clone prompt creation failed: {exc}")
             return ""
 
+    @staticmethod
+    def _append_translation_punctuation(text: str, punctuation: str) -> str:
+        base = PipelineRunner._clean_translation_text(text)
+        punct = PipelineRunner._clean_translation_text(punctuation)
+        if not punct:
+            return base
+        if not base:
+            return punct
+        if base.endswith(punct):
+            return base
+        return f"{base}{punct}"
+
+    def _normalize_translation_segments(self, ws: Path,
+                                        segments: List[SubtitleSegment],
+                                        target_lang: str) -> None:
+        """Clean translated text before export/TTS.
+
+        Translation APIs sometimes return a standalone punctuation caption or
+        preserve invisible/control characters.  Merge punctuation-only target
+        captions into the previous translated sentence so exported subtitles and
+        TTS inputs do not contain isolated "。"/"..." lines.
+        """
+        previous: Optional[SubtitleSegment] = None
+        merged_punctuation = 0
+        cleaned_count = 0
+
+        for seg in sorted(segments, key=lambda item: (float(item.start), int(item.index))):
+            cleaned = self._clean_translation_text(seg.translation)
+            if cleaned != (seg.translation or ""):
+                cleaned_count += 1
+            seg.translation = cleaned
+
+            if not cleaned:
+                continue
+
+            if punctuation_only(cleaned):
+                if previous and previous.translation:
+                    previous.translation = self._append_translation_punctuation(previous.translation, cleaned)
+                    seg.translation = ""
+                    seg.metadata["translation_skipped"] = "punctuation_only_merged"
+                    merged_punctuation += 1
+                continue
+
+            previous = seg
+
+        if cleaned_count or merged_punctuation:
+            write_log(
+                ws,
+                f"  Translation normalized: cleaned={cleaned_count}, "
+                f"merged_punctuation={merged_punctuation}, target={target_lang}",
+            )
+
+    @staticmethod
+    def _has_blocking_translation_warnings(warnings: List[Tuple[str, str, Dict]]) -> bool:
+        blocking_codes = {
+            "EMPTY_TRANSLATION",
+            "MISSING_TRANSLATION",
+            "UNTRANSLATED",
+            "TARGET_LANGUAGE_LEAK_JA",
+            "TARGET_LANGUAGE_LEAK_JA_FRAGMENT",
+            "TARGET_LANGUAGE_LEAK_KO",
+            "TARGET_LANGUAGE_LEAK_NON_LATIN",
+            "UNTRANSLATED_SOURCE_COPY",
+            "SUSPICIOUS_TRANSLATION_ARTIFACT",
+            "PUNCTUATION_ONLY_TRANSLATION",
+        }
+        return any(code in blocking_codes for code, _message, _context in warnings)
+
     def _write_translation_quality_report(self, ws: Path,
-                                          segments: List[SubtitleSegment]) -> Optional[Dict]:
-        warnings = validate_translation(segments)
+                                          segments: List[SubtitleSegment],
+                                          target_lang: str = "",
+                                          warnings: Optional[List[Tuple[str, str, Dict]]] = None) -> Optional[Dict]:
+        if warnings is None:
+            warnings = validate_translation(segments, target_lang)
         report_path = ws / "translation" / "translation_quality_report.json"
         report_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
+            "target_language": target_lang,
             "total_segments": len(segments),
             "warning_count": len(warnings),
+            "blocking_warning_count": sum(1 for item in warnings if self._has_blocking_translation_warnings([item])),
             "warnings": [
                 {"code": code, "message": message, "context": context}
                 for code, message, context in warnings
@@ -1644,7 +2128,8 @@ class PipelineRunner:
     def _write_tts_timeline_report(self, ws: Path, rows: List[Dict[str, Any]],
                                    *, chunk_count: int,
                                    chunk_fallback_count: int,
-                                   chunk_options: Dict[str, Any]) -> Optional[Dict]:
+                                   chunk_options: Dict[str, Any],
+                                   tts_plan: Optional[Dict[str, Any]] = None) -> Optional[Dict]:
         report_path = ws / "audio" / "tts" / "tts_timeline_report.json"
         report_path.parent.mkdir(parents=True, exist_ok=True)
         warnings = [
@@ -1659,7 +2144,11 @@ class PipelineRunner:
             "chunk_fallback_count": int(chunk_fallback_count),
             "max_gap_sec": chunk_options.get("max_gap_sec"),
             "max_timeline_span_sec": chunk_options.get("max_timeline_span_sec"),
+            "max_tolerance_sec": chunk_options.get("max_tolerance_sec"),
+            "max_chunk_speed_factor": chunk_options.get("max_chunk_speed_factor"),
+            "allow_proportional_chunk_split": chunk_options.get("allow_proportional_chunk_split"),
             "warnings_count": len(warnings),
+            "tts_plan": tts_plan or {},
             "segments": sorted(rows, key=lambda row: int(row.get("index") or 0)),
         }
         report_path.write_text(
@@ -1683,8 +2172,15 @@ class PipelineRunner:
             return False
 
         tts_dir = ws / "audio" / "tts"
-        segment_start_by_index = {int(seg.index): float(seg.start) for seg in segments}
-        tts_segments = []
+        ordered_segments = sorted(segments, key=lambda item: (float(item.start), int(item.index)))
+        segment_start_by_index = {int(seg.index): float(seg.start) for seg in ordered_segments}
+        segment_by_index = {int(seg.index): seg for seg in ordered_segments}
+        next_start_by_index: Dict[int, Optional[float]] = {}
+        for i, seg in enumerate(ordered_segments):
+            next_start_by_index[int(seg.index)] = (
+                float(ordered_segments[i + 1].start) if i + 1 < len(ordered_segments) else None
+            )
+        tts_segments: List[Tuple[int, Path, float]] = []
         index_path = tts_dir / "index.json"
 
         if index_path.exists():
@@ -1718,21 +2214,103 @@ class PipelineRunner:
                         f"  TTS index start mismatch for seg {idx}: "
                         f"index={indexed_start:.3f}s current={current_start:.3f}s; using current subtitle start",
                     )
-                tts_segments.append((wav_path, current_start))
+                tts_segments.append((idx, wav_path, current_start))
         else:
             tts_wavs = sorted(tts_dir.glob("seg_*.wav"))
             for seg in segments:
                 match = [w for w in tts_wavs if w.stem.endswith(f"{seg.index:04d}")]
                 if match and match[0].stat().st_size > 0:
-                    tts_segments.append((match[0], seg.start))
+                    tts_segments.append((int(seg.index), match[0], float(seg.start)))
 
         if not tts_segments:
             self._fail(job_id, ws, "AUDIO_MIX_NO_TTS", "No TTS audio files found")
             return False
 
-        tts_segments.sort(key=lambda item: item[1])
+        tts_segments.sort(key=lambda item: item[2])
 
-        from audio.mix import mix_audio
+        from audio.mix import get_audio_duration, mix_audio
+        from tts.timing import extract_audio_window
+
+        tts_options = dict(request.get("tts_options", {}) or {})
+        try:
+            mix_gap = float(tts_options.get("tts_segment_gap", request.get("tts_segment_gap", 0.04)) or 0.04)
+        except (TypeError, ValueError):
+            mix_gap = 0.04
+        mix_gap = max(0.0, min(0.25, mix_gap))
+
+        def _prepare_mix_safe_segments() -> Tuple[List[Tuple[Path, float]], Optional[Dict[str, Any]]]:
+            """Final guardrail before FFmpeg amix.
+
+            Even if an older cached seg_*.wav or a provider quirk ignores timing,
+            this pass prevents one clip from bleeding into the next subtitle
+            window. It writes a small report so misalignment can be diagnosed
+            without listening through the whole render.
+            """
+            safe_dir = tts_dir / "mix_safe"
+            safe_dir.mkdir(parents=True, exist_ok=True)
+            safe_items: List[Tuple[Path, float]] = []
+            rows: List[Dict[str, Any]] = []
+            clipped_count = 0
+
+            for idx, wav_path, start in tts_segments:
+                if cancel_token.is_cancelled():
+                    break
+                duration = get_audio_duration(wav_path)
+                next_start = next_start_by_index.get(int(idx))
+                max_duration = None
+                clipped = False
+                output_wav = wav_path
+
+                if next_start is not None:
+                    max_duration = max(0.02, float(next_start) - float(start) - mix_gap)
+                    if duration > 0 and duration > max_duration + 0.03:
+                        clipped_wav = safe_dir / f"seg_{int(idx):04d}_mixsafe.wav"
+                        if extract_audio_window(wav_path, clipped_wav, 0.0, max_duration):
+                            output_wav = clipped_wav
+                            duration = get_audio_duration(clipped_wav) or max_duration
+                            clipped = True
+                            clipped_count += 1
+                        else:
+                            write_log(
+                                ws,
+                                f"  TTS mix-safe trim failed for seg {idx}; using original audio",
+                            )
+
+                safe_items.append((output_wav, float(start)))
+                seg = segment_by_index.get(int(idx))
+                rows.append({
+                    "index": int(idx),
+                    "path": str(output_wav),
+                    "source_path": str(wav_path),
+                    "start": float(start),
+                    "duration": duration,
+                    "subtitle_start": float(seg.start) if seg is not None else None,
+                    "subtitle_end": float(seg.end) if seg is not None else None,
+                    "next_subtitle_start": next_start,
+                    "max_duration_before_next": max_duration,
+                    "gap_sec": mix_gap,
+                    "clipped_for_mix": clipped,
+                })
+
+            report = {
+                "total_segments": len(rows),
+                "clipped_segments": clipped_count,
+                "gap_sec": mix_gap,
+                "segments": rows,
+            } if rows else None
+            if report:
+                report_path = tts_dir / "mix_alignment_report.json"
+                report_path.write_text(
+                    json.dumps(report, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                self._store.add_artifact(job_id, {
+                    "kind": "tts_mix_alignment_report",
+                    "path": "audio/tts/mix_alignment_report.json",
+                })
+                if clipped_count:
+                    write_log(ws, f"  TTS mix-safe clipped {clipped_count} segment(s) to prevent overlap")
+            return safe_items, report
 
         def cc():
             return cancel_token.is_cancelled()
@@ -1750,9 +2328,16 @@ class PipelineRunner:
             else "Replacing original audio with TTS audio..."
         )
         self._progress.update(job_id, "audio_mix", 10, mix_message)
+        mix_inputs, _mix_report = _prepare_mix_safe_segments()
+        if cancel_token.is_cancelled():
+            self._mark_cancelled(job_id, ws)
+            return False
+        if not mix_inputs:
+            self._fail(job_id, ws, "AUDIO_MIX_NO_TTS", "No usable TTS audio files found after alignment checks")
+            return False
         result = mix_audio(
             video_path=source_video,
-            tts_segments=tts_segments,
+            tts_segments=mix_inputs,
             output_path=output_path,
             original_volume=original_volume,
             cancel_checker=cc,

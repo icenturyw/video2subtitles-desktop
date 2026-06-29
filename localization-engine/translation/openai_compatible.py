@@ -19,9 +19,18 @@ from .base import (
     TranslationError,
     TranslationProvider,
 )
-from .batching import batch_segments, batch_to_request
-from .prompts import build_system_prompt, build_translate_prompt
-from .response_parser import parse_translation_response, sanitize_for_log
+from .batching import batch_segments, batch_to_request, batch_to_tsv
+from .prompts import (
+    build_system_prompt,
+    build_system_prompt_compact,
+    build_translate_prompt,
+    build_translate_prompt_compact,
+)
+from .response_parser import (
+    parse_translation_response,
+    parse_translation_response_compact,
+    sanitize_for_log,
+)
 
 logger = logging.getLogger("translation.openai")
 
@@ -50,6 +59,11 @@ _LANGUAGE_NAMES = {
 def _language_name(language: str) -> str:
     text = str(language or "auto").strip()
     return _LANGUAGE_NAMES.get(text.lower(), text or "auto")
+
+
+def batch_to_tsv_from_dicts(segments: List[Dict]) -> str:
+    """Convert a list of {"id": int, "text": str} to TSV string."""
+    return "\n".join(f'{s["id"]}\t{s["text"]}' for s in segments)
 
 
 def _extract_response_content(result: Any) -> str:
@@ -180,7 +194,8 @@ class OpenAICompatibleProvider(TranslationProvider):
         return explicit
 
     def _build_payload(self, endpoint: str, model: str, system_prompt: str,
-                       user_prompt: str, temperature: float) -> Dict[str, Any]:
+                       user_prompt: str, temperature: float,
+                       estimated_output_chars: int = 4096) -> Dict[str, Any]:
         if endpoint == "responses":
             return {
                 "model": model,
@@ -188,14 +203,22 @@ class OpenAICompatibleProvider(TranslationProvider):
                 "input": user_prompt,
             }
         if endpoint == "anthropic_messages":
-            return {
+            dynamic_max_tokens = max(4096, min(8192, estimated_output_chars))
+            payload: Dict[str, Any] = {
                 "model": model,
-                "max_tokens": 4096,
-                "system": system_prompt,
+                "max_tokens": dynamic_max_tokens,
+                "system": [
+                    {
+                        "type": "text",
+                        "text": system_prompt,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
                 "messages": [
                     {"role": "user", "content": user_prompt},
                 ],
             }
+            return payload
         return {
             "model": model,
             "messages": [
@@ -203,7 +226,6 @@ class OpenAICompatibleProvider(TranslationProvider):
                 {"role": "user", "content": user_prompt},
             ],
             "temperature": temperature,
-            # Note: response_format removed - not supported by all OpenAI-compatible servers
         }
 
     def _endpoint_url(self, base_url: str, endpoint: str) -> str:
@@ -256,7 +278,81 @@ class OpenAICompatibleProvider(TranslationProvider):
                     headers=endpoint_headers,
                     timeout=timeout,
                 )
+        if response.status_code == 400 and isinstance(payload.get("system"), list):
+            detail = _response_error_detail(response).lower()
+            if any(kw in detail for kw in ("cache_control", "cache", "system")):
+                logger.warning("cache_control not supported, retrying without")
+                slim_payload = dict(payload)
+                system_list = slim_payload.pop("system", [])
+                if isinstance(system_list, list) and system_list:
+                    slim_payload["system"] = str(system_list[0].get("text", ""))
+                else:
+                    slim_payload["system"] = str(system_list) if system_list else ""
+                response = self.client.post(
+                    self._endpoint_url(base_url, endpoint),
+                    json=slim_payload,
+                    headers=endpoint_headers,
+                    timeout=timeout,
+                )
         return response
+
+    def _stream_accumulate(self, endpoint: str, base_url: str,
+                            payload: Dict[str, Any], headers: Dict[str, str],
+                            timeout: int) -> str:
+        """Send a streaming request and accumulate the full response text."""
+        endpoint_headers = dict(headers)
+        if endpoint == "anthropic_messages":
+            endpoint_headers["anthropic-beta"] = "context-1m-2025-08-07"
+
+        accumulated: List[str] = []
+        with self.client.stream(
+            "POST",
+            self._endpoint_url(base_url, endpoint),
+            json=payload,
+            headers=endpoint_headers,
+            timeout=timeout,
+        ) as response:
+            if response.status_code != 200:
+                response.read()
+                raise httpx.HTTPStatusError(
+                    f"Streaming request failed: HTTP {response.status_code}",
+                    request=response.request,
+                    response=response,
+                )
+
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                if endpoint == "anthropic_messages":
+                    if line.startswith("data: "):
+                        data = line[6:]
+                        if data == "[DONE]":
+                            break
+                        try:
+                            event = json.loads(data)
+                            delta = event.get("delta", {})
+                            text = delta.get("text", "")
+                            if text:
+                                accumulated.append(text)
+                        except json.JSONDecodeError:
+                            continue
+                else:
+                    if line.startswith("data: "):
+                        data = line[6:]
+                        if data == "[DONE]":
+                            break
+                        try:
+                            event = json.loads(data)
+                            choices = event.get("choices", [])
+                            if choices:
+                                delta = choices[0].get("delta", {})
+                                text = delta.get("content", "")
+                                if text:
+                                    accumulated.append(text)
+                        except json.JSONDecodeError:
+                            continue
+
+        return "".join(accumulated)
 
     def translate_batch(self, segments: List[Dict], config: TranslationConfig,
                         source_lang: str, target_lang: str,
@@ -273,16 +369,29 @@ class OpenAICompatibleProvider(TranslationProvider):
         temperature = config.temperature
 
         segments_json = json.dumps(segments, ensure_ascii=False)
+        segments_tsv = batch_to_tsv_from_dicts(segments)
         source_prompt_lang = _language_name(source_lang)
         target_prompt_lang = _language_name(target_lang)
-        system_prompt = build_system_prompt(source_prompt_lang, target_prompt_lang)
-        user_prompt = build_translate_prompt(
-            segments_json=segments_json,
-            source_lang=source_prompt_lang,
-            target_lang=target_prompt_lang,
-            count=len(segments),
-            glossary_text=glossary or "",
-        )
+
+        use_compact = getattr(config, "output_format", "json") == "compact"
+        if use_compact:
+            system_prompt = build_system_prompt_compact(source_prompt_lang, target_prompt_lang)
+            user_prompt = build_translate_prompt_compact(
+                segments_tsv=segments_tsv,
+                source_lang=source_prompt_lang,
+                target_lang=target_prompt_lang,
+                count=len(segments),
+                glossary_text=glossary or "",
+            )
+        else:
+            system_prompt = build_system_prompt(source_prompt_lang, target_prompt_lang)
+            user_prompt = build_translate_prompt(
+                segments_json=segments_json,
+                source_lang=source_prompt_lang,
+                target_lang=target_prompt_lang,
+                count=len(segments),
+                glossary_text=glossary or "",
+            )
 
         headers = {
             "Content-Type": "application/json",
@@ -301,58 +410,101 @@ class OpenAICompatibleProvider(TranslationProvider):
         max_attempts = max(1, config.retry_count + 1)
         for attempt in range(max_attempts):
             for endpoint_index, endpoint in enumerate(endpoints):
+                estimated_chars = sum(len(s["text"]) for s in segments) * 4
                 payload = self._build_payload(
-                    endpoint, model, system_prompt, user_prompt, temperature
+                    endpoint, model, system_prompt, user_prompt, temperature,
+                    estimated_output_chars=estimated_chars,
                 )
+                if getattr(config, "stream", False):
+                    payload["stream"] = True
                 try:
-                    response = self._post_endpoint(
-                        endpoint, base_url, payload, headers, config.timeout
-                    )
-
-                    if response.status_code in (401, 403):
-                        raise AuthError(_response_error_detail(response))
-                    elif response.status_code == 429:
-                        retry_after = int(response.headers.get("Retry-After", "30"))
-                        raise RateLimitError(retry_after=retry_after)
-                    elif response.status_code >= 400:
-                        error_detail = _response_error_detail(response)
-                        if self._is_endpoint_fallback_error(response):
-                            last_error = TranslationError(error_detail, recoverable=False)
-                            logger.warning("%s endpoint unavailable: %s", endpoint, error_detail)
-                            continue
-                        if response.status_code == 400:
-                            logger.error("Translation API returned 400 Bad Request: %s", error_detail)
-                        raise TranslationError(
-                            error_detail,
-                            recoverable=response.status_code >= 500,
+                    use_stream = payload.get("stream", False)
+                    if use_stream:
+                        try:
+                            content = self._stream_accumulate(
+                                endpoint, base_url, payload, headers, config.timeout
+                            )
+                        except httpx.HTTPStatusError as e:
+                            if e.response.status_code == 400:
+                                detail = _response_error_detail(e.response).lower()
+                                if "stream" in detail:
+                                    logger.warning("Stream not supported, retrying non-stream")
+                                    slim_payload = dict(payload)
+                                    slim_payload.pop("stream", None)
+                                    if endpoint == "anthropic_messages":
+                                        slim_payload["system"] = system_prompt
+                                    response = self._post_endpoint(
+                                        endpoint, base_url, slim_payload, headers, config.timeout
+                                    )
+                                    if response.status_code >= 400:
+                                        raise TranslationError(
+                                            _response_error_detail(response),
+                                            recoverable=response.status_code >= 500,
+                                        )
+                                    if response.status_code in (401, 403):
+                                        raise AuthError(_response_error_detail(response))
+                                    if response.status_code == 429:
+                                        raise RateLimitError(
+                                            retry_after=int(response.headers.get("Retry-After", "30"))
+                                        )
+                                    result = response.json()
+                                    content = _extract_response_content(result)
+                                else:
+                                    raise
+                            else:
+                                raise
+                    else:
+                        response = self._post_endpoint(
+                            endpoint, base_url, payload, headers, config.timeout
                         )
 
-                    response.raise_for_status()
-                    try:
-                        result = response.json()
-                    except json.JSONDecodeError as exc:
-                        content_type = response.headers.get("content-type", "")
-                        body = sanitize_for_log(response.text or "", 800)
-                        if self._can_fallback_endpoint(
-                            getattr(config, "api_type", "auto"), endpoint_index, endpoints
-                        ):
-                            last_error = InvalidResponseError(
-                                f"{endpoint} endpoint returned non-JSON response "
-                                f"(content-type={content_type}): {body}"
+                        if response.status_code in (401, 403):
+                            raise AuthError(_response_error_detail(response))
+                        elif response.status_code == 429:
+                            retry_after = int(response.headers.get("Retry-After", "30"))
+                            raise RateLimitError(retry_after=retry_after)
+                        elif response.status_code >= 400:
+                            error_detail = _response_error_detail(response)
+                            if self._is_endpoint_fallback_error(response):
+                                last_error = TranslationError(error_detail, recoverable=False)
+                                logger.warning("%s endpoint unavailable: %s", endpoint, error_detail)
+                                continue
+                            if response.status_code == 400:
+                                logger.error("Translation API returned 400 Bad Request: %s", error_detail)
+                            raise TranslationError(
+                                error_detail,
+                                recoverable=response.status_code >= 500,
                             )
-                            logger.warning("%s endpoint returned non-JSON response; "
-                                           "trying next endpoint: %s",
-                                           endpoint, body)
-                            continue
-                        raise InvalidResponseError(
-                            f"Translation API returned non-JSON response "
-                            f"(content-type={content_type}): {body}"
-                        ) from exc
 
-                    content = _extract_response_content(result)
+                        response.raise_for_status()
+                        try:
+                            result = response.json()
+                        except json.JSONDecodeError as exc:
+                            content_type = response.headers.get("content-type", "")
+                            body = sanitize_for_log(response.text or "", 800)
+                            if self._can_fallback_endpoint(
+                                getattr(config, "api_type", "auto"), endpoint_index, endpoints
+                            ):
+                                last_error = InvalidResponseError(
+                                    f"{endpoint} endpoint returned non-JSON response "
+                                    f"(content-type={content_type}): {body}"
+                                )
+                                logger.warning("%s endpoint returned non-JSON response; "
+                                               "trying next endpoint: %s",
+                                               endpoint, body)
+                                continue
+                            raise InvalidResponseError(
+                                f"Translation API returned non-JSON response "
+                                f"(content-type={content_type}): {body}"
+                            ) from exc
+
+                        content = _extract_response_content(result)
                     expected_ids = [s["id"] for s in segments]
 
-                    translations, errors = parse_translation_response(content, expected_ids)
+                    if use_compact:
+                        translations, errors = parse_translation_response_compact(content, expected_ids)
+                    else:
+                        translations, errors = parse_translation_response(content, expected_ids)
                     if errors:
                         logger.warning("Translation parse issues: %s; response: %s",
                                        errors, sanitize_for_log(content))

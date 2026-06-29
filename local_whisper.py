@@ -121,6 +121,66 @@ def split_text(text, max_len=25):
     return [r for r in result if r] or [text]
 
 
+def initial_prompt_for_language(language):
+    lang = str(language or "auto").strip().lower()
+    if lang in {"zh", "zh-cn", "zh-hans", "cmn", "yue"}:
+        return "以下是中文普通话音频，请准确转写为简体中文，不要添加原文没有的内容。"
+    return None
+
+
+def normalize_subtitle_text(text):
+    import re
+    value = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    value = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", value)
+    value = re.sub(r"\{[^{}]*\}", "", value)
+    value = re.sub(r"<[^>]+>", "", value)
+    lines = [re.sub(r"[ \t\r\f\v]+", " ", line).strip() for line in value.split("\n")]
+    return "\n".join(line for line in lines if line).strip()
+
+
+def is_punctuation_only(text):
+    import re
+    cleaned = normalize_subtitle_text(text)
+    if not cleaned:
+        return False
+    semantic = re.sub(r"[\s\u3000\.,!?;:'\"`~\-—–_()\[\]{}<>/\\|@#$%^&*+=，。！？；：、“”‘’（）【】《》…·￥]+", "", cleaned).strip()
+    return not semantic
+
+
+def normalize_subtitle_timeline(subtitles, min_gap=0.02, min_duration=0.12):
+    items = []
+    for sub in subtitles:
+        start = max(0.0, float(sub.get("start", 0) or 0))
+        end = max(start + 0.001, float(sub.get("end", start) or start))
+        text = normalize_subtitle_text(sub.get("text", ""))
+        if not text:
+            continue
+        if is_punctuation_only(text) and items:
+            if not str(items[-1].get("text", "")).endswith(text):
+                items[-1]["text"] = f"{items[-1].get('text', '')}{text}"
+            items[-1]["end"] = max(float(items[-1].get("end", 0) or 0), end)
+            continue
+        item = dict(sub)
+        item.update({"start": round(start, 3), "end": round(end, 3), "text": text})
+        items.append(item)
+    items.sort(key=lambda item: (float(item.get("start", 0) or 0), float(item.get("end", 0) or 0)))
+    for i in range(len(items) - 1):
+        prev = items[i]
+        curr = items[i + 1]
+        ps = max(0.0, float(prev.get("start", 0) or 0))
+        pe = max(ps + 0.001, float(prev.get("end", ps) or ps))
+        cs = max(0.0, float(curr.get("start", 0) or 0))
+        ce = max(cs + 0.001, float(curr.get("end", cs) or cs))
+        if pe + min_gap <= cs:
+            continue
+        desired = cs - min_gap
+        if desired - ps >= min_duration:
+            prev["end"] = round(desired, 3)
+        elif ce - (pe + min_gap) >= min_duration:
+            curr["start"] = round(pe + min_gap, 3)
+    return [item for item in items if float(item.get("end", 0) or 0) > float(item.get("start", 0) or 0)]
+
+
 def transcribe(audio_path, language=None):
     emit({"type": "status", "progress": 10, "message": "Loading Whisper model..."})
 
@@ -138,14 +198,20 @@ def transcribe(audio_path, language=None):
 
     emit({"type": "status", "progress": 20, "message": "Model loaded, transcribing..."})
 
-    segments, info = model.transcribe(
-        audio_path,
+    prompt = initial_prompt_for_language(language)
+    transcribe_kwargs = dict(
         language=None if not language or language == 'auto' else language,
         beam_size=1,
         vad_filter=True,
-        vad_parameters=dict(min_silence_duration_ms=1000),
-        initial_prompt="以下是普通话的句子，请用简体中文。"
+        vad_parameters=dict(min_silence_duration_ms=700),
+        condition_on_previous_text=False,
+        compression_ratio_threshold=2.4,
+        no_speech_threshold=0.6,
     )
+    if prompt:
+        transcribe_kwargs["initial_prompt"] = prompt
+
+    segments, info = model.transcribe(audio_path, **transcribe_kwargs)
 
     detected_lang = info.language
     total_duration = info.duration
@@ -166,15 +232,17 @@ def transcribe(audio_path, language=None):
                 part_len = len(part)
                 part_duration = (part_len / total_chars) * duration
                 part_end = current_start + part_duration
-                subtitles.append({'start': round(current_start, 2), 'end': round(part_end + 0.1, 2), 'text': part})
+                subtitles.append({'start': round(current_start, 3), 'end': round(part_end, 3), 'text': part})
                 current_start = part_end
         else:
-            subtitles.append({'start': round(segment.start, 2), 'end': round(segment.end + 0.1, 2), 'text': text})
+            subtitles.append({'start': round(segment.start, 3), 'end': round(segment.end, 3), 'text': text})
+        subtitles = normalize_subtitle_timeline(subtitles)
         if total_duration and total_duration > 0:
             progress = min(98, 25 + int((segment.end / total_duration) * 73))
             if int(progress) % 5 == 0:
                 emit({"type": "status", "progress": int(progress), "message": f"Transcribing: {int(segment.end)}s / {int(total_duration)}s ({int(progress)}%)..."})
 
+    subtitles = normalize_subtitle_timeline(subtitles)
     emit({"type": "complete", "subtitles": subtitles, "language": detected_lang})
 
 

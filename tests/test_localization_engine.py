@@ -664,7 +664,9 @@ class TestPipelineTTSConcurrency(unittest.TestCase):
             )
 
         self.assertTrue(ok)
-        self.assertAlmostEqual(targets[0], 1.8, places=2)
+        # Overlapping subtitles must use the next subtitle start as the hard
+        # safety boundary; 1.0s next start minus the 0.04s TTS gap.
+        self.assertAlmostEqual(targets[0], 0.96, places=2)
         self.assertAlmostEqual(targets[1], 1.0, places=2)
 
     def test_stable_tts_chunks_extract_segment_windows(self):
@@ -708,7 +710,12 @@ class TestPipelineTTSConcurrency(unittest.TestCase):
                 "job-tts",
                 ws,
                 segments,
-                {"tts_provider": "fake", "tts_voice": "voice", "tts_consistency_mode": "stable"},
+                {
+                    "tts_provider": "fake",
+                    "tts_voice": "voice",
+                    "tts_consistency_mode": "stable",
+                    "tts_chunk_allow_proportional_split": True,
+                },
                 "zh-CN",
                 CancellationToken(),
             )
@@ -767,6 +774,11 @@ class TestPipelineTTSConcurrency(unittest.TestCase):
         self.assertEqual([item["start"] for item in index], [0.0, 20.0])
         timeline = json.loads((ws / "audio" / "tts" / "tts_timeline_report.json").read_text(encoding="utf-8"))
         self.assertEqual(timeline["chunk_count"], 2)
+        self.assertIn("tts_plan", timeline)
+        self.assertEqual(len(timeline["tts_plan"]["chunks"]), 2)
+        self.assertIn("gap>", timeline["tts_plan"]["chunks"][1]["split_reason"])
+        self.assertIn("planned_estimated_duration", timeline["segments"][0])
+        self.assertIn("speed_pressure", timeline["segments"][0])
         self.assertTrue(all(item["overlay_start_matches_subtitle_start"] for item in timeline["segments"]))
 
     def test_tts_skip_removes_stale_segment_audio(self):
@@ -1105,6 +1117,58 @@ class TestPipelineTTSConcurrency(unittest.TestCase):
         self.assertFalse(ok)
         rec = store.get("job-tts-down")
         self.assertEqual(rec.error_code, "TTS_SERVICE_DOWN")
+
+    def test_qwen3_tts_auto_corrects_voice_language_mismatch(self):
+        """Korean voice 'Sohee' for Chinese text must be auto-corrected."""
+        from job_models import SubtitleSegment
+        from tts.base import TTSResult
+
+        used_voices = []
+
+        class FakeQwenProvider:
+            supports_concurrency = False
+            def synthesize(self, text, language, voice, output_path, options):
+                used_voices.append(voice)
+                Path(output_path).write_bytes(b"wav")
+                return TTSResult(
+                    output_path=Path(output_path),
+                    duration_seconds=0.4,
+                    mode=options.get("qwen_mode", ""),
+                )
+            def list_voices(self, language=None):
+                return []
+
+        ws = Path(self.tmpdir)
+        segments = [
+            SubtitleSegment(index=1, start=0.0, end=1.0, text="src", translation="你好世界"),
+        ]
+        store = TaskStore(ws / "data")
+        store.create("job-voice-mismatch", {"workspace_dir": str(ws)})
+        runner = PipelineRunner(store, ProgressTracker())
+
+        health_resp = MagicMock()
+        health_resp.__enter__.return_value = health_resp
+        health_resp.read.return_value = b'{"status": "ok"}'
+
+        with patch("tts.get_provider", return_value=FakeQwenProvider()), \
+             patch("urllib.request.urlopen", return_value=health_resp):
+            ok = runner._run_tts(
+                "job-voice-mismatch",
+                ws,
+                segments,
+                {
+                    "tts_provider": "qwen3-tts",
+                    "tts_voice": "Sohee",  # Korean voice for Chinese text
+                    "tts_options": {"qwen_mode": "custom_voice"},
+                },
+                "zh-CN",
+                CancellationToken(),
+            )
+
+        self.assertTrue(ok)
+        # Sohee should have been replaced with a Chinese-compatible voice.
+        self.assertNotIn("Sohee", used_voices)
+        self.assertEqual(used_voices[0], "Vivian")
 
 
 class TestTTSTiming(unittest.TestCase):
@@ -1460,13 +1524,18 @@ class TestPipelineAudioMix(unittest.TestCase):
         runner = PipelineRunner(TaskStore(ws / "data"), ProgressTracker())
         runner._store.create("job-low-vram", {})
 
+        def fake_translation(job_id, workspace, segments, request, source_lang, target_lang, token):
+            for seg in segments:
+                seg.translation = "你好"
+            return True
+
         def fake_audio_mix(job_id, workspace, segments, source, target_lang, request, token):
             dubbed = workspace / "rendered" / f"{workspace.name}_{target_lang}_dubbed.mp4"
             dubbed.parent.mkdir(parents=True, exist_ok=True)
             dubbed.write_bytes(b"dubbed")
             return True
 
-        with patch.object(PipelineRunner, "_run_translation", return_value=True), \
+        with patch.object(PipelineRunner, "_run_translation", side_effect=fake_translation), \
              patch.object(PipelineRunner, "_run_tts", return_value=True), \
              patch.object(PipelineRunner, "_run_audio_mix", side_effect=fake_audio_mix), \
              patch.object(runner, "_unload_qwen3_tts") as mock_unload:

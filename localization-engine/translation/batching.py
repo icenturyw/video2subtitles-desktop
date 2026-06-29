@@ -12,9 +12,9 @@ from job_models import SubtitleSegment
 
 
 def batch_segments(segments: List[SubtitleSegment],
-                   max_chars: int = 4000,
+                   max_chars: int = 16000,
                    min_items: int = 1,
-                   max_items: int = 30) -> List[List[SubtitleSegment]]:
+                   max_items: int = 50) -> List[List[SubtitleSegment]]:
     """Split segments into translation batches.
 
     Args:
@@ -61,6 +61,14 @@ def batch_segments(segments: List[SubtitleSegment],
 def batch_to_request(batch: List[SubtitleSegment]) -> List[Dict]:
     """Convert a batch of SubtitleSegments to API request format."""
     return [{"id": seg.index, "text": seg.text} for seg in batch]
+
+
+def batch_to_tsv(batch: List[SubtitleSegment]) -> str:
+    """Convert a batch of SubtitleSegments to tab-separated input format.
+
+    Returns a multi-line string where each line is ``id<TAB>text``.
+    """
+    return "\n".join(f"{seg.index}\t{seg.text}" for seg in batch)
 
 
 class CheckpointManager:

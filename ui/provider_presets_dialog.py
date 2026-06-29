@@ -70,6 +70,96 @@ QCheckBox {{ color: {_THEME["text_primary"]}; }}
 """
 
 
+_TTS_PROVIDER_OPTIONS = [
+    "edge-tts",
+    "qwen3-tts",
+    "openai-compatible",
+    "volcengine-doubao",
+    "sapi",
+]
+
+_QWEN3_TTS_VOICE_OPTIONS = [
+    "Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric",
+    "Ryan", "Aiden", "Ono_Anna", "Sohee",
+]
+
+# Native language for each Qwen3-TTS preset voice.  Helps the user avoid
+# voice-language mismatches that cause off-language speech and clipping.
+_QWEN3_VOICE_LANG_LABELS = {
+    "Vivian": "zh",
+    "Uncle_Fu": "zh",
+    "Serena": "en",
+    "Dylan": "en",
+    "Eric": "en",
+    "Ryan": "en",
+    "Aiden": "en",
+    "Ono_Anna": "ja",
+    "Sohee": "ko",
+}
+_QWEN3_VOICE_LANG_DISPLAY = {
+    "zh": "中文",
+    "en": "English",
+    "ja": "日本語",
+    "ko": "한국어",
+}
+
+_VOLCENGINE_DOUBAO_VOICE_OPTIONS = [
+    "zh_female_tianmei_moon_bigtts",
+    "zh_male_yunzhou_emo_v2_mars_bigtts",
+    "zh_female_shuangkuaisisi_moon_bigtts",
+    "zh_male_guozhoudege_moon_bigtts",
+]
+
+_EDGE_TTS_VOICE_OPTIONS = [
+    "zh-CN-XiaoxiaoNeural",
+    "zh-CN-YunxiNeural",
+    "zh-CN-XiaoyiNeural",
+    "en-US-JennyNeural",
+    "en-US-GuyNeural",
+]
+
+_SAPI_VOICE_OPTIONS = ["default"]
+
+_OPENAI_TTS_VOICE_OPTIONS = [
+    "alloy", "ash", "ballad", "coral", "echo",
+    "fable", "nova", "onyx", "sage", "shimmer",
+]
+
+
+def _provider_value(widget: Any) -> str:
+    if hasattr(widget, "currentText"):
+        return str(widget.currentText() or "").strip()
+    if hasattr(widget, "text"):
+        return str(widget.text() or "").strip()
+    return ""
+
+
+def _set_provider_value(widget: Any, value: str) -> None:
+    value = str(value or "").strip()
+    if hasattr(widget, "findText") and hasattr(widget, "setCurrentIndex"):
+        index = widget.findText(value)
+        if index >= 0:
+            widget.setCurrentIndex(index)
+        elif hasattr(widget, "setEditText"):
+            widget.setEditText(value)
+        return
+    if hasattr(widget, "setText"):
+        widget.setText(value)
+
+
+def _voice_options_for_provider(provider: str) -> list[str]:
+    provider = str(provider or "").strip().lower()
+    if provider == "qwen3-tts":
+        return list(_QWEN3_TTS_VOICE_OPTIONS)
+    if provider == "volcengine-doubao":
+        return list(_VOLCENGINE_DOUBAO_VOICE_OPTIONS)
+    if provider in {"openai-compatible", "openai_compatible", "openai", "openai-tts", "openai_tts"}:
+        return list(_OPENAI_TTS_VOICE_OPTIONS)
+    if provider == "sapi":
+        return list(_SAPI_VOICE_OPTIONS)
+    return list(_EDGE_TTS_VOICE_OPTIONS)
+
+
 def _text(value: Any, default: str = "") -> str:
     return str(value if value is not None else default).strip()
 
@@ -96,7 +186,13 @@ class ProviderPresetEditDialog(QDialog):
         self.name = QLineEdit()
         form.addRow("配置名称:", self.name)
 
-        self.provider = QLineEdit("openai_compatible" if self.preset_type == "translation" else "edge-tts")
+        if self.preset_type == "translation":
+            self.provider = QLineEdit("openai_compatible")
+        else:
+            self.provider = QComboBox()
+            self.provider.setEditable(True)
+            self.provider.addItems(_TTS_PROVIDER_OPTIONS)
+            self.provider.currentTextChanged.connect(self._on_tts_provider_changed_in_editor)
         form.addRow("服务商:", self.provider)
 
         self.enabled = QCheckBox("启用")
@@ -136,11 +232,11 @@ class ProviderPresetEditDialog(QDialog):
         self.timeout.setRange(10, 300)
         self.timeout.setValue(60)
         self.concurrency = QSpinBox()
-        self.concurrency.setRange(1, 16)
-        self.concurrency.setValue(2)
+        self.concurrency.setRange(1, 32)
+        self.concurrency.setValue(4)
         self.max_batch_items = QSpinBox()
         self.max_batch_items.setRange(1, 100)
-        self.max_batch_items.setValue(10)
+        self.max_batch_items.setValue(50)
 
         form.addRow("API Key:", self.api_key)
         form.addRow("API 地址:", self.base_url)
@@ -161,7 +257,10 @@ class ProviderPresetEditDialog(QDialog):
         self.api_key.setEchoMode(QLineEdit.Password)
         self.base_url = QLineEdit()
         self.model = QLineEdit()
-        self.voice = QLineEdit()
+        self.voice = QComboBox()
+        self.voice.setEditable(True)
+        self.voice.setMinimumWidth(320)
+        self._sync_tts_voice_options()
         self.speed = QDoubleSpinBox()
         self.speed.setRange(-100.0, 4.0)
         self.speed.setSingleStep(0.1)
@@ -205,21 +304,52 @@ class ProviderPresetEditDialog(QDialog):
         form.addRow("一致性模式:", self.consistency_mode)
         layout.addWidget(group)
 
+    def _on_tts_provider_changed_in_editor(self, _provider: str):
+        if self.preset_type == "tts" and hasattr(self, "voice"):
+            self._sync_tts_voice_options()
+
+    def _sync_tts_voice_options(self, selected_voice: str = ""):
+        if self.preset_type != "tts" or not hasattr(self, "voice"):
+            return
+        provider = _provider_value(self.provider) or "edge-tts"
+        current = selected_voice or (self.voice.currentData() or self.voice.currentText()).strip()
+        options = _voice_options_for_provider(provider)
+        if current and current not in options:
+            options.insert(0, current)
+
+        self.voice.blockSignals(True)
+        self.voice.clear()
+        for name in options:
+            native = _QWEN3_VOICE_LANG_LABELS.get(name, "")
+            if provider == "qwen3-tts" and native:
+                display = _QWEN3_VOICE_LANG_DISPLAY.get(native, native)
+                self.voice.addItem(f"{name} ({display})", name)
+            else:
+                self.voice.addItem(name, name)
+        if current:
+            index = self.voice.findData(current)
+            if index < 0:
+                index = self.voice.findText(current)
+            self.voice.setCurrentIndex(index if index >= 0 else 0)
+        elif options:
+            self.voice.setCurrentIndex(0)
+        self.voice.blockSignals(False)
+
     def _load_defaults(self):
         settings = get_effective_settings()
         if self.preset_type == "translation":
             cfg = translation_config_from_settings(settings)
             self.name.setText("新的翻译配置")
-            self.provider.setText(_text(settings.get("translation_provider"), "openai_compatible") or "openai_compatible")
+            _set_provider_value(self.provider, _text(settings.get("translation_provider"), "openai_compatible") or "openai_compatible")
         else:
             cfg = tts_config_from_settings(settings)
             self.name.setText("新的 TTS 配置")
-            self.provider.setText(_text(settings.get("tts_provider"), "edge-tts") or "edge-tts")
+            _set_provider_value(self.provider, _text(settings.get("tts_provider"), "edge-tts") or "edge-tts")
         self._load_config(cfg)
 
     def _load_preset(self, preset: ProviderPreset):
         self.name.setText(preset.name)
-        self.provider.setText(preset.provider)
+        _set_provider_value(self.provider, preset.provider)
         self.enabled.setChecked(preset.enabled)
         self.is_default.setChecked(preset.isDefault)
         self._load_config(preset.config)
@@ -235,10 +365,10 @@ class ProviderPresetEditDialog(QDialog):
             self.api_type.setCurrentIndex(idx if idx >= 0 else 0)
             self.temperature.setValue(float(cfg.get("temperature", 0.3) or 0.3))
             self.timeout.setValue(int(cfg.get("timeout", 60) or 60))
-            self.concurrency.setValue(int(cfg.get("concurrency", 2) or 2))
-            self.max_batch_items.setValue(int(cfg.get("maxBatchItems") or cfg.get("max_batch_items") or 10))
+            self.concurrency.setValue(int(cfg.get("concurrency", 4) or 4))
+            self.max_batch_items.setValue(int(cfg.get("maxBatchItems") or cfg.get("max_batch_items") or 50))
         else:
-            self.voice.setText(_text(cfg.get("voice")))
+            self._sync_tts_voice_options(_text(cfg.get("voice")))
             self.speed.setValue(float(cfg.get("speed", 1.0) or 1.0))
             self.volume.setValue(int(cfg.get("volume", 0) or 0))
             idx = self.format.findText(_text(cfg.get("format"), "mp3"))
@@ -273,7 +403,7 @@ class ProviderPresetEditDialog(QDialog):
                 "apiKey": self.api_key.text().strip(),
                 "baseUrl": self.base_url.text().strip(),
                 "model": self.model.text().strip(),
-                "voice": self.voice.text().strip(),
+                "voice": (self.voice.currentData() or self.voice.currentText()).strip(),
                 "speed": self.speed.value(),
                 "volume": self.volume.value(),
                 "format": self.format.currentText(),
@@ -288,7 +418,7 @@ class ProviderPresetEditDialog(QDialog):
             id=self.preset.id if self.preset else _new_id(),
             type=self.preset_type,  # type: ignore[arg-type]
             name=self.name.text().strip() or "未命名配置",
-            provider=self.provider.text().strip() or ("openai_compatible" if self.preset_type == "translation" else "edge-tts"),
+            provider=_provider_value(self.provider) or ("openai_compatible" if self.preset_type == "translation" else "edge-tts"),
             enabled=self.enabled.isChecked(),
             isDefault=self.is_default.isChecked(),
             createdAt=self.preset.createdAt if self.preset else now,
