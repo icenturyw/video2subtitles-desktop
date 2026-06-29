@@ -43,7 +43,7 @@ DEFAULT_SETTINGS = {
     "translation_model": "",
     "translation_api_type": "auto",
     "translation_timeout": "60",
-    "translation_concurrency": "4",
+    "translation_concurrency": "8",
     "translation_max_batch_items": "50",
     "translation_output_format": "compact",
     "translation_quality": "fast",

@@ -61,7 +61,7 @@ class SubtitleStyleDialog(QDialog):
         super().__init__(parent)
         self._style = style or SubtitleStyle()
         self.setWindowTitle("字幕样式")
-        self.setMinimumSize(480, 520)
+        self.setMinimumSize(520, 680)
         self.setStyleSheet(_STYLE_SHEET)
         self._setup_ui()
 
@@ -91,15 +91,18 @@ class SubtitleStyleDialog(QDialog):
         font_form.setSpacing(8)
 
         self.font_family = QLineEdit(self._style.font_family)
+        self.font_family.textChanged.connect(self._update_preview)
         font_form.addRow("字体:", self.font_family)
 
         self.font_size = QSpinBox()
         self.font_size.setRange(12, 120)
         self.font_size.setValue(self._style.font_size)
+        self.font_size.valueChanged.connect(self._update_preview)
         font_form.addRow("字号:", self.font_size)
 
         self.bold = QCheckBox()
         self.bold.setChecked(self._style.bold)
+        self.bold.toggled.connect(self._update_preview)
         font_form.addRow("加粗:", self.bold)
 
         layout.addWidget(font_group)
@@ -113,12 +116,14 @@ class SubtitleStyleDialog(QDialog):
         self.outline.setRange(0, 10)
         self.outline.setSingleStep(0.5)
         self.outline.setValue(self._style.outline)
+        self.outline.valueChanged.connect(self._update_preview)
         effect_form.addRow("描边:", self.outline)
 
         self.shadow = QDoubleSpinBox()
         self.shadow.setRange(0, 10)
         self.shadow.setSingleStep(0.5)
         self.shadow.setValue(self._style.shadow)
+        self.shadow.valueChanged.connect(self._update_preview)
         effect_form.addRow("阴影:", self.shadow)
 
         layout.addWidget(effect_group)
@@ -131,6 +136,7 @@ class SubtitleStyleDialog(QDialog):
         self.margin_v = QSpinBox()
         self.margin_v.setRange(0, 300)
         self.margin_v.setValue(self._style.margin_v)
+        self.margin_v.valueChanged.connect(self._update_preview)
         pos_form.addRow("底部边距:", self.margin_v)
 
         layout.addWidget(pos_group)
@@ -144,15 +150,29 @@ class SubtitleStyleDialog(QDialog):
         self.source_scale.setRange(0.3, 2.0)
         self.source_scale.setSingleStep(0.05)
         self.source_scale.setValue(self._style.bilingual_source_scale)
+        self.source_scale.valueChanged.connect(self._update_preview)
         bilingual_form.addRow("原文字号比例:", self.source_scale)
 
         self.trans_scale = QDoubleSpinBox()
         self.trans_scale.setRange(0.3, 2.0)
         self.trans_scale.setSingleStep(0.05)
         self.trans_scale.setValue(self._style.bilingual_translation_scale)
+        self.trans_scale.valueChanged.connect(self._update_preview)
         bilingual_form.addRow("译文字号比例:", self.trans_scale)
 
         layout.addWidget(bilingual_group)
+
+        # Preview
+        preview_group = QGroupBox("预览")
+        preview_layout = QVBoxLayout(preview_group)
+        preview_layout.setContentsMargins(12, 10, 12, 10)
+        self.preview_label = QLabel()
+        self.preview_label.setAlignment(Qt.AlignCenter)
+        self.preview_label.setMinimumHeight(80)
+        self.preview_label.setWordWrap(True)
+        preview_layout.addWidget(self.preview_label)
+        self._preview_card_bg = _THEME["bg_light"]
+        layout.addWidget(preview_group)
 
         layout.addStretch()
 
@@ -160,6 +180,40 @@ class SubtitleStyleDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+        self._update_preview()
+
+    def _update_preview(self):
+        ff = self.font_family.text() or "Microsoft YaHei"
+        fs = self.font_size.value()
+        weight = "bold" if self.bold.isChecked() else "normal"
+        ol = self.outline.value()
+        sh = self.shadow.value()
+        mv = self.margin_v.value()
+        css = (
+            f"font-family: '{ff}'; font-size: {fs}px; font-weight: {weight}; "
+            f"color: white; text-align: center; "
+            f"padding: 12px; "
+            f"background-color: rgba(0,0,0,0.6); "
+            f"border-radius: 4px; "
+        )
+        if ol > 0:
+            css += f"-webkit-text-stroke: {ol}px black; text-shadow: 0 0 {ol}px black; "
+        if sh > 0:
+            css += f"margin-bottom: {mv}px; "
+
+        lines = [
+            '<div style="text-align: center; padding: 4px 0;">',
+            f'  <div style="{css}">Hello 你好</div>',
+            f'  <div style="font-size: {int(fs * self.source_scale.value())}px; color: #aaa; padding-top: 6px;">',
+            f'    源语言 · Source Text',
+            '  </div>',
+            f'  <div style="font-size: {int(fs * self.trans_scale.value())}px; color: #ffd700; padding-top: 2px;">',
+            f'    目标语言 · Translated Text',
+            '  </div>',
+            '</div>',
+        ]
+        self.preview_label.setText("".join(lines))
 
     def _on_preset_changed(self, preset_name: str):
         presets = SubtitleStyle.presets()

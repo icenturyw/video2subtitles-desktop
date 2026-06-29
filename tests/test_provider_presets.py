@@ -119,7 +119,7 @@ class TestProviderPresets(unittest.TestCase):
                 "baseUrl": "https://api.test",
                 "model": "m",
                 "targetLanguage": "ja",
-                "concurrency": 4,
+                "concurrency": 8,
             },
         )
         tts = ProviderPreset(

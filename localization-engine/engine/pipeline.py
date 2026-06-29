@@ -13,6 +13,7 @@ import os
 import json
 import shutil
 import threading
+import time
 from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -514,9 +515,17 @@ class PipelineRunner:
             return True
 
         max_batch_items = max(1, int(getattr(trans_config, "max_batch_items", 10) or 10))
+        max_batch_chars = trans_config.max_batch_chars
+
+        # CJK target languages produce longer output per segment; smaller
+        # batches reduce the straggler problem in concurrent execution.
+        if target_lang and any(lang in target_lang.lower() for lang in ("zh", "ja", "ko")):
+            max_batch_items = min(max_batch_items, 30)
+            max_batch_chars = min(max_batch_chars, 8000)
+
         batches = batch_segments(
             pending,
-            max_chars=trans_config.max_batch_chars,
+            max_chars=max_batch_chars,
             max_items=max_batch_items,
         )
 
@@ -533,19 +542,17 @@ class PipelineRunner:
         concurrency = max(1, int(getattr(trans_config, "concurrency", 1) or 1))
         concurrency = min(concurrency, total)
 
+        # Create a single provider shared across all batches to avoid
+        # per-batch TCP+TLS handshake overhead (httpx.Client is thread-safe).
+        shared_provider = get_provider(provider_name)
+
         def request_translation(batch: List[SubtitleSegment]) -> List[Dict]:
             if cancel_token.is_cancelled():
                 raise RuntimeError("Task cancelled")
-            provider = get_provider(provider_name)
-            try:
-                return provider.translate_batch(
-                    batch_to_request(batch), trans_config, source_lang, target_lang,
-                    glossary=glossary_text,
-                )
-            finally:
-                close = getattr(provider, "close", None)
-                if callable(close):
-                    close()
+            return shared_provider.translate_batch(
+                batch_to_request(batch), trans_config, source_lang, target_lang,
+                glossary=glossary_text,
+            )
 
         def complete_translations(batch_index: int,
                                   batch: List[SubtitleSegment],
@@ -666,86 +673,95 @@ class PipelineRunner:
                           batch: List[SubtitleSegment]) -> tuple[int, List[SubtitleSegment], List[Dict]]:
             return batch_index, batch, complete_translations(batch_index, batch)
 
-        if concurrency > 1:
-            write_log(ws, f"  Translation concurrency: {concurrency}")
-            self._progress.update(
-                job_id, "translate", 0,
-                f"Requesting translation API with {concurrency} threads...",
-            )
+        try:
+            if concurrency > 1:
+                write_log(ws, f"  Translation concurrency: {concurrency}")
+                self._progress.update(
+                    job_id, "translate", 0,
+                    f"Requesting translation API with {concurrency} threads...",
+                )
 
-            with ThreadPoolExecutor(max_workers=concurrency) as executor:
-                futures = {
-                    executor.submit(translate_one, idx, batch): idx
-                    for idx, batch in enumerate(batches, 1)
-                }
-                for future in as_completed(futures):
-                    if cancel_token.is_cancelled():
-                        self._mark_cancelled(job_id, ws)
-                        for pending_future in futures:
-                            pending_future.cancel()
-                        return False
-                    try:
-                        batch_index, batch, translations = future.result()
-                    except Exception as e:
-                        for pending_future in futures:
-                            pending_future.cancel()
+                with ThreadPoolExecutor(max_workers=concurrency) as executor:
+                    futures = {}
+                    stagger = min(0.15, 1.0 / concurrency)
+                    for idx, batch in enumerate(batches, 1):
+                        futures[executor.submit(translate_one, idx, batch)] = idx
+                        if len(futures) < concurrency and idx < len(batches):
+                            time.sleep(stagger)
+                    for future in as_completed(futures):
                         if cancel_token.is_cancelled():
                             self._mark_cancelled(job_id, ws)
-                        else:
-                            self._fail(job_id, ws, "TRANSLATION_ERROR", str(e)[:200])
-                        return False
+                            for pending_future in futures:
+                                pending_future.cancel()
+                            return False
+                        try:
+                            batch_index, batch, translations = future.result()
+                        except Exception as e:
+                            for pending_future in futures:
+                                pending_future.cancel()
+                            if cancel_token.is_cancelled():
+                                self._mark_cancelled(job_id, ws)
+                            else:
+                                self._fail(job_id, ws, "TRANSLATION_ERROR", str(e)[:200])
+                            return False
 
-                    if self._has_source_fallback_translations(batch, translations, request):
-                        self._fail(job_id, ws, "TRANSLATION_INCOMPLETE",
-                                   "翻译结果不完整或目标语言校验失败，已停止配音以避免把源语言/脏字幕送入 TTS")
-                        for pending_future in futures:
-                            pending_future.cancel()
-                        return False
-                    self._apply_translation_result(batch, translations)
-                    checkpoints.mark_completed([s.index for s in batch])
-                    write_log(ws, f"  Batch {batch_index}/{total} translated ({len(batch)} segments)")
-                    completed_batches += 1
-                    self._progress.update(
-                        job_id, "translate", int((completed_batches / total) * 100),
-                        f"Translated batch {completed_batches}/{total}",
-                    )
+                        if self._has_source_fallback_translations(batch, translations, request):
+                            self._fail(job_id, ws, "TRANSLATION_INCOMPLETE",
+                                       "翻译结果不完整或目标语言校验失败，已停止配音以避免把源语言/脏字幕送入 TTS")
+                            for pending_future in futures:
+                                pending_future.cancel()
+                            return False
+                        self._apply_translation_result(batch, translations)
+                        checkpoints.mark_completed([s.index for s in batch])
+                        write_log(ws, f"  Batch {batch_index}/{total} translated ({len(batch)} segments)")
+                        completed_batches += 1
+                        self._progress.update(
+                            job_id, "translate", int((completed_batches / total) * 100),
+                            f"Translated batch {completed_batches}/{total}",
+                        )
 
-            return True
+                checkpoints.flush()
+                return True
 
-        for batch_index, batch in enumerate(batches, 1):
-            if cancel_token.is_cancelled():
-                self._mark_cancelled(job_id, ws)
-                return False
-
-            batch_pct = int((completed_batches / total) * 100)
-            self._progress.update(
-                job_id, "translate", batch_pct,
-                f"Requesting translation API: batch {batch_index}/{total}",
-            )
-
-            try:
-                _, batch, translations = translate_one(batch_index, batch)
-            except Exception as e:
+            for batch_index, batch in enumerate(batches, 1):
                 if cancel_token.is_cancelled():
                     self._mark_cancelled(job_id, ws)
-                else:
-                    self._fail(job_id, ws, "TRANSLATION_ERROR", str(e)[:200])
-                return False
+                    return False
 
-            if self._has_source_fallback_translations(batch, translations, request):
-                self._fail(job_id, ws, "TRANSLATION_INCOMPLETE",
-                           "翻译结果不完整或目标语言校验失败，已停止配音以避免把源语言/脏字幕送入 TTS")
-                return False
-            self._apply_translation_result(batch, translations)
-            checkpoints.mark_completed([s.index for s in batch])
-            write_log(ws, f"  Batch {batch_index}/{total} translated ({len(batch)} segments)")
-            completed_batches += 1
-            self._progress.update(
-                job_id, "translate", int((completed_batches / total) * 100),
-                f"Translated batch {completed_batches}/{total}",
-            )
+                batch_pct = int((completed_batches / total) * 100)
+                self._progress.update(
+                    job_id, "translate", batch_pct,
+                    f"Requesting translation API: batch {batch_index}/{total}",
+                )
 
-        return True
+                try:
+                    _, batch, translations = translate_one(batch_index, batch)
+                except Exception as e:
+                    if cancel_token.is_cancelled():
+                        self._mark_cancelled(job_id, ws)
+                    else:
+                        self._fail(job_id, ws, "TRANSLATION_ERROR", str(e)[:200])
+                    return False
+
+                if self._has_source_fallback_translations(batch, translations, request):
+                    self._fail(job_id, ws, "TRANSLATION_INCOMPLETE",
+                               "翻译结果不完整或目标语言校验失败，已停止配音以避免把源语言/脏字幕送入 TTS")
+                    return False
+                self._apply_translation_result(batch, translations)
+                checkpoints.mark_completed([s.index for s in batch])
+                write_log(ws, f"  Batch {batch_index}/{total} translated ({len(batch)} segments)")
+                completed_batches += 1
+                self._progress.update(
+                    job_id, "translate", int((completed_batches / total) * 100),
+                    f"Translated batch {completed_batches}/{total}",
+                )
+
+            checkpoints.flush()
+            return True
+        finally:
+            close = getattr(shared_provider, "close", None)
+            if callable(close):
+                close()
 
     @staticmethod
     def _has_source_fallback_translations(batch: List[SubtitleSegment],
@@ -1840,30 +1856,62 @@ class PipelineRunner:
             write_log(ws, f"  TTS concurrency: {tts_concurrency}")
 
         if use_chunking:
-            for chunk in chunks:
-                if cancel_token.is_cancelled():
-                    self._mark_cancelled(job_id, ws)
-                    return False
-                chunk_results = synthesize_chunk(chunk)
-                for result in chunk_results:
-                    if result.get("cancelled"):
+            if tts_concurrency > 1:
+                write_log(ws, f"  TTS chunk concurrency: {tts_concurrency}")
+                with ThreadPoolExecutor(max_workers=tts_concurrency) as executor:
+                    future_map = {
+                        executor.submit(synthesize_chunk, chunk): chunk
+                        for chunk in chunks
+                    }
+                    for future in as_completed(future_map):
+                        if cancel_token.is_cancelled():
+                            self._mark_cancelled(job_id, ws)
+                            return False
+                        chunk_results = future.result()
+                        for result in chunk_results:
+                            if result.get("cancelled"):
+                                self._mark_cancelled(job_id, ws)
+                                return False
+                            record_report(result)
+                            if result.get("error"):
+                                tts_errors.append(result)
+                                write_log(ws, f"  TTS failed for seg {result.get('index')}: {result['error']}")
+                            elif result.get("skipped") and result.get("warning"):
+                                write_log(ws, f"  TTS timing [{result.get('index')}]: {result['warning']}")
+                            elif result.get("path"):
+                                tts_segments.append((result["index"], result["path"], result["start"]))
+                                if result.get("warning"):
+                                    write_log(ws, f"  TTS timing [{result.get('index')}]: {result['warning']}")
+                                if result.get("speed") is not None:
+                                    speed_ratios[result["index"]] = result["speed"]
+                        completed += len(chunk_results)
+                        pct = int((completed / total) * 100) if total else 100
+                        self._progress.update(job_id, "tts", pct, f"TTS synthesis {completed}/{total}")
+            else:
+                for chunk in chunks:
+                    if cancel_token.is_cancelled():
                         self._mark_cancelled(job_id, ws)
                         return False
-                    record_report(result)
-                    if result.get("error"):
-                        tts_errors.append(result)
-                        write_log(ws, f"  TTS failed for seg {result.get('index')}: {result['error']}")
-                    elif result.get("skipped") and result.get("warning"):
-                        write_log(ws, f"  TTS timing [{result.get('index')}]: {result['warning']}")
-                    elif result.get("path"):
-                        tts_segments.append((result["index"], result["path"], result["start"]))
-                        if result.get("warning"):
-                            write_log(ws, f"  TTS timing [{result['index']}]: {result['warning']}")
-                        if result.get("speed") is not None:
-                            speed_ratios[result["index"]] = result["speed"]
-                completed += len(chunk_results)
-                pct = int((completed / total) * 100) if total else 100
-                self._progress.update(job_id, "tts", pct, f"TTS synthesis {completed}/{total}")
+                    chunk_results = synthesize_chunk(chunk)
+                    for result in chunk_results:
+                        if result.get("cancelled"):
+                            self._mark_cancelled(job_id, ws)
+                            return False
+                        record_report(result)
+                        if result.get("error"):
+                            tts_errors.append(result)
+                            write_log(ws, f"  TTS failed for seg {result.get('index')}: {result['error']}")
+                        elif result.get("skipped") and result.get("warning"):
+                            write_log(ws, f"  TTS timing [{result.get('index')}]: {result['warning']}")
+                        elif result.get("path"):
+                            tts_segments.append((result["index"], result["path"], result["start"]))
+                            if result.get("warning"):
+                                write_log(ws, f"  TTS timing [{result.get('index')}]: {result['warning']}")
+                            if result.get("speed") is not None:
+                                speed_ratios[result["index"]] = result["speed"]
+                    completed += len(chunk_results)
+                    pct = int((completed / total) * 100) if total else 100
+                    self._progress.update(job_id, "tts", pct, f"TTS synthesis {completed}/{total}")
         elif tts_concurrency > 1:
             with ThreadPoolExecutor(max_workers=tts_concurrency) as executor:
                 futures = [executor.submit(synthesize_segment, seg) for seg in candidates]

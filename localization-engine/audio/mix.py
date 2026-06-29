@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -202,16 +203,42 @@ def _mix_audio_chunked(
     work_dir.mkdir(parents=True, exist_ok=True)
 
     chunk_outputs: List[Path] = []
+    chunk_results: dict = {}
     try:
+        tasks: List[tuple] = []
         for chunk_index, start in enumerate(range(0, len(tts_segments), _MAX_DIRECT_SEGMENTS), 1):
-            if cancel_checker and cancel_checker():
-                return {"success": False, "cancelled": True}
             chunk = tts_segments[start:start + _MAX_DIRECT_SEGMENTS]
             chunk_output = work_dir / f"tts_chunk_{chunk_index:04d}.wav"
-            result = _mix_tts_chunk(chunk, chunk_output, log_path=log_path, cancel_checker=cancel_checker)
-            if not result.get("success"):
-                return result
-            chunk_outputs.append(chunk_output)
+            tasks.append((chunk_index, chunk, chunk_output))
+
+        if len(tasks) > 1:
+            with ThreadPoolExecutor(max_workers=min(2, len(tasks))) as executor:
+                futures = {
+                    executor.submit(
+                        _mix_tts_chunk, chunk, chunk_output,
+                        log_path=log_path, cancel_checker=cancel_checker,
+                    ): chunk_index
+                    for chunk_index, chunk, chunk_output in tasks
+                }
+                for future in _as_completed(futures):
+                    if cancel_checker and cancel_checker():
+                        for f in futures:
+                            f.cancel()
+                        return {"success": False, "cancelled": True}
+                    chunk_index = futures[future]
+                    result = future.result()
+                    if not result.get("success"):
+                        return result
+                    chunk_results[chunk_index] = work_dir / f"tts_chunk_{chunk_index:04d}.wav"
+            chunk_outputs = [chunk_results[idx] for idx in sorted(chunk_results)]
+        else:
+            for chunk_index, chunk, chunk_output in tasks:
+                if cancel_checker and cancel_checker():
+                    return {"success": False, "cancelled": True}
+                result = _mix_tts_chunk(chunk, chunk_output, log_path=log_path, cancel_checker=cancel_checker)
+                if not result.get("success"):
+                    return result
+                chunk_outputs.append(chunk_output)
 
         if cancel_checker and cancel_checker():
             return {"success": False, "cancelled": True}
@@ -254,7 +281,7 @@ def _mix_tts_chunk(
         "-filter_complex", ";".join(filter_parts),
         "-map", "[out]",
         "-ac", "2",
-        "-ar", "44100",
+        "-ar", "24000",
         str(output_path),
     ])
     return _run_ffmpeg(cmd, output_path, log_path=log_path, label="mix-chunk", cancel_checker=cancel_checker)
@@ -280,7 +307,7 @@ def _mix_chunk_outputs(
         "-filter_complex", f"{labels}amix=inputs={len(chunk_outputs)}:normalize=0[out]",
         "-map", "[out]",
         "-ac", "2",
-        "-ar", "44100",
+        "-ar", "24000",
         str(output_path),
     ])
     return _run_ffmpeg(cmd, output_path, log_path=log_path, label="mix-tts", cancel_checker=cancel_checker)

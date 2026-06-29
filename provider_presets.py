@@ -397,7 +397,7 @@ def translation_config_from_settings(settings: Dict[str, Any]) -> Dict[str, Any]
         "targetLanguage": _language_code(settings.get("target_language_dialog"), _str(settings.get("default_target_language"), "zh-CN") or "zh-CN"),
         "temperature": _float(settings.get("translation_temperature"), 0.3),
         "maxBatchItems": _int(settings.get("translation_max_batch_items"), 50),
-        "concurrency": _int(settings.get("translation_concurrency"), 4),
+        "concurrency": _int(settings.get("translation_concurrency"), 8),
         "retries": _int(settings.get("translation_retry_count"), 3),
         "timeout": _int(settings.get("translation_timeout"), 60),
         "qualityMode": _str(settings.get("translation_quality"), "fast") or "fast",
@@ -468,7 +468,7 @@ def apply_translation_preset_to_settings(settings: Dict[str, Any], preset: Provi
     updated["translation_api_key"] = _str(cfg.get("apiKey") or cfg.get("api_key"))
     updated["translation_api_type"] = _str(cfg.get("apiType") or cfg.get("api_type"), "auto") or "auto"
     updated["translation_timeout"] = str(_int(cfg.get("timeout"), 60))
-    updated["translation_concurrency"] = str(_int(cfg.get("concurrency"), 4))
+    updated["translation_concurrency"] = str(_int(cfg.get("concurrency"), 8))
     updated["translation_max_batch_items"] = str(_int(cfg.get("maxBatchItems") or cfg.get("max_batch_items"), 50))
     updated["translation_quality"] = _str(cfg.get("qualityMode") or cfg.get("quality_mode"), "fast") or "fast"
     updated["translation_output_format"] = _str(cfg.get("outputFormat") or cfg.get("output_format"), "compact") or "compact"

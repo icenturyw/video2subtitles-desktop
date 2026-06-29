@@ -361,7 +361,7 @@ class TranslationConfig:
     max_batch_chars: int = 16000
     max_batch_items: int = 50
     retry_count: int = 3
-    concurrency: int = 4
+    concurrency: int = 8
     quality_mode: Literal["fast", "quality"] = "fast"
     output_format: Literal["json", "compact"] = "compact"
     stream: bool = False

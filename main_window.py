@@ -8,7 +8,7 @@ from pathlib import Path
 
 from PyQt5.QtCore import (
     Qt, QObject, QThread, pyqtSignal, QTimer, QSize, QRectF,
-    QPropertyAnimation, QEasingCurve, pyqtProperty,
+    QPropertyAnimation, QEasingCurve, pyqtProperty, QKeySequence,
 )
 from PyQt5.QtGui import (
     QFont, QColor, QPalette, QIcon, QPixmap, QPainter, QPen,
@@ -23,7 +23,8 @@ from PyQt5.QtWidgets import (
     QGroupBox, QTabWidget, QScrollArea, QAbstractItemView,
     QSystemTrayIcon, QStyle, QStackedWidget, QSizePolicy,
     QGraphicsDropShadowEffect, QToolButton, QButtonGroup,
-    QStyleOptionViewItem,
+    QStyleOptionViewItem, QShortcut, QTableWidget, QTableWidgetItem,
+    QHeaderView,
 )
 
 from api_client import WhisperApiClient
@@ -537,18 +538,28 @@ class VideoItemWidget(QWidget):
 class SubtitleViewer(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._subtitles = None
+        self._file_path = None
         self._setup_ui()
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(12)
+        layout.setSpacing(8)
 
         header = QHBoxLayout()
         title = QLabel("字幕预览")
         title.setStyleSheet(f"font-size: 16px; font-weight: 700; color: {THEME['text_primary']};")
         header.addWidget(title)
         header.addStretch()
+
+        # Search bar
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("搜索字幕... (Ctrl+F)")
+        self.search_input.setFixedWidth(200)
+        self.search_input.setVisible(False)
+        self.search_input.textChanged.connect(self._filter_table)
+        header.addWidget(self.search_input)
 
         self.open_dir_btn = QPushButton("📂 打开输出目录")
         self.open_dir_btn.setObjectName("btn_secondary")
@@ -580,73 +591,109 @@ class SubtitleViewer(QWidget):
 
         layout.addLayout(header)
 
-        self.text_edit = QTextEdit()
-        self.text_edit.setReadOnly(True)
-        self.text_edit.setPlaceholderText("选择已完成的任务查看字幕内容...")
-        self.text_edit.setStyleSheet(f"""
-            QTextEdit {{
+        self.table = QTableWidget()
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["#", "时间", "原文", "译文"])
+        self.table.setColumnWidth(0, 50)
+        self.table.setColumnWidth(1, 170)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setAlternatingRowColors(True)
+        self.table.setEditTriggers(QAbstractItemView.DoubleClicked)
+        self.table.cellChanged.connect(self._on_cell_changed)
+        self.table.setStyleSheet(f"""
+            QTableWidget {{
                 background-color: {THEME["bg_medium"]};
                 border: 1px solid {THEME["border"]};
                 border-radius: 12px;
-                padding: 16px;
-                font-size: 14px;
-                line-height: 1.7;
+                font-size: 13px;
+            }}
+            QTableWidget::item {{
+                padding: 6px 10px;
+                color: {THEME["text_primary"]};
+            }}
+            QTableWidget::item:alternate {{
+                background-color: {THEME["bg_light"]};
+            }}
+            QHeaderView::section {{
+                background-color: {THEME["bg_dark"]};
+                color: {THEME["text_secondary"]};
+                padding: 8px;
+                border: none;
+                font-weight: 600;
+                font-size: 12px;
             }}
         """)
-        layout.addWidget(self.text_edit)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setVisible(False)
+        layout.addWidget(self.table)
 
-        self._subtitles = None
-        self._file_path = None
+        self.empty_label = QLabel("选择已完成的任务查看字幕...\n双击原文或译文单元格可编辑")
+        self.empty_label.setAlignment(Qt.AlignCenter)
+        self.empty_label.setStyleSheet(f"color: {THEME['text_muted']}; font-size: 14px;")
+        layout.addWidget(self.empty_label)
 
     def show_subtitles(self, key, subtitles, is_url=False):
         try:
             self._file_path = key
-            self._subtitles = subtitles
+            self._subtitles = list(subtitles)
             self.open_dir_btn.setVisible(True)
             self.export_btn.setVisible(True)
             self.export_vtt_btn.setVisible(True)
             self.export_txt_btn.setVisible(True)
+            self.table.setVisible(True)
+            self.empty_label.setVisible(False)
+            self.search_input.setVisible(True)
 
-            if is_url:
-                display_name = str(key)
-                if len(display_name) > 60:
-                    display_name = display_name[:57] + "..."
-            else:
-                display_name = Path(str(key)).name
-
-            html = []
-            html.append(f'<div style="color: {THEME["text_secondary"]}; font-size: 12px; margin-bottom: 12px;">')
-            html.append(f'📄 {display_name} | 共 {len(subtitles)} 条字幕')
-            html.append('</div>')
-            html.append('<table style="width: 100%; border-collapse: collapse;">')
-
-            for i, sub in enumerate(subtitles, 1):
-                start = sub.get("start", 0)
-                end = sub.get("end", 0)
-                text = sub.get("text", "")
-                translation = sub.get("translation", "")
-
-                start_str = self._format_time(start)
-                end_str = self._format_time(end)
-
-                bg = "#232540" if i % 2 == 1 else "#2d2f54"
-
-                html.append(
-                    f'<tr style="background-color: {bg};">'
-                    f'<td style="padding: 8px 12px; color: {THEME["text_muted"]}; width: 50px; text-align: center; font-size: 12px;">{i}</td>'
-                    f'<td style="padding: 8px 6px; color: {THEME["info"]}; width: 160px; font-size: 12px; font-family: monospace;">{start_str} → {end_str}</td>'
-                    f'<td style="padding: 8px 12px;">{text}</td>'
-                )
-                if translation:
-                    html.append(
-                        f'<td style="padding: 8px 12px; color: {THEME["text_secondary"]}; font-style: italic;">{translation}</td>'
-                    )
-                html.append('</tr>')
-
-            html.append('</table>')
-            self.text_edit.setHtml("".join(html))
+            self._populate_table(self._subtitles)
         except Exception as e:
-            self.text_edit.setPlainText(f"显示字幕时出错: {str(e)[:100]}")
+            self.table.setVisible(False)
+            self.empty_label.setText(f"显示字幕时出错: {str(e)[:100]}")
+            self.empty_label.setVisible(True)
+
+    def _populate_table(self, subtitles):
+        self.table.blockSignals(True)
+        self.table.setRowCount(0)
+        self.table.setRowCount(len(subtitles))
+        for i, sub in enumerate(subtitles):
+            idx_item = QTableWidgetItem(str(i + 1))
+            idx_item.setFlags(idx_item.flags() & ~Qt.ItemIsEditable)
+            self.table.setItem(i, 0, idx_item)
+
+            start = sub.get("start", 0)
+            end = sub.get("end", 0)
+            time_item = QTableWidgetItem(self._format_time(start) + " → " + self._format_time(end))
+            time_item.setFlags(time_item.flags() & ~Qt.ItemIsEditable)
+            self.table.setItem(i, 1, time_item)
+
+            text = sub.get("text", "")
+            self.table.setItem(i, 2, QTableWidgetItem(text))
+
+            translation = sub.get("translation", "")
+            self.table.setItem(i, 3, QTableWidgetItem(translation))
+        self.table.blockSignals(False)
+
+    def _filter_table(self):
+        text = self.search_input.text().lower()
+        for row in range(self.table.rowCount()):
+            match = False
+            for col in range(1, self.table.columnCount()):
+                item = self.table.item(row, col)
+                if item and text in item.text().lower():
+                    match = True
+                    break
+            self.table.setRowHidden(row, not match)
+
+    def _on_cell_changed(self, row, col):
+        if not self._subtitles or col not in (2, 3):
+            return
+        item = self.table.item(row, col)
+        if item is None:
+            return
+        new_text = item.text()
+        key = "text" if col == 2 else "translation"
+        if row < len(self._subtitles):
+            self._subtitles[row][key] = new_text
 
     def clear(self):
         self._subtitles = None
@@ -655,7 +702,11 @@ class SubtitleViewer(QWidget):
         self.export_btn.setVisible(False)
         self.export_vtt_btn.setVisible(False)
         self.export_txt_btn.setVisible(False)
-        self.text_edit.clear()
+        self.table.setVisible(False)
+        self.search_input.setVisible(False)
+        self.search_input.clear()
+        self.empty_label.setText("选择已完成的任务查看字幕...\n双击原文或译文单元格可编辑")
+        self.empty_label.setVisible(True)
 
     def _open_output_dir(self):
         if self._file_path:
@@ -764,6 +815,7 @@ class WorkerThread(QThread):
         self.service = service
         self._running = True
         self._cancel_event = threading.Event()
+        self._skip_event = threading.Event()
         self.client = WhisperApiClient()
         self.local = LocalWhisperTranscriber()
         self._use_api = self.client.health_check()
@@ -802,8 +854,12 @@ class WorkerThread(QThread):
                 return
 
             for path_or_url, is_url in self.items:
-                if not self._running or self._cancel_event.is_set():
+                if not self._running:
                     break
+                if self._cancel_event.is_set() and not self._skip_event.is_set():
+                    break
+                self._skip_event.clear()
+                self._cancel_event.clear()
 
                 key = str(path_or_url)
                 self.progress_updated.emit(key, 0, "准备处理...", "queued")
@@ -942,6 +998,15 @@ class WorkerThread(QThread):
 
     def stop(self):
         self._running = False
+        self._cancel_event.set()
+        try:
+            self.local.cancel()
+        except Exception:
+            pass
+        threading.Thread(target=self._cancel_active_tasks, daemon=True).start()
+
+    def skip_current(self):
+        self._skip_event.set()
         self._cancel_event.set()
         try:
             self.local.cancel()
@@ -1599,6 +1664,18 @@ class MainWindow(QMainWindow):
         self._create_content(main_layout)
         self._create_statusbar()
 
+        # -- Keyboard shortcuts -------------------------------------------
+        QShortcut(QKeySequence("Ctrl+O"), self, self._add_files)
+        QShortcut(QKeySequence("Ctrl+Shift+O"), self, self._add_folder)
+        QShortcut(QKeySequence("Delete"), self, self._remove_selected)
+        QShortcut(QKeySequence("Ctrl+Return"), self, self._start_processing)
+        QShortcut(QKeySequence("Escape"), self, self._stop_processing)
+        QShortcut(QKeySequence("Ctrl+E"), self, self._export_selected_srt)
+        QShortcut(QKeySequence("Ctrl+H"), self, self._show_history)
+        QShortcut(QKeySequence("Ctrl+L"), self, self._open_localization_dialog)
+        QShortcut(QKeySequence("Ctrl+F"), self, self._focus_subtitle_search)
+        QShortcut(QKeySequence("Ctrl+Shift+S"), self, self._skip_current)
+
     def _create_toolbar(self, parent_layout):
         toolbar = QWidget()
         toolbar.setStyleSheet(f"""
@@ -1795,6 +1872,14 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(False)
         secondary_actions.addWidget(self.stop_btn)
 
+        self.skip_btn = QPushButton("⏭ 跳过")
+        self.skip_btn.setObjectName("btn_secondary")
+        self.skip_btn.setFixedHeight(36)
+        self.skip_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self.skip_btn.clicked.connect(self._skip_current)
+        self.skip_btn.setEnabled(False)
+        secondary_actions.addWidget(self.skip_btn)
+
         self.retry_all_btn = QPushButton("🔄 重试失败")
         self.retry_all_btn.setObjectName("btn_secondary")
         self.retry_all_btn.setFixedHeight(36)
@@ -1841,6 +1926,7 @@ class MainWindow(QMainWindow):
         self.file_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.file_list.customContextMenuRequested.connect(self._show_context_menu)
         self.file_list.setAcceptDrops(True)
+        self.file_list.setDragDropMode(QAbstractItemView.InternalMove)
         self.file_list.dragEnterEvent = self._drag_enter_event
         self.file_list.dragMoveEvent = self._drag_move_event
         self.file_list.dropEvent = self._drop_event
@@ -1927,16 +2013,30 @@ class MainWindow(QMainWindow):
             entry = self.history.get(p)
             if entry:
                 self.video_items[p]["localization_job_id"] = entry.get("job_id", "")
+                saved_status = entry.get("status", "")
+                saved_progress = entry.get("progress", 0)
+                saved_message = entry.get("message", "")
                 subs = self.history.get_subtitles(p)
                 if subs:
                     widget.subtitles = subs
                     out_dir = entry.get("output_dir") or ""
-                    msg = f"✅ 已有字幕 ({entry.get('language', '?')})"
-                    if out_dir:
-                        msg += f" · {Path(out_dir).name}"
-                    widget.update_status("completed", 100, msg)
+                    if saved_status == "error":
+                        msg = saved_message or "上次处理出错"
+                        widget.update_status("error", 0, msg[:80])
+                    elif saved_status == "cancelled":
+                        msg = "上次已取消"
+                        widget.update_status("cancelled", 0, msg)
+                    elif saved_status in ("processing", "pending"):
+                        msg = "⚠ 未完成 (可重新处理)"
+                        widget.update_status("interrupted", saved_progress or 0, msg)
+                    else:
+                        msg = f"✅ 已有字幕 ({entry.get('language', '?')})"
+                        if out_dir:
+                            msg += f" · {Path(out_dir).name}"
+                        widget.update_status("completed", 100, msg)
+                elif saved_status == "error":
+                    widget.update_status("error", 0, (saved_message or "上次处理出错")[:80])
                 else:
-                    entry = self.history.get(p)
                     srt_path = entry.get("srt_path") if entry else ""
                     widget.update_status("completed", 100, f"历史记录 ({Path(srt_path).name})")
             added += 1
@@ -2004,6 +2104,7 @@ class MainWindow(QMainWindow):
 
             self.start_btn.setEnabled(False)
             self.stop_btn.setEnabled(True)
+            self.skip_btn.setEnabled(True)
             self.add_files_btn.setEnabled(False)
             self.add_folder_btn.setEnabled(False)
             self.add_url_btn.setEnabled(False)
@@ -2047,7 +2148,13 @@ class MainWindow(QMainWindow):
             widget = data["widget"]
             if widget.status in ("queued", "downloading", "processing", "pending"):
                 widget.update_status("cancelled", widget.progress, "已取消")
+        self.stop_btn.setEnabled(False)
+        self.skip_btn.setEnabled(False)
         self._on_all_done()
+
+    def _skip_current(self):
+        if self.worker and self.worker.isRunning():
+            self.worker.skip_current()
 
     def _on_progress(self, file_path, progress, message, status):
         try:
@@ -2055,6 +2162,7 @@ class MainWindow(QMainWindow):
                 return
             if file_path in self.video_items:
                 self.video_items[file_path]["widget"].update_status(status, progress, message)
+                self._save_progress_to_history(file_path, progress, status, message)
         except Exception as e:
             print(f"_on_progress error: {e}")
 
@@ -2072,6 +2180,8 @@ class MainWindow(QMainWindow):
                     out_dir_name = srt_path.parent.name
                     msg = f"完成 ({language}) · {out_dir_name}/"
                     widget.update_status("completed", 100, msg)
+
+                self._save_progress_to_history(file_path, 100, "completed", msg)
 
                 idx = self.file_list.row(self.video_items[file_path]["item"])
                 if idx == self.file_list.currentRow():
@@ -2091,11 +2201,25 @@ class MainWindow(QMainWindow):
                 return
             if file_path and file_path in self.video_items:
                 self.video_items[file_path]["widget"].update_status("error", 0, error_msg[:80])
+                self._save_progress_to_history(file_path, 0, "error", error_msg[:200])
             elif not file_path:
                 QMessageBox.critical(self, "错误", error_msg)
             self._update_progress()
         except Exception as e:
             print(f"Error in _on_error: {e}")
+
+    def _save_progress_to_history(self, file_path, progress, status, message):
+        try:
+            if not self.history.exists(file_path):
+                return
+            entry = self.history.get(file_path)
+            entry["progress"] = progress
+            entry["status"] = status
+            entry["message"] = str(message)[:200]
+            entry["timestamp"] = time.time()
+            self.history.put(file_path, entry)
+        except Exception:
+            pass
 
     def _on_all_done(self):
         try:
@@ -2418,6 +2542,7 @@ class MainWindow(QMainWindow):
         )
         self.video_items[key]["widget"].update_status("processing", 0, f"重新生成: {stage}")
         self.stop_btn.setEnabled(True)
+        self.skip_btn.setEnabled(True)
         self._attach_localization_worker(key, worker)
         self.status_label.setText(f"正在从 {stage} 重新生成...")
 
@@ -2458,6 +2583,28 @@ class MainWindow(QMainWindow):
             self.video_items[key]["widget"].subtitles = None
             self.video_items[key]["widget"].update_status("pending", 0, "已删除历史记录")
         self.status_label.setText("输出和记录已删除")
+
+    def _remove_selected(self):
+        item = self.file_list.currentItem()
+        if item:
+            key = str(item.data(Qt.UserRole) or "")
+            if key in self.video_items:
+                self._remove_file(key)
+
+    def _export_selected_srt(self):
+        item = self.file_list.currentItem()
+        if item:
+            key = str(item.data(Qt.UserRole) or "")
+            if key in self.video_items:
+                self._export_single(key, "srt")
+
+    def _open_localization_dialog(self):
+        self._show_localization_dialog()
+
+    def _focus_subtitle_search(self):
+        if self.subtitle_viewer.search_input.isVisible():
+            self.subtitle_viewer.search_input.setFocus()
+            self.subtitle_viewer.search_input.selectAll()
 
     def _remove_file(self, key):
         if key in self.video_items:

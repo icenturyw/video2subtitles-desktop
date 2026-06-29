@@ -533,7 +533,8 @@ class OpenAICompatibleProvider(TranslationProvider):
                         logger.warning("Translation attempt %d failed: %s; retrying in %ds",
                                        attempt + 1, e, wait)
                         time.sleep(wait)
-                    break
+                    if endpoint_index < len(endpoints) - 1:
+                        continue
                 except TranslationError as e:
                     if not e.recoverable:
                         raise
@@ -543,13 +544,15 @@ class OpenAICompatibleProvider(TranslationProvider):
                         logger.warning("Translation attempt %d failed: %s; retrying in %ds",
                                        attempt + 1, e, wait)
                         time.sleep(wait)
-                    break
+                    if endpoint_index < len(endpoints) - 1:
+                        continue
                 except httpx.TimeoutException as e:
                     last_error = TimeoutError_(str(e))
                     if attempt < max_attempts - 1:
                         wait = min(2 ** attempt * 5, 60)
                         time.sleep(wait)
-                    break
+                    if endpoint_index < len(endpoints) - 1:
+                        continue
                 except httpx.HTTPStatusError as e:
                     if e.response.status_code in (401,):
                         raise AuthError()
@@ -571,13 +574,15 @@ class OpenAICompatibleProvider(TranslationProvider):
                     if attempt < max_attempts - 1:
                         wait = min(2 ** attempt * 5, 60)
                         time.sleep(wait)
-                    break
+                    if endpoint_index < len(endpoints) - 1:
+                        continue
                 except Exception as e:
                     last_error = TranslationError(str(e), recoverable=True)
                     if attempt < max_attempts - 1:
                         wait = min(2 ** attempt * 5, 30)
                         time.sleep(wait)
-                    break
+                    if endpoint_index < len(endpoints) - 1:
+                        continue
 
             if isinstance(last_error, TranslationError) and not last_error.recoverable:
                 raise last_error

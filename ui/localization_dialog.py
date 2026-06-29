@@ -588,8 +588,8 @@ class LocalizationDialog(QDialog):
         trans_form.addRow("超时(秒):", self.trans_timeout)
 
         self.trans_concurrency = QSpinBox()
-        self.trans_concurrency.setRange(1, 16)
-        self.trans_concurrency.setValue(int(self._settings.get("translation_concurrency", 4)))
+        self.trans_concurrency.setRange(1, 32)
+        self.trans_concurrency.setValue(int(self._settings.get("translation_concurrency", 8)))
         trans_form.addRow("并发线程数:", self.trans_concurrency)
 
         self.trans_output_format = QComboBox()
@@ -981,7 +981,7 @@ class LocalizationDialog(QDialog):
         if idx >= 0:
             self.trans_api_type.setCurrentIndex(idx)
         self.trans_timeout.setValue(int(settings.get("translation_timeout", 60) or 60))
-        self.trans_concurrency.setValue(int(settings.get("translation_concurrency", 4) or 4))
+        self.trans_concurrency.setValue(int(settings.get("translation_concurrency", 8) or 8))
         source = settings.get("source_language_dialog", "")
         target = settings.get("target_language_dialog", "")
         if source:
@@ -1086,7 +1086,7 @@ class LocalizationDialog(QDialog):
         if idx >= 0:
             self.trans_api_type.setCurrentIndex(idx)
         self.trans_timeout.setValue(int(s.get("translation_timeout", 60)))
-        self.trans_concurrency.setValue(int(s.get("translation_concurrency", 4)))
+        self.trans_concurrency.setValue(int(s.get("translation_concurrency", 8)))
         fmt = s.get("translation_output_format", "compact")
         idx = self.trans_output_format.findData(fmt)
         if idx >= 0:

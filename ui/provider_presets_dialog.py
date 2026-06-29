@@ -462,7 +462,7 @@ class ProviderPresetsDialog(QDialog):
             ("复制", self._duplicate_current),
             ("启用/禁用", self._toggle_current),
             ("设为默认", self._set_default_current),
-            ("测试连接", self._mark_test_placeholder),
+            ("测试连接", self._test_current_connection),
             ("删除", self._delete_current),
         ]:
             btn = QPushButton(text)
@@ -557,14 +557,152 @@ class ProviderPresetsDialog(QDialog):
             set_default_provider_preset(preset_id)
             self._reload()
 
-    def _mark_test_placeholder(self):
+    def _test_current_connection(self):
         preset = self._find_current()
         if not preset:
             return
+        import time
+        import logging
+        logger = logging.getLogger("provider_presets_dialog")
+
         preset.lastTestStatus = "unknown"
-        preset.lastTestMessage = "测试连接能力后续增强"
+        preset.lastTestMessage = "测试中..."
         upsert_provider_preset(preset)
-        QMessageBox.information(self, "测试连接", "已保留测试状态字段；真实连接测试将在后续版本增强。")
+        self._reload()
+
+        start = time.time()
+        success = False
+        message = ""
+
+        try:
+            if preset.type == "translation":
+                success, message = self._test_translation_provider(preset)
+            else:
+                success, message = self._test_tts_provider(preset)
+        except Exception as e:
+            elapsed = time.time() - start
+            message = f"{e}"[:200]
+            logger.warning("Connection test failed in %.1fs: %s", elapsed, message)
+
+        preset.lastTestStatus = "success" if success else "failed"
+        preset.lastTestMessage = message
+        upsert_provider_preset(preset)
+        self._reload()
+
+        if success:
+            QMessageBox.information(self, "测试连接", f"连接成功 ({message})")
+        else:
+            QMessageBox.warning(self, "测试连接", f"连接失败：{message}")
+
+    @staticmethod
+    def _test_translation_provider(preset: ProviderPreset):
+        base_url = (preset.config.get("base_url", "") or "").strip().rstrip("/")
+        api_key = preset.config.get("api_key", "") or ""
+        if not base_url:
+            base_url = preset.config.get("baseUrl", "") or ""
+        if not base_url:
+            return False, "未设置 API 地址"
+
+        # Try common health/status endpoints
+        import urllib.request
+        import json as _json
+
+        model = (preset.config.get("model", "") or "").strip()
+        endpoints_to_try = ["/health", "/v1/models", "/models"]
+        if model:
+            endpoints_to_try.insert(0, "/v1/chat/completions")
+
+        last_err = ""
+        for ep in endpoints_to_try:
+            url = base_url + ep
+            try:
+                req = urllib.request.Request(url, method="GET")
+                req.add_header("User-Agent", "Video2Subtitles/1.0")
+                if api_key:
+                    req.add_header("Authorization", f"Bearer {api_key}")
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    if resp.status < 400:
+                        return True, f"HTTP {resp.status}, {ep}"
+                last_err = f"HTTP {resp.status}"
+            except urllib.error.HTTPError as e:
+                if e.code == 401:
+                    return True, "服务响应，API Key 验证通过" if api_key else "服务响应，未设置 API Key"
+                if e.code == 404:
+                    last_err = f"{e.code} {ep}"
+                    continue
+                last_err = f"HTTP {e.code}"
+            except urllib.error.URLError as e:
+                last_err = f"无法连接: {e.reason}"
+                break
+            except Exception as e:
+                last_err = str(e)[:100]
+        return False, last_err
+
+    @staticmethod
+    def _test_tts_provider(preset: ProviderPreset):
+        provider_name = (preset.config.get("provider", "") or "").strip().lower()
+        base_url = (preset.config.get("base_url", "") or "").strip().rstrip("/")
+        api_key = preset.config.get("api_key", "") or ""
+
+        if provider_name in ("edge-tts",):
+            try:
+                import edge_tts
+                import asyncio
+                voices = asyncio.run(edge_tts.list_voices())
+                count = len(voices) if voices else 0
+                return True, f"Edge-TTS 已安装，{count} 个可用音色"
+            except ImportError:
+                return False, "Edge-TTS 未安装 (pip install edge-tts)"
+            except Exception as e:
+                return False, str(e)[:200]
+        elif provider_name in ("sapi", "windows-sapi", "windows_sapi"):
+            import os
+            if os.name == "nt":
+                return True, "Windows SAPI 可用"
+            return False, "SAPI 仅支持 Windows"
+        elif provider_name in ("qwen3-tts", "qwen3_tts", "qwen3"):
+            import urllib.request
+            try:
+                with urllib.request.urlopen("http://127.0.0.1:8767/health", timeout=3) as resp:
+                    data = resp.read().decode("utf-8")
+                    import json
+                    info = json.loads(data)
+                    model = info.get("model", info.get("loaded_model", "未知"))
+                    device = info.get("device", "未知")
+                    return True, f"Qwen3-TTS 就绪 ({model}, {device})"
+            except Exception as e:
+                return False, f"Qwen3-TTS 未运行: {e}"
+        elif provider_name in ("openai-compatible", "openai_compatible", "openai", "openai-tts", "openai_tts"):
+            if not base_url:
+                return False, "未设置 API 地址"
+            import urllib.request
+            try:
+                url = base_url.rstrip("/") + "/health"
+                req = urllib.request.Request(url)
+                if api_key:
+                    req.add_header("Authorization", f"Bearer {api_key}")
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    return True, f"HTTP {resp.status}"
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    return True, "服务可连接 (health 端点未实现)"
+                return True, f"服务响应 HTTP {e.code}"
+            except Exception as e:
+                return False, str(e)[:200]
+        elif provider_name in ("volcengine-doubao", "volcengine", "volcano", "doubao-tts", "doubao"):
+            endpoint = (preset.config.get("endpoint", "") or "").strip()
+            if not endpoint:
+                return False, "未设置 API 端点"
+            import urllib.request
+            try:
+                with urllib.request.urlopen(endpoint, timeout=5) as resp:
+                    return True, f"HTTP {resp.status}"
+            except urllib.error.HTTPError as e:
+                return True, f"服务可连接 HTTP {e.code}"
+            except Exception as e:
+                return False, str(e)[:200]
+        else:
+            return False, f"不支持的提供者: {provider_name}"
         self._reload()
 
     def _delete_current(self):

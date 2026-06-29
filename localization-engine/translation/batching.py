@@ -72,13 +72,32 @@ def batch_to_tsv(batch: List[SubtitleSegment]) -> str:
 
 
 class CheckpointManager:
-    """Manages translation checkpoint files for resumable translation."""
+    """Manages translation checkpoint files for resumable translation.
 
-    def __init__(self, checkpoint_dir: Path):
+    Writes are batched: only flushed to disk every *flush_interval*
+    completions or every *flush_seconds*, whichever comes first.  This
+    avoids per-batch disk syncs while keeping recovery loss small.
+    """
+
+    def __init__(self, checkpoint_dir: Path,
+                 flush_interval: int = 5,
+                 flush_seconds: float = 30.0):
         self._dir = Path(checkpoint_dir)
         self._dir.mkdir(parents=True, exist_ok=True)
         self._completed: Set[int] = set()
+        self._flush_interval = max(1, int(flush_interval))
+        self._flush_seconds = float(flush_seconds)
+        self._pending = 0
+        self._last_flush: float = 0.0
         self._load()
+
+    def _should_flush(self) -> bool:
+        if self._pending >= self._flush_interval:
+            return True
+        import time
+        return (self._last_flush > 0
+                and self._pending > 0
+                and (time.time() - self._last_flush) >= self._flush_seconds)
 
     def _load(self) -> None:
         checkpoint_file = self._dir / "completed_ids.json"
@@ -93,7 +112,6 @@ class CheckpointManager:
         checkpoint_file = self._dir / "completed_ids.json"
         data = {"completed_ids": sorted(self._completed)}
         self._dir.mkdir(parents=True, exist_ok=True)
-        # Atomic write via temp file
         tmp = checkpoint_file.with_suffix(".tmp")
         tmp.write_text(json.dumps(data), encoding="utf-8")
         if checkpoint_file.exists():
@@ -104,15 +122,22 @@ class CheckpointManager:
 
     def mark_completed(self, segment_ids: List[int]) -> None:
         self._completed.update(segment_ids)
+        self._pending += 1
+        if self._should_flush():
+            self.flush()
+
+    def flush(self) -> None:
+        import time
         self.save()
+        self._pending = 0
+        self._last_flush = time.time()
 
     def is_completed(self, segment_id: int) -> bool:
         return segment_id in self._completed
 
     def get_pending_segments(self, segments: List[SubtitleSegment]) -> List[SubtitleSegment]:
-        """Return segments that haven't been translated yet."""
         return [s for s in segments if s.index not in self._completed]
 
     def clear(self) -> None:
         self._completed.clear()
-        self.save()
+        self.flush()

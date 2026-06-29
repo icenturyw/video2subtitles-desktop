@@ -301,14 +301,20 @@ def main():
     # Apply dark theme
     apply_theme(app)
 
-    # Auto-start bundled/custom whisper server in background when present.
-    _ensure_whisper_server()
+    # Auto-start sidecars in background threads so the UI appears immediately.
+    import threading as _threading
 
-    # Auto-start localization engine (failure does not block the app).
-    try:
-        _ensure_localization_engine()
-    except Exception as exc:
-        _set_localization_status("error", f"启动失败: {exc}")
+    _threading.Thread(
+        target=_ensure_whisper_server,
+        daemon=True,
+        name="whisper-autostart",
+    ).start()
+
+    _threading.Thread(
+        target=lambda: _ensure_localization_engine(),
+        daemon=True,
+        name="loceng-autostart",
+    ).start()
 
     # Auto-start Qwen3-TTS sidecar when dub + qwen3-tts is configured.
     try:
@@ -317,7 +323,6 @@ def main():
             str(_settings.get("localization_mode", "") or "").strip() == "dub"
             and "qwen3-tts" in str(_settings.get("tts_provider", "") or "").lower()
         ):
-            import threading as _threading
             _threading.Thread(
                 target=lambda: ensure_qwen3_tts_engine(),
                 daemon=True,
