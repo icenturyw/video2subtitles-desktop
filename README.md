@@ -60,6 +60,8 @@
 - **音频混合可取消** — 所有 FFmpeg 子进程支持回调检测取消信号，混合/合成过程可快速终止
 - **YouTube 字幕智能选择** — 支持 auto/youtube/whisper 三种字幕策略：auto 自动获取 YouTube 字幕、修复重分段、质量不达标回退本地 Whisper；youtube 强制字幕；whisper 强制本地识别
 - **Fish.audio TTS** — 新增 Fish.audio TTS 提供者，支持 s2.1-pro-free / s2-pro / s1 模型，可配置 mp3/wav/opus 格式和采样率
+- **结构化输出目录** — 任务输出改为 `source/` `subtitles/` `media/` `packages/` `logs/` `.work/` 分层布局，自动生成 README.txt
+- **任务状态系统重构** — 统一状态/阶段双维度模型，内置图标和颜色映射，历史记录支持生命周期 API（启动/进度/完成/失败/取消/中断）
 - **自定义 TTS 设置** — 本地化对话框支持不绑定 Provider Preset 直接手动配置 TTS 参数
 - **崩溃日志** — 未捕获异常自动写入 `.cache/crash.log`，便于排查无窗口崩溃问题
 - **关闭窗口保护** — 任务运行中关闭窗口弹出确认提示，ChatGPT 打包运行中阻止关闭
@@ -116,23 +118,27 @@ python tools/package_source.py --output video2subtitles-source-package.zip
 
 ## 维护记录 / Maintenance Notes
 
-### 2026-07 — Fish.audio TTS、YouTube 字幕智能选择与翻译鲁棒性增强
+### 2026-07 — Fish.audio TTS、YouTube 字幕智能选择、输出目录重构与翻译鲁棒性增强
 
 - **Fish.audio TTS 支持**：新增 `FishAudioTTSProvider`（`localization-engine/tts/fish_audio_tts.py`），支持 Fish.audio API 的 `v1/tts` 端点，可配置 API Key、模型（`s2.1-pro-free` / `s2-pro` / `s1`）、音频格式（mp3/wav/opus）和采样率。设置页新增 Fish.audio 参数组，本地化对话框支持手动输入音色 ID 和试听。
 - **YouTube 字幕智能选择**：新增「YouTube 字幕策略」三级控制（auto / youtube / whisper），auto 模式下自动获取 YouTube 字幕、修复断词并按语义重分段，质量不达标时自动回退本地 Whisper；youtube 模式强制使用 YouTube 字幕；whisper 模式跳过字幕直接本地识别。
-- **YouTube 字幕重分段引擎**：`whisper-server/main.py` 新增 `_resegment_youtube_captions()`，将 YouTube 逐句显示字幕按停顿、句末标点、字符数上限和时长上限合并为适合翻译/TTS 的语义段落；新增 `_assess_youtube_caption_quality()` 多维度质量评分（片段碎片率、平均时长、平均字符数、时间轴重叠、重复字幕等），auto 模式下低于阈值自动回退 Whisper。
+- **YouTube 字幕重分段引擎**：`whisper-server/main.py` 新增 `_resegment_youtube_captions()`，将 YouTube 逐句显示字幕按停顿、句末标点、字符数上限和时长上限合并为适合翻译/TTS 的语义段落；新增 `_assess_youtube_caption_quality()` 多维度质量评分（片段碎片率、平均时长、平均字符数、时间轴重叠、重复字幕等）。
+- **输出目录重构**：新增 `output_layout.py`，任务输出目录改为结构化布局 — `source/`（原视频）、`subtitles/`（字幕）、`media/`（配音/硬字幕视频）、`packages/`（ChatGPT 包）、`logs/`（日志）、`.work/`（中间文件）、`README.txt`。历史记录、output patch 和 manifest 全面适配新布局。
+- **Manifest v2 优化**：`output_manifest.py` 中 v2 manifest 的 `source` 改为结构化对象，兼容字段移至 `source_input`/`legacy`，v1 升级不再覆盖 v2 结构；`packages` 字典统一管理 ChatGPT 包路径；`source/`/`subtitles/`/`media/` 子目录搜索支持。
 - **断词修复与数字碎片重连**：`subtitle_utils.py` 的 `reconstruct_split_words()` 扩展支持数字跨段落拆分修复（如 `"$17,"` / `"000."` → `"$17,000."`），避免孤立数字碎片导致翻译质量检测失败。
-- **翻译响应解析增强**：`response_parser.py` 大幅重构，支持 JSON 字段别名（`translation`/`target_text`/`content` 等）、ID 字段别名、映射格式（`{"1": "..."}`），紧凑模式优先识别 `id<TAB>translation` TSV 格式，markdown 表格、编号列表、fenced JSON 均能正确解析，减少本地小模型输出格式漂移导致的翻译丢失。
-- **翻译完整性保护优化**：新增 `TRANSLATION_INCOMPLETE` 检测，配音模式下翻译缺失或回退为源文本时写入 `translation_error_report.json` 并精确提示缺失 ID；翻译质量失败（如目标语言混入日语假名）的单个字幕不再中止整个配音流程，改为跳过 TTS 保留原音频。
-- **翻译检查点 v2**：`CheckpointManager` 升级为 `translations.json` 格式，同时存储 `completed_ids` 和译文文本；重启后能恢复已翻译文本，旧的仅 ID 断点不再信任，避免重跑时静默跳过已丢失译文的字幕。
-- **TTS 时序参数放宽**：`MAX_SPEED` 从 1.5 提升至 2.0、`max_tolerance_sec` 从 0.8 提升至 1.5、`max_speed_factor` 从 1.5 提升至 2.0，chunk 语速压力阈值同步上调，适配更多自然语速差异场景。新增「超时硬切」开关和溢出容忍秒数配置。
-- **静音边界过滤**：chunk 切分时过滤音频首尾边缘静音，避免首尾静音被误当作分句边界导致首句/尾句时间窗口缩成静默片。
-- **Qt 枚举规范化**：`AA_UseHighDpiPixmaps` / `AA_EnableHighDpiScaling` 改用 `Qt.AA_*` 标准枚举常量。
-- **崩溃日志记录**：`app.py` 启动时启用 `faulthandler` 并注册线程/主线程异常钩子，未捕获异常写入 `.cache/crash.log`，便于排查无窗口崩溃问题。
-- **关闭窗口安全保护**：`main_window.py` 新增 `closeEvent`，ChatGPT 打包运行中阻止关闭，其他任务运行中弹出确认提示，确认后自动停止 worker 并等待 5 秒。
-- **自定义 TTS 设置**：本地化对话框 TTS 预设下拉新增「自定义 TTS 设置」选项，支持不绑定任何 Provider Preset 直接配置 TTS 参数；手动切换 TTS 服务商时自动切到自定义模式。
-- **新文件**：`localization-engine/tts/fish_audio_tts.py`、`pack_for_chatgpt.bat`（ChatGPT 打包快捷脚本）。
-- **测试覆盖**：新增/更新 `tests/test_translation_parser.py`（紧凑 TSV/JSON 字段别名/编号保护/markdown 表格/断点恢复）、`tests/test_translation_quality.py`（质量失败段跳过不中止）、`tests/test_subtitle_utils.py`（断词/数字碎片合并）、`tests/test_youtube_captions.py`（重分段/质量评估/策略别名）、`tests/test_qwen3_tts.py`（Fish.audio 请求验证）、`tests/test_client_settings.py`（字幕策略设置校验）、`tests/test_engine_api.py`（output_format/stream 传递）、`tests/test_localization_client.py`（interrupted 状态）、`tests/test_localization_language_codes.py`（自定义 TTS 不覆盖）、`tests/test_localization_dialog_tts.py`（新文件）。
+- **翻译响应解析增强**：`response_parser.py` 大幅重构，支持 JSON 字段别名（`translation`/`target_text`/`content` 等）、ID 字段别名、映射格式，紧凑模式优先识别 `id<TAB>translation` TSV 格式，markdown 表格、编号列表、fenced JSON 均能正确解析。
+- **翻译批次模式**：`TranslationConfig` 新增 `batch_mode`（`auto`/`strict_json_batch`/`single_segment`），`single_segment` 逐句独立翻译，最大程度隔离小模型格式漂移。
+- **翻译质量增强**：`quality.py` 新增 `SOURCE_TRANSLATION_PAIR_LEAK`、`UNTRANSLATED_LATIN_SOURCE_COPY`、`STRUCTURED_RESPONSE_ARTIFACT` 三项检测，提升本地小模型翻译质量把关。
+- **翻译完整性保护优化**：翻译缺失或回退源文本时写入 `translation_error_report.json`；单条质量失败的翻译不再中止整个配音流程，改为跳过 TTS 保留原音频。
+- **翻译检查点 v2**：`CheckpointManager` 升级为 `translations.json` 格式同时存储 ID 和译文，重启后可恢复已翻译文本。
+- **任务状态系统重构**：`core/task_state.py` 扩展为完整状态机 — 新增 `RUNNING`/`FAILED`/`INTERRUPTED`/`CACHED` 状态，`normalize_task_status()`/`normalize_task_stage()` 双维度，`build_task_display()` 统一输出标题、图标、颜色和可操作标记。
+- **历史记录 v3**：`history.py` 升级 schema v3，新增 `start_task()`/`update_task_progress()`/`complete_task()`/`fail_task()`/`cancel_task()`/`interrupt_running_tasks()` 生命周期 API，启动时自动迁移旧格式。
+- **TTS 时序参数放宽**：`MAX_SPEED` 2.0、`max_tolerance_sec` 1.5、`max_speed_factor` 2.0，新增「超时硬切」开关和溢出容忍秒数配置。
+- **静音边界过滤**：chunk 切分过滤音频首尾边缘静音，避免误判为分句边界。
+- **崩溃日志记录**：`app.py` 启用 `faulthandler` 和线程异常钩子，写入 `.cache/crash.log`。
+- **关闭窗口安全保护**：`main_window.py` 新增 `closeEvent`，ChatGPT 打包中阻止关闭，运行中确认后停止 worker。
+- **新文件**：`localization-engine/tts/fish_audio_tts.py`、`output_layout.py`、`pack_for_chatgpt.bat`。
+- **测试覆盖**：新增/更新 15+ 测试文件，覆盖状态/阶段规范化、v2 manifest source 对象、batch_mode 序列化、输出布局、翻译解析紧凑/fallback、质量检测新增项、断点恢复、YouTube 字幕重分段与质量评估、Fish.audio 请求、自定义 TTS、字幕策略设置。
 
 ### 2026-06 — 字幕样式微调、TTS 时序优化与音频混合改进
 
@@ -389,8 +395,8 @@ chatgpt_package/      # 生成 ChatGPT 包后出现
 | `V2S_DOWNLOAD_QUALITY` | 可选。下载质量：`best`、`720p`、`480p`；默认 `best` |
 | `V2S_KEEP_DOWNLOADED_VIDEO` | 可选。是否保留下载视频：`true` / `false`；默认 `true` |
 | `V2S_PROXY` | 可选。在线视频标题预取和 yt-dlp 下载使用的代理地址；留空表示直连 |
-| `V2S_YOUTUBE_CAPTION_POLICY` | 可选。YouTube 字幕策略：`auto`（自动选择）、`youtube`（强制字幕）、`whisper`（强制本地识别）；默认 `auto` |
-| `V2S_YOUTUBE_CAPTION_RESEGMENT` | 可选。是否对 YouTube 字幕进行智能重分段：`true` / `false`；默认 `true` |
+| `V2S_YOUTUBE_CAPTION_POLICY` | 可选。YouTube 字幕策略：`auto` / `youtube` / `whisper`；默认 `auto` |
+| `V2S_YOUTUBE_CAPTION_RESEGMENT` | 可选。是否智能重分段：`true` / `false`；默认 `true` |
 | `V2S_STOP_SIDECARS_ON_EXIT` | 可选。关闭主窗口时是否停止 Whisper、本地化引擎和 Qwen3-TTS 后台服务：`true` / `false`；默认 `true` |
 | `VOLCENGINE_TTS_ENDPOINT` | 可选。火山引擎豆包 TTS API 地址；默认 `https://openspeech.bytedance.com/api/v3/tts/unidirectional` |
 | `VOLCENGINE_TTS_API_KEY` | 可选。X-Api-Key 认证密钥（新控制台推荐） |
@@ -404,7 +410,6 @@ chatgpt_package/      # 生成 ChatGPT 包后出现
 | `VOLCENGINE_TTS_LOUDNESS_RATE` | 可选。音量调节；默认 `0`，范围 -100~100 |
 | `FISH_TTS_API_BASE` | 可选。Fish.audio API 地址；默认 `https://api.fish.audio` |
 | `FISH_TTS_API_KEY` | 可选。Fish.audio API Key |
-| `FISH_TTS_VOICE` | 可选。音色 ID |
 | `FISH_TTS_MODEL` | 可选。模型名称；默认 `s2.1-pro-free` |
 | `FISH_TTS_FORMAT` | 可选。音频格式；默认 `mp3`，可选 `wav`/`opus` |
 | `FISH_TTS_SAMPLE_RATE` | 可选。采样率；默认 `44100` |
@@ -578,7 +583,11 @@ video_2_subtitles/
 ├── playlist_patch.py   # YouTube 播放列表添加模式选择 / Playlist add-mode patch
 ├── settings_patch.py   # 设置窗口和启动流程扩展 / Setup flow extension
 ├── history.py          # 历史记录管理 / History manager
+├── job_models.py        # 任务数据模型 / Job data models
+├── output_layout.py     # 输出目录结构化布局 / Output directory layout
 ├── requirements.txt    # Python 依赖 / Dependencies
+├── core/                # 核心模块 / Core modules
+│   └── task_state.py    # 任务状态与阶段定义 / Task state & stage definitions
 ├── whisper-server/     # 内置 Whisper 服务 / Bundled local service
 │   ├── main.py         # FastAPI sidecar / Local API server
 │   ├── requirements.txt
