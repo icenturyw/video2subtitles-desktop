@@ -9,9 +9,10 @@ from __future__ import annotations
 import json
 import logging
 import threading
-import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from engine.repository import TaskRecord, TaskRepository, utc_now
 
 logger = logging.getLogger("engine.task_store")
 
@@ -24,85 +25,7 @@ VALID_STATUSES = frozenset({
 _INFLIGHT = frozenset({"pending", "running"})
 
 
-class TaskRecord:
-    """Internal representation of a task in the store."""
-
-    __slots__ = (
-        "job_id", "status", "stage", "progress", "message",
-        "detected_language", "artifacts", "error_code", "error_detail",
-        "request_payload", "created_at", "updated_at",
-    )
-
-    def __init__(self, job_id: str, request_payload: Optional[Dict[str, Any]] = None):
-        self.job_id = job_id
-        self.status = "pending"
-        self.stage = "prepare"
-        self.progress = 0
-        self.message = ""
-        self.detected_language = ""
-        self.artifacts: List[Dict[str, Any]] = []
-        self.error_code: Optional[str] = None
-        self.error_detail: Optional[str] = None
-        self.request_payload = request_payload or {}
-        self.created_at = time.strftime("%Y-%m-%dT%H:%M:%S")
-        self.updated_at = self.created_at
-
-    def to_dict(self) -> Dict[str, Any]:
-        d: Dict[str, Any] = {
-            "job_id": self.job_id,
-            "status": self.status,
-            "stage": self.stage,
-            "progress": self.progress,
-            "message": self.message,
-            "detected_language": self.detected_language,
-            "artifacts": self.artifacts,
-            "request_payload": self.request_payload,
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
-        }
-        if self.error_code:
-            d["error_code"] = self.error_code
-        if self.error_detail:
-            d["error_detail"] = self.error_detail
-        return d
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "TaskRecord":
-        rec = cls(
-            job_id=data.get("job_id", ""),
-            request_payload=data.get("request_payload", {}),
-        )
-        rec.status = data.get("status", "pending")
-        rec.stage = data.get("stage", "prepare")
-        rec.progress = int(data.get("progress", 0))
-        rec.message = data.get("message", "")
-        rec.detected_language = data.get("detected_language", "")
-        rec.artifacts = data.get("artifacts", [])
-        rec.error_code = data.get("error_code")
-        rec.error_detail = data.get("error_detail")
-        rec.created_at = data.get("created_at", "")
-        rec.updated_at = data.get("updated_at", "")
-        return rec
-
-    def to_api_dict(self) -> Dict[str, Any]:
-        """Return dict suitable for API responses (excludes request_payload)."""
-        d: Dict[str, Any] = {
-            "job_id": self.job_id,
-            "status": self.status,
-            "stage": self.stage,
-            "progress": self.progress,
-            "message": self.message,
-            "detected_language": self.detected_language,
-            "artifacts": self.artifacts,
-        }
-        if self.error_code:
-            d["error_code"] = self.error_code
-        if self.error_detail:
-            d["error_detail"] = self.error_detail
-        return d
-
-
-class TaskStore:
+class TaskStore(TaskRepository):
     """Thread-safe task storage with JSON file persistence.
 
     Data directory layout:
@@ -139,7 +62,7 @@ class TaskStore:
     def _save(self) -> None:
         """Persist current tasks to disk. Caller must hold _lock."""
         payload = {
-            "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "saved_at": utc_now(),
             "tasks": [rec.to_dict() for rec in self._tasks.values()],
         }
         try:
@@ -166,7 +89,7 @@ class TaskStore:
                     rec.status = "interrupted"
                     rec.message = "服务重启，任务中断"
                     rec.error_code = "TASK_INTERRUPTED"
-                    rec.updated_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+                    rec.updated_at = utc_now()
                     recovered += 1
             if recovered:
                 self._save()
@@ -209,7 +132,8 @@ class TaskStore:
             for key, value in kwargs.items():
                 if hasattr(rec, key) and key not in ("job_id", "created_at"):
                     setattr(rec, key, value)
-            rec.updated_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+            rec.updated_at = utc_now()
+            rec.version += 1
             self._save()
             return rec
 
@@ -220,7 +144,8 @@ class TaskStore:
             if rec is None:
                 return None
             rec.artifacts.append(artifact)
-            rec.updated_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+            rec.updated_at = utc_now()
+            rec.version += 1
             self._save()
             return rec
 
@@ -232,3 +157,7 @@ class TaskStore:
                 self._save()
                 return True
             return False
+
+
+# Explicit name for callers that select the legacy backend.
+JsonTaskRepository = TaskStore
