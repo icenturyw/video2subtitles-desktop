@@ -40,18 +40,12 @@ from engine.pipeline import start_pipeline
 from engine.progress import ProgressTracker
 from engine.json_migration import migrate_tasks_json
 from engine.repository import TaskQuery, TaskRepository
+from engine.retry import RetryPlanner, RetryPlanningError
 from engine.sqlite_repository import SQLiteTaskRepository
+from engine.stages import STAGE_NAMES
 from engine.workspace import get_log_path, read_log_tail, resolve_workspace
 
-RETRY_STAGES = {
-    "prepare",
-    "normalize",
-    "translate",
-    "subtitle_export",
-    "tts",
-    "audio_mix",
-    "render",
-}
+RETRY_STAGES = set(STAGE_NAMES) | {"failed", "all"}
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -376,8 +370,7 @@ def cancel_job(job_id: str):
     return {"status": "cancelling", "message": "取消请求已发送"}
 
 
-@app.post("/jobs/{job_id}/retry")
-def retry_job(job_id: str, req: RetryRequest):
+def _legacy_retry_job(job_id: str, req: RetryRequest):
     """Retry a failed or interrupted job from a specific stage."""
     rec = _store().get(job_id)
     if rec is None:
@@ -430,6 +423,67 @@ def retry_job(job_id: str, req: RetryRequest):
     )
 
     return {"status": "retrying", "from_stage": req.from_stage}
+
+
+@app.post("/jobs/{job_id}/retry")
+def retry_job(job_id: str, req: RetryRequest):
+    """Plan and launch a concurrency-safe stage rerun."""
+    if not isinstance(_store(), SQLiteTaskRepository):
+        return _legacy_retry_job(job_id, req)
+    rec = _store().get(job_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    if req.from_stage not in RETRY_STAGES:
+        raise HTTPException(status_code=400, detail=f"Unsupported retry stage: {req.from_stage}")
+
+    planner = RetryPlanner(_store())
+    try:
+        if req.from_stage == "failed":
+            plan = planner.retry_latest_failed(job_id)
+        elif req.from_stage == "all":
+            plan = planner.rerun_all(job_id)
+        else:
+            plan = planner.plan_from(job_id, req.from_stage)
+    except RetryPlanningError as exc:
+        status_code = 409 if exc.error_code == "TASK_ALREADY_RUNNING" else 400
+        raise HTTPException(
+            status_code=status_code,
+            detail={"error_code": exc.error_code, "message": str(exc)},
+        ) from exc
+
+    _progress().reset(job_id)
+    cancel_token = _cancellation().get(job_id)
+    if cancel_token:
+        cancel_token.reset()
+    else:
+        cancel_token = _cancellation().register(job_id)
+    try:
+        start_pipeline(
+            job_id=job_id,
+            request=plan.request_payload,
+            task_store=_store(),
+            progress=_progress(),
+            cancel_token=cancel_token,
+        )
+    except Exception:
+        _store().release_run_lease(job_id, plan.lease_token)
+        raise
+    return {
+        "status": "retrying",
+        "requested_stage": plan.requested_stage,
+        "from_stage": plan.start_stage,
+        "invalidated_artifacts": plan.invalidated_artifacts,
+    }
+
+
+@app.post("/jobs/{job_id}/retry-failed")
+def retry_failed_stage(job_id: str):
+    return retry_job(job_id, RetryRequest(from_stage="failed"))
+
+
+@app.post("/jobs/{job_id}/rerun")
+def rerun_job(job_id: str):
+    return retry_job(job_id, RetryRequest(from_stage="all"))
 
 
 @app.get("/jobs/{job_id}/logs", response_model=LogResponse)

@@ -302,6 +302,12 @@ class SQLiteTaskRepository(TaskRepository):
             if cursor.rowcount != 1:
                 raise ConcurrentUpdateError(f"Task {job_id} version changed from {version}")
             self._track_stage_transition(conn, current, updates)
+            effective_status = str(updates.get("status", current["status"]))
+            if effective_status in {"completed", "error", "failed", "cancelled", "interrupted", "paused"}:
+                conn.execute(
+                    "UPDATE tasks SET run_lock_token = NULL, run_lock_at = NULL WHERE job_id = ?",
+                    (job_id,),
+                )
             row = conn.execute("SELECT * FROM tasks WHERE job_id = ?", (job_id,)).fetchone()
             return self._row_to_record(row, self._artifact_rows(conn, job_id))
 
@@ -616,6 +622,48 @@ class SQLiteTaskRepository(TaskRepository):
                 }
                 for row in rows
             ]
+
+    def last_completed_stage_run(self, job_id: str, stage: str) -> Optional[Dict[str, Any]]:
+        runs = [
+            run for run in self.list_stage_runs(job_id)
+            if run["stage"] == stage and run["status"] == "completed"
+        ]
+        return runs[-1] if runs else None
+
+    def stage_config_fingerprint(self, stage: str, request_payload: Dict[str, Any]) -> str:
+        if stage not in STAGE_BY_NAME:
+            raise ValueError(f"Unknown pipeline stage: {stage}")
+        keys = STAGE_BY_NAME[stage].config_keys
+        config = {key: request_payload.get(key) for key in keys}
+        return hashlib.sha256(self._json_dump(config).encode("utf-8")).hexdigest()
+
+    def acquire_run_lease(self, job_id: str, token: str) -> bool:
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                """UPDATE tasks SET run_lock_token = ?, run_lock_at = ?,
+                   updated_at = ?, version = version + 1
+                   WHERE job_id = ? AND run_lock_token IS NULL
+                   AND status NOT IN ('running', 'pending')""",
+                (token, utc_now(), utc_now(), job_id),
+            )
+            return cursor.rowcount == 1
+
+    def release_run_lease(self, job_id: str, token: str) -> bool:
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                """UPDATE tasks SET run_lock_token = NULL, run_lock_at = NULL,
+                   updated_at = ?, version = version + 1
+                   WHERE job_id = ? AND run_lock_token = ?""",
+                (utc_now(), job_id, token),
+            )
+            return cursor.rowcount == 1
+
+    def run_lease(self, job_id: str) -> Optional[str]:
+        with self.transaction(immediate=False) as conn:
+            row = conn.execute(
+                "SELECT run_lock_token FROM tasks WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            return str(row["run_lock_token"]) if row and row["run_lock_token"] else None
 
     def pragma_settings(self) -> Dict[str, Any]:
         """Expose effective settings for diagnostics and tests."""
