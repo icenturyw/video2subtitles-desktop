@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import os
 import json
+import re
 import shutil
 import threading
 import time
@@ -26,9 +27,12 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from engine.cancellation import CancellationToken
+from engine.errors import PipelineError
 from engine.progress import ProgressTracker
-from engine.task_store import TaskStore
+from engine.repository import TaskRepository
+from engine.runtime import ModelResourceError, ModelResourceManager, qwen3_tts_definition
 from engine.workspace import (
+    WorkspaceManager,
     ensure_log_dir,
     get_source_subtitle,
     get_source_video,
@@ -70,6 +74,8 @@ try:
     from subtitle_ass import segments_to_ass, save_ass
     from services.ffmpeg_service import find_ffmpeg, render_hardsub, render_softsub
     from subtitles.normalize import read_subtitle_file
+    from subtitles.document import SubtitleDocument
+    from subtitles.document_service import document_to_segments
     from subtitles.srt_writer import write_srt, write_vtt, write_txt
     from subtitles.validate import validate_timeline, validate_translation
     from subtitle_utils import (
@@ -87,6 +93,7 @@ try:
     from translation.quality import (
         has_blocking_issues, punctuation_only, validate_translation_items,
     )
+    from translation.validator import TranslationValidator
 except ImportError as e:
     logger.warning("Pipeline import error (some features may be unavailable): %s", e)
 
@@ -98,28 +105,59 @@ _STAGE_ORDER = [
 
 
 class PipelineRunner:
-    def __init__(self, task_store: TaskStore, progress: ProgressTracker):
+    def __init__(
+        self,
+        task_store: TaskRepository,
+        progress: ProgressTracker,
+        model_resources: ModelResourceManager | None = None,
+        run_lease_token: str = "",
+    ):
         self._store = task_store
         self._progress = progress
+        self._model_resources = model_resources
+        self._run_lease_token = run_lease_token
 
     def run_job(self, job_id: str, request: Dict[str, Any],
                 cancel_token: CancellationToken) -> None:
         try:
             self._execute(job_id, request, cancel_token)
+        except PipelineError as exc:
+            logger.exception("Pipeline failed for job %s", job_id)
+            self._save_pipeline_error(job_id, exc)
         except Exception as exc:
             logger.exception("Pipeline failed for job %s", job_id)
-            self._store.update(
-                job_id, status="error", stage="error",
-                message=f"Pipeline error: {exc}",
-                error_code="PIPELINE_ERROR", error_detail=str(exc),
+            rec = self._store.get(job_id)
+            stage = rec.stage if rec and rec.stage not in {"error", "cancelled"} else "prepare"
+            self._save_pipeline_error(
+                job_id,
+                PipelineError(str(exc), stage=stage, cause=exc),
             )
-            self._progress.update(job_id, "error", 0, str(exc))
+        finally:
+            if self._run_lease_token:
+                release = getattr(self._store, "release_run_lease", None)
+                if release:
+                    release(job_id, self._run_lease_token)
+
+    def _save_pipeline_error(self, job_id: str, exc: PipelineError) -> None:
+        self._store.update(
+            job_id,
+            status="error",
+            stage=exc.stage,
+            message=exc.message,
+            error_code=exc.error_code,
+            error_detail=exc.message,
+        )
+        self._progress.update(job_id, exc.stage, 0, exc.message)
+        self._add_event(job_id, "task_failed", exc.message, {
+            "stage": exc.stage, "error_code": exc.error_code,
+        })
 
     def _execute(self, job_id: str, request: Dict[str, Any],
                  cancel_token: CancellationToken) -> None:
         ws = self._resolve_ws(request)
         write_log(ws, f"Pipeline started for job {job_id}")
         self._store.update(job_id, status="running", stage="prepare")
+        self._add_event(job_id, "task_started", "Pipeline task started", {})
 
         source_lang = request.get("source_language", "auto")
         target_lang = request.get("target_language", "")
@@ -200,6 +238,14 @@ class PipelineRunner:
 
         self._progress.update(job_id, "normalize", 100, f"Loaded {len(segments)} subtitle segments")
 
+        # A formal editor revision becomes the source of truth for downstream
+        # retries. Original transcription/translation inputs remain untouched.
+        if resume_index >= _STAGE_ORDER.index("tts"):
+            edited_segments = self._load_current_subtitle(request)
+            if edited_segments is not None:
+                segments = edited_segments
+                write_log(ws, f"  Loaded current subtitle revision: {len(segments)} cues")
+
         if low_vram_mode and dubbing and should_run("translate") and self._is_qwen3_tts_request(request):
             self._unload_qwen3_tts(ws, "before translation")
 
@@ -268,10 +314,30 @@ class PipelineRunner:
             self._progress.update(job_id, "tts", 0, "TTS synthesis starting...")
             write_log(ws, "Stage: tts")
 
+            model_lease = None
+            if self._model_resources and self._is_qwen3_tts_request(request):
+                options = dict(request.get("tts_options") or {})
+                definition = qwen3_tts_definition(options, immediate=low_vram_mode)
+                try:
+                    self._add_event(job_id, "MODEL_LOADING", "Loading local TTS model", {
+                        "model_id": definition.model_id,
+                    })
+                    model_lease = self._model_resources.acquire(definition)
+                    self._add_event(job_id, "MODEL_LOADED", "Local TTS model is ready", {
+                        "model_id": definition.model_id,
+                    })
+                except ModelResourceError as exc:
+                    self._fail(job_id, ws, exc.error_code, str(exc))
+                    return
             try:
                 tts_success = self._run_tts(job_id, ws, segments, request, target_lang, cancel_token)
             finally:
-                if low_vram_mode and self._is_qwen3_tts_request(request):
+                if model_lease is not None:
+                    model_lease.release()
+                    self._add_event(job_id, "MODEL_RELEASED", "Released local TTS model lease", {
+                        "model_id": model_lease.model_id,
+                    })
+                elif low_vram_mode and self._is_qwen3_tts_request(request):
                     self._unload_qwen3_tts(ws, "after TTS")
             if not tts_success:
                 return
@@ -380,6 +446,7 @@ class PipelineRunner:
             job_id, status="completed", stage="completed",
             progress=100, message="处理完成",
         )
+        self._add_event(job_id, "task_completed", "Pipeline task completed", {})
         write_log(ws, "Pipeline completed successfully")
 
     # -----------------------------------------------------------------------
@@ -388,7 +455,12 @@ class PipelineRunner:
 
     def _resolve_ws(self, request: Dict[str, Any]) -> Path:
         ws_dir = request.get("workspace_dir", "")
-        return resolve_workspace(ws_dir)
+        manager = WorkspaceManager(
+            ws_dir,
+            allowed_root=request.get("workspace_root") or None,
+        )
+        manager.ensure()
+        return manager.root
 
     def _check_cancel(self, job_id: str, ws: Path,
                       cancel_token: CancellationToken) -> bool:
@@ -426,6 +498,29 @@ class PipelineRunner:
             return candidates[0]
 
         return None
+
+    @staticmethod
+    def _load_current_subtitle(request: Dict[str, Any]) -> Optional[List[Any]]:
+        raw_path = str(request.get("current_subtitle_path") or "").strip()
+        if not raw_path:
+            return None
+        path = Path(raw_path).expanduser().resolve()
+        if not path.is_file():
+            raise PipelineError(
+                "Current subtitle revision artifact is missing",
+                error_code="SUBTITLE_ARTIFACT_MISSING",
+                stage="tts",
+            )
+        try:
+            document = SubtitleDocument.from_dict(json.loads(path.read_text(encoding="utf-8")))
+            return document_to_segments(document)
+        except Exception as exc:
+            raise PipelineError(
+                "Current subtitle revision artifact is invalid",
+                error_code="SUBTITLE_ARTIFACT_INVALID",
+                stage="tts",
+                cause=exc,
+            ) from exc
 
     @staticmethod
     def _is_qwen3_tts_request(request: Dict[str, Any]) -> bool:
@@ -504,6 +599,9 @@ class PipelineRunner:
 
         # Batch
         checkpoints = CheckpointManager(ws / "translation" / "checkpoints" if (ws / "translation").exists() else ws / "translation")
+        restored_count = checkpoints.restore_translations(segments)
+        if restored_count:
+            write_log(ws, f"  Translation checkpoint restored {restored_count} translated segments")
         pending = checkpoints.get_pending_segments(segments)
         if not pending and any(not (seg.translation or "").strip() for seg in segments):
             write_log(ws, "  Translation checkpoint ignored: translated text is missing")
@@ -516,6 +614,13 @@ class PipelineRunner:
 
         max_batch_items = max(1, int(getattr(trans_config, "max_batch_items", 10) or 10))
         max_batch_chars = trans_config.max_batch_chars
+        batch_mode = str(getattr(trans_config, "batch_mode", "auto") or "auto").strip().lower()
+        if batch_mode == "single_segment":
+            max_batch_items = 1
+            max_batch_chars = min(max_batch_chars, 2000)
+            write_log(ws, "  Translation batch mode: single_segment (safest, slower)")
+        elif batch_mode in {"auto", "strict_json_batch"}:
+            write_log(ws, f"  Translation batch mode: {batch_mode} (strict id-mapped JSON)")
 
         # CJK target languages produce longer output per segment; smaller
         # batches reduce the straggler problem in concurrent execution.
@@ -540,11 +645,29 @@ class PipelineRunner:
         total = len(batches)
         completed_batches = 0
         concurrency = max(1, int(getattr(trans_config, "concurrency", 1) or 1))
+        if batch_mode == "single_segment":
+            concurrency = min(concurrency, 4)
         concurrency = min(concurrency, total)
 
         # Create a single provider shared across all batches to avoid
         # per-batch TCP+TLS handshake overhead (httpx.Client is thread-safe).
         shared_provider = get_provider(provider_name)
+        translation_lease = None
+        definition_factory = getattr(shared_provider, "model_definition", None)
+        if callable(definition_factory) and self._model_resources is not None:
+            try:
+                definition = definition_factory(trans_config)
+                translation_lease = self._model_resources.acquire(definition)
+                self._add_event(job_id, "MODEL_LOADED", "Local translation model is ready", {
+                    "model_id": definition.model_id,
+                })
+            except ModelResourceError as exc:
+                close = getattr(shared_provider, "close", None)
+                if callable(close):
+                    close()
+                self._fail(job_id, ws, exc.error_code, str(exc))
+                return False
+        completeness_validator = TranslationValidator()
 
         def request_translation(batch: List[SubtitleSegment]) -> List[Dict]:
             if cancel_token.is_cancelled():
@@ -579,9 +702,32 @@ class PipelineRunner:
                     + complete_translations(batch_index, batch[mid:], depth + 1)
                 )
 
+            raw_validation = completeness_validator.validate(
+                batch_to_request(batch), translations, target_lang,
+            )
+            if (
+                raw_validation.issue_codes & TranslationValidator.STRUCTURAL_CODES
+                and depth < 3
+                and len(batch) > 1
+            ):
+                mid = max(1, len(batch) // 2)
+                write_log(
+                    ws,
+                    f"  Batch {batch_index}: completeness validation failed "
+                    f"({', '.join(sorted(raw_validation.issue_codes))}); splitting {len(batch)} segments",
+                )
+                return (
+                    complete_translations(batch_index, batch[:mid], depth + 1)
+                    + complete_translations(batch_index, batch[mid:], depth + 1)
+                )
+
             batch_ids = {s.index for s in batch}
+            source_by_id = {seg.index: seg.text for seg in batch}
             valid_by_id = {
-                int(t["id"]): self._clean_translation_text(str(t.get("text", "")))
+                int(t["id"]): self._clean_translation_text(
+                    str(t.get("text", "")),
+                    source_text=source_by_id.get(int(t.get("id")), ""),
+                )
                 for t in translations
                 if isinstance(t, dict)
                 and str(t.get("id", "")).isdigit()
@@ -608,7 +754,9 @@ class PipelineRunner:
                     for item in complete_translations(batch_index, missing, depth + 1):
                         if str(item.get("text", "")).strip():
                             item_id = int(item["id"])
-                            valid_by_id[item_id] = self._clean_translation_text(str(item["text"]))
+                            valid_by_id[item_id] = self._clean_translation_text(
+                                str(item["text"]), source_text=source_by_id.get(item_id, "")
+                            )
                             if item.get("_fallback_source") or item.get("_quality_failed"):
                                 fallback_ids.add(item_id)
 
@@ -620,7 +768,6 @@ class PipelineRunner:
                     item["_fallback_source"] = True
                 result.append(item)
 
-            source_by_id = {seg.index: seg.text for seg in batch}
             issues_by_id = validate_translation_items(result, source_by_id, target_lang)
             bad_ids = {
                 item_id
@@ -636,7 +783,9 @@ class PipelineRunner:
                 )
                 for item in complete_translations(batch_index, bad_batch, depth + 1):
                     item_id = int(item["id"])
-                    valid_by_id[item_id] = self._clean_translation_text(str(item.get("text", "")))
+                    valid_by_id[item_id] = self._clean_translation_text(
+                        str(item.get("text", "")), source_text=source_by_id.get(item_id, "")
+                    )
                     if item.get("_fallback_source") or item.get("_quality_failed"):
                         fallback_ids.add(item_id)
                     else:
@@ -660,12 +809,41 @@ class PipelineRunner:
                     item_id = int(item["id"])
                     if item_id in bad_ids:
                         joined = "; ".join(issue.code for issue in issues_by_id.get(item_id, []))
+                        if item.get("_fallback_source"):
+                            # Source fallback is a hard incomplete-translation
+                            # failure for real speech in dubbing mode.  Do not
+                            # reclassify it as a quality skip, otherwise dirty
+                            # source text could bypass TRANSLATION_INCOMPLETE.
+                            write_log(
+                                ws,
+                                f"  Batch {batch_index}: segment {item_id} source fallback also failed target-language check: {joined}",
+                            )
+                            continue
                         item["_quality_failed"] = joined or "TARGET_LANGUAGE_QUALITY_FAILED"
                         item["_fallback_source"] = True
                         write_log(
                             ws,
                             f"  Batch {batch_index}: segment {item_id} failed target-language check: {item['_quality_failed']}",
                         )
+
+            final_validation = completeness_validator.validate(
+                batch_to_request(batch), result, target_lang,
+            )
+            source_residual_ids = {
+                issue.segment_id
+                for issue in final_validation.issues
+                if issue.code in {"SOURCE_TEXT_REMAINS", "EMPTY_TRANSLATION"}
+                and issue.segment_id is not None
+            }
+            if source_residual_ids:
+                for item in result:
+                    if int(item["id"]) in source_residual_ids:
+                        item["_fallback_source"] = True
+                write_log(
+                    ws,
+                    f"  Batch {batch_index}: completeness validator found source/empty residual IDs "
+                    f"{sorted(source_residual_ids)}",
+                )
 
             return result
 
@@ -705,14 +883,19 @@ class PipelineRunner:
                                 self._fail(job_id, ws, "TRANSLATION_ERROR", str(e)[:200])
                             return False
 
-                        if self._has_source_fallback_translations(batch, translations, request):
+                        incomplete_issues = self._source_fallback_translation_issues(batch, translations, request)
+                        if incomplete_issues:
+                            self._write_translation_error_report(ws, batch, translations, incomplete_issues)
                             self._fail(job_id, ws, "TRANSLATION_INCOMPLETE",
-                                       "翻译结果不完整或目标语言校验失败，已停止配音以避免把源语言/脏字幕送入 TTS")
+                                       self._translation_incomplete_message(incomplete_issues))
                             for pending_future in futures:
                                 pending_future.cancel()
                             return False
                         self._apply_translation_result(batch, translations)
-                        checkpoints.mark_completed([s.index for s in batch])
+                        checkpoints.mark_completed(
+                            [s.index for s in batch],
+                            {s.index: s.translation for s in batch if (s.translation or "").strip()},
+                        )
                         write_log(ws, f"  Batch {batch_index}/{total} translated ({len(batch)} segments)")
                         completed_batches += 1
                         self._progress.update(
@@ -743,12 +926,17 @@ class PipelineRunner:
                         self._fail(job_id, ws, "TRANSLATION_ERROR", str(e)[:200])
                     return False
 
-                if self._has_source_fallback_translations(batch, translations, request):
+                incomplete_issues = self._source_fallback_translation_issues(batch, translations, request)
+                if incomplete_issues:
+                    self._write_translation_error_report(ws, batch, translations, incomplete_issues)
                     self._fail(job_id, ws, "TRANSLATION_INCOMPLETE",
-                               "翻译结果不完整或目标语言校验失败，已停止配音以避免把源语言/脏字幕送入 TTS")
+                               self._translation_incomplete_message(incomplete_issues))
                     return False
                 self._apply_translation_result(batch, translations)
-                checkpoints.mark_completed([s.index for s in batch])
+                checkpoints.mark_completed(
+                    [s.index for s in batch],
+                    {s.index: s.translation for s in batch if (s.translation or "").strip()},
+                )
                 write_log(ws, f"  Batch {batch_index}/{total} translated ({len(batch)} segments)")
                 completed_batches += 1
                 self._progress.update(
@@ -759,45 +947,160 @@ class PipelineRunner:
             checkpoints.flush()
             return True
         finally:
+            if translation_lease is not None:
+                translation_lease.release()
             close = getattr(shared_provider, "close", None)
             if callable(close):
                 close()
 
     @staticmethod
-    def _has_source_fallback_translations(batch: List[SubtitleSegment],
-                                          translations: List[Dict],
-                                          request: Dict[str, Any]) -> bool:
-        if not bool(request.get("dubbing_enabled", False)):
-            return False
-        fallback_ids = {
-            int(t["id"])
-            for t in translations
-            if isinstance(t, dict)
-            and str(t.get("id", "")).isdigit()
-            and (t.get("_fallback_source") or t.get("_quality_failed"))
-        }
-        if fallback_ids:
+    def _is_nonblocking_fallback_segment(seg: SubtitleSegment) -> bool:
+        """Return True for fragments that should not abort dubbing.
+
+        YouTube auto captions can contain isolated letters, digits, punctuation,
+        or broken word tails.  If such a fragment fails translation, it is safer
+        to skip TTS for that fragment than to abort the whole job.
+        """
+        text = str(seg.text or "").strip()
+        if not text:
             return True
-        trans_map = {
-            int(t["id"]): str(t.get("text", "")).strip()
+        if punctuation_only(text):
+            return True
+        if not is_speech_subtitle_text(text):
+            return True
+        return False
+
+    def _source_fallback_translation_issues(self,
+                                            batch: List[SubtitleSegment],
+                                            translations: List[Dict],
+                                            request: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Return blocking incomplete-translation issues for dubbing mode.
+
+        Quality-failed items are intentionally non-blocking because
+        _apply_translation_result clears them and marks the segment as skipped
+        for TTS.  Source fallbacks on real speech remain blocking to prevent
+        English/Japanese/etc. text from being sent to the target-language TTS.
+        """
+        if not bool(request.get("dubbing_enabled", False)):
+            return []
+
+        by_id = {
+            int(t["id"]): t
             for t in translations
             if isinstance(t, dict) and str(t.get("id", "")).isdigit()
         }
+        issues: List[Dict[str, Any]] = []
         for seg in batch:
-            translated = trans_map.get(seg.index, "")
-            if not translated:
-                return True
-        return False
+            item = by_id.get(seg.index)
+            if item and item.get("_quality_failed"):
+                continue
+
+            text = str(item.get("text", "") if item else "").strip()
+            fallback = bool(item and item.get("_fallback_source"))
+            missing = item is None or not text
+            if not fallback and not missing:
+                continue
+
+            if self._is_nonblocking_fallback_segment(seg):
+                # Let _apply_translation_result clear/skip it instead of
+                # aborting the whole dubbing job.
+                if item is not None:
+                    item["_quality_failed"] = item.get("_quality_failed") or "NON_SPEECH_OR_FRAGMENT_TRANSLATION_SKIPPED"
+                    item["_fallback_source"] = True
+                continue
+
+            reason = "fallback_source" if fallback else "missing_or_empty"
+            issues.append({
+                "id": seg.index,
+                "reason": reason,
+                "start": seg.start,
+                "end": seg.end,
+                "source_text": seg.text or "",
+                "translation_text": text,
+            })
+        return issues
+
+    def _has_source_fallback_translations(self,
+                                          batch: List[SubtitleSegment],
+                                          translations: List[Dict],
+                                          request: Dict[str, Any]) -> bool:
+        """Backward-compatible boolean wrapper for existing tests/callers."""
+        return bool(self._source_fallback_translation_issues(batch, translations, request))
+
+    @staticmethod
+    def _translation_incomplete_message(issues: List[Dict[str, Any]]) -> str:
+        ids = [str(item.get("id")) for item in issues[:12]]
+        suffix = "..." if len(issues) > 12 else ""
+        return (
+            f"翻译结果不完整：{len(issues)} 条有效语音字幕缺少目标语言翻译或回退为源文本"
+            f"（ID: {', '.join(ids)}{suffix}）。已停止配音以避免把源语言/脏字幕送入 TTS；"
+            "详情见 translation/translation_error_report.json"
+        )
+
+    def _write_translation_error_report(self,
+                                        ws: Path,
+                                        batch: List[SubtitleSegment],
+                                        translations: List[Dict],
+                                        issues: List[Dict[str, Any]]) -> Optional[Dict]:
+        report_path = ws / "translation" / "translation_error_report.json"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        by_id = {
+            int(t["id"]): t
+            for t in translations
+            if isinstance(t, dict) and str(t.get("id", "")).isdigit()
+        }
+        payload = {
+            "error": "TRANSLATION_INCOMPLETE",
+            "issue_count": len(issues),
+            "issues": issues,
+            "batch_segments": [
+                {
+                    "id": seg.index,
+                    "start": seg.start,
+                    "end": seg.end,
+                    "source_text": seg.text or "",
+                    "translation_text": str(by_id.get(seg.index, {}).get("text", "") or ""),
+                    "fallback_source": bool(by_id.get(seg.index, {}).get("_fallback_source")),
+                    "quality_failed": str(by_id.get(seg.index, {}).get("_quality_failed", "") or ""),
+                }
+                for seg in batch
+            ],
+        }
+        report_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        write_log(
+            ws,
+            "  Translation incomplete report written: "
+            f"translation/translation_error_report.json ({len(issues)} issues)",
+        )
+        return {"kind": "translation_error_report", "path": "translation/translation_error_report.json"}
 
     def _apply_translation_result(self, batch: List[SubtitleSegment],
                                   translations: List[Dict]) -> None:
-        trans_map = {t["id"]: t["text"] for t in translations}
+        trans_map = {t["id"]: t for t in translations if isinstance(t, dict)}
         for seg in batch:
-            if seg.index in trans_map:
-                seg.translation = self._clean_translation_text(trans_map[seg.index])
+            item = trans_map.get(seg.index)
+            if not item:
+                continue
+            if item.get("_quality_failed"):
+                # The provider returned a translation that failed target-language
+                # quality gates (e.g. Japanese kana leaked into a Chinese target).
+                # Rather than aborting the entire dubbing run for one bad segment
+                # we drop the translation and mark the segment so the TTS step
+                # silently preserves the original audio for this subtitle, while
+                # the burned/exported subtitles simply show the source line.
+                seg.translation = ""
+                seg.metadata["translation_skipped"] = True
+                seg.metadata["tts_skip_quality_failed"] = str(
+                    item.get("_quality_failed")
+                )
+                continue
+            seg.translation = self._clean_translation_text(item.get("text", ""), source_text=seg.text)
 
     @staticmethod
-    def _clean_translation_text(text: str) -> str:
+    def _clean_translation_text(text: str, source_text: str = "") -> str:
         cleaned = str(text or "").strip()
         replacements = {
             "\u0104\u0141": "?",
@@ -806,6 +1109,42 @@ class PipelineRunner:
         }
         for old, new in replacements.items():
             cleaned = cleaned.replace(old, new)
+
+        cleaned = re.sub(
+            r"^(?:translation|translated text|译文|中文|翻译)\s*[:：]\s*",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        ).strip()
+
+        # Last-resort guard: never allow a leaked JSON translation object to be
+        # rendered literally in SRT/ASS or sent to TTS.  The main parser should
+        # catch object-per-line output earlier; this protects old checkpoints
+        # and provider-specific edge cases.
+        if cleaned.startswith("{") and ('"text"' in cleaned or '"translation"' in cleaned):
+            candidate = cleaned.rstrip(",").strip()
+            try:
+                payload = json.loads(candidate)
+            except Exception:
+                payload = None
+            if isinstance(payload, dict):
+                for key in ("text", "translation", "translated_text", "target_text", "target", "content"):
+                    value = payload.get(key)
+                    if value is not None:
+                        cleaned = str(value).strip()
+                        break
+
+        # Some models answer compact batches as: source<TAB>translation.  When
+        # the left column matches the current source segment, keep only the last
+        # translated column so dirty bilingual pairs never reach subtitles/TTS.
+        if "\t" in cleaned and source_text:
+            parts = [part.strip() for part in cleaned.split("\t") if part.strip()]
+            if len(parts) >= 2:
+                left = re.sub(r"[^a-z0-9]+", "", parts[0].lower())
+                source = re.sub(r"[^a-z0-9]+", "", str(source_text or "").lower())
+                if source and len(source) >= 4 and (left == source or left in source or source in left):
+                    cleaned = parts[-1].strip()
+
         return cleaned
 
     def _load_existing_translations(self, ws: Path,
@@ -1055,6 +1394,18 @@ class PipelineRunner:
         )
         missing_tts_translations: List[int] = []
         for seg in segments:
+            if seg.metadata.get("tts_skip_quality_failed"):
+                # Translation failed the target-language quality gate. Skip TTS
+                # for this segment so the original audio is preserved for the
+                # bad line; the rest of the run continues normally.
+                skipped_tts_inputs.append({
+                    "index": seg.index,
+                    "start": seg.start,
+                    "end": seg.end,
+                    "text": seg.text or "",
+                    "reason": "translation_quality_failed",
+                })
+                continue
             if seg.translation:
                 raw_text = seg.translation
             elif translation_required_for_tts and is_speech_subtitle_text(seg.text):
@@ -1124,6 +1475,18 @@ class PipelineRunner:
             prompt_id = self._ensure_qwen3_clone_prompt(provider, options, ws)
             if prompt_id:
                 options["voice_clone_prompt_id"] = prompt_id
+        try:
+            from tts.registry import provider_registry
+            capabilities = provider_registry.capabilities(tts_provider_name)
+            allowed_provider_options = set(capabilities.supported_parameters) | {"timeout"}
+            provider_options = {
+                key: value for key, value in options.items()
+                if key in allowed_provider_options
+            }
+        except Exception:
+            # Only registered production providers have declarations. Tests
+            # and third-party injected providers retain their legacy contract.
+            provider_options = dict(options)
 
         report_rows: List[Dict[str, Any]] = []
         tts_errors: List[Dict[str, Any]] = []
@@ -1423,7 +1786,7 @@ class PipelineRunner:
                                  target_dur: float) -> Dict[str, Any]:
             try:
                 result = provider.synthesize(
-                    text.strip(), target_lang, tts_voice, temp_path, options,
+                    text.strip(), target_lang, tts_voice, temp_path, provider_options,
                 )
                 if cancel_token.is_cancelled():
                     seg_path.unlink(missing_ok=True)
@@ -1566,11 +1929,21 @@ class PipelineRunner:
             boundaries = detect_silence_boundaries(chunk_path)
             target_boundary_count = len(csegs) - 1
 
-            if len(boundaries) >= target_boundary_count and target_boundary_count >= 1:
+            # Tail/lead silence is not a real segment boundary. A silence near
+            # chunk_dur or 0 collapses the last/first subtitle window to a
+            # sliver of quiet audio (see seg_0008 of e2e_10DVBSKv-34). Filter
+            # those out before counting against target_boundary_count.
+            edge_pad = max(0.20, chunk_dur * 0.05)
+            inner_boundaries = [
+                b for b in boundaries
+                if edge_pad < b < chunk_dur - edge_pad
+            ]
+
+            if len(inner_boundaries) >= target_boundary_count and target_boundary_count >= 1:
                 # Prefer real silence boundaries closest to the text-proportional
                 # expected split points.  This is safer than taking evenly spaced
                 # silences when the TTS model inserts extra pauses inside a line.
-                if len(boundaries) > target_boundary_count:
+                if len(inner_boundaries) > target_boundary_count:
                     text_units = [
                         max(1, len((seg.translation or seg.text or "").strip()))
                         for seg in csegs
@@ -1583,7 +1956,7 @@ class PipelineRunner:
                         expected_points.append(chunk_dur * (cursor_units / total_units))
 
                     picked = []
-                    remaining = list(boundaries)
+                    remaining = list(inner_boundaries)
                     lower_bound = 0.0
                     for expected in expected_points:
                         viable = [point for point in remaining if point > lower_bound + 0.03]
@@ -1595,11 +1968,11 @@ class PipelineRunner:
                         remaining = [point for point in remaining if point > chosen + 0.001]
 
                     if len(picked) != target_boundary_count:
-                        step = len(boundaries) / (target_boundary_count + 1)
-                        picked = [boundaries[int((i + 1) * step)]
+                        step = len(inner_boundaries) / (target_boundary_count + 1)
+                        picked = [inner_boundaries[int((i + 1) * step)]
                                   for i in range(target_boundary_count)]
                 else:
-                    picked = boundaries.copy()
+                    picked = inner_boundaries.copy()
 
                 split_points = [0.0] + picked + [chunk_dur]
                 windows: Dict[int, Tuple[float, float]] = {}
@@ -1688,7 +2061,7 @@ class PipelineRunner:
 
             try:
                 result = provider.synthesize(
-                    chunk.text.strip(), target_lang, tts_voice, chunk_temp, options,
+                    chunk.text.strip(), target_lang, tts_voice, chunk_temp, provider_options,
                 )
                 if cancel_token.is_cancelled():
                     chunk_path.unlink(missing_ok=True)
@@ -2079,7 +2452,7 @@ class PipelineRunner:
         cleaned_count = 0
 
         for seg in sorted(segments, key=lambda item: (float(item.start), int(item.index))):
-            cleaned = self._clean_translation_text(seg.translation)
+            cleaned = self._clean_translation_text(seg.translation, source_text=seg.text)
             if cleaned != (seg.translation or ""):
                 cleaned_count += 1
             seg.translation = cleaned
@@ -2432,22 +2805,32 @@ class PipelineRunner:
         write_log(ws, "Pipeline cancelled")
 
     def _fail(self, job_id: str, ws: Path, code: str, message: str) -> None:
+        rec = self._store.get(job_id)
+        stage = rec.stage if rec and rec.stage not in {"error", "cancelled"} else "prepare"
         self._store.update(
-            job_id, status="error", stage="error",
+            job_id, status="error", stage=stage,
             message=message, error_code=code, error_detail=message,
         )
-        self._progress.update(job_id, "error", 0, message)
+        self._progress.update(job_id, stage, 0, message)
+        self._add_event(job_id, "task_failed", message, {"stage": stage, "error_code": code})
         write_log(ws, f"Pipeline failed: [{code}] {message}")
+
+    def _add_event(self, job_id: str, event_type: str, message: str, payload: dict) -> None:
+        add_event = getattr(self._store, "add_event", None)
+        if add_event:
+            add_event(job_id, event_type, message, payload)
 
 
 def start_pipeline(
     job_id: str,
     request: Dict[str, Any],
-    task_store: TaskStore,
+    task_store: TaskRepository,
     progress: ProgressTracker,
     cancel_token: CancellationToken,
+    model_resources: ModelResourceManager | None = None,
+    run_lease_token: str = "",
 ) -> threading.Thread:
-    runner = PipelineRunner(task_store, progress)
+    runner = PipelineRunner(task_store, progress, model_resources, run_lease_token)
     thread = threading.Thread(
         target=runner.run_job,
         args=(job_id, request, cancel_token),

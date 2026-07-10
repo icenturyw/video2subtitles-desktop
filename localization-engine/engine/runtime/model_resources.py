@@ -39,6 +39,7 @@ class ModelDefinition:
     policy: ModelResourcePolicy = ModelResourcePolicy.IDLE
     idle_timeout_seconds: float = 120.0
     load_timeout_seconds: float = 300.0
+    resource_group: str = ""
     metadata: dict = field(default_factory=dict)
 
 
@@ -100,8 +101,14 @@ class ModelResourceManager:
         with self._lock:
             existing = self._entries.get(model_id)
             if existing and not replace:
-                if existing.definition != definition:
-                    raise ValueError(f"Model already registered: {model_id}")
+                if (
+                    existing.definition.kind != definition.kind
+                    or existing.definition.resource_group != definition.resource_group
+                ):
+                    raise ValueError(f"Model already registered with incompatible definition: {model_id}")
+                # Adapters create fresh loader closures for each request. Keep
+                # the resident value/refcount but refresh policy and callbacks.
+                existing.definition = definition
                 return
             if existing and existing.ref_count:
                 raise ModelResourceError("Cannot replace a model with active leases")
@@ -127,10 +134,15 @@ class ModelResourceManager:
                 entry.error = ""
                 break
 
+        self._ensure_resource_group(definition)
         self._ensure_capacity(definition)
         self._emit("model_loading", definition.model_id, definition)
         try:
-            value = _call_with_timeout(definition.loader, max(0.01, deadline - time.monotonic()))
+            value = _call_with_timeout(
+                definition.loader,
+                max(0.01, deadline - time.monotonic()),
+                late_cleanup=definition.unloader,
+            )
         except Exception as exc:
             with entry.condition:
                 entry.state = ModelState.FAILED
@@ -269,6 +281,28 @@ class ModelResourceManager:
                 entry.condition.notify_all()
             raise ModelResourceError(entry.error)
 
+    def _ensure_resource_group(self, definition: ModelDefinition) -> None:
+        group = str(definition.resource_group or "")
+        if not group:
+            return
+        for model_id, entry in self._entry_items():
+            if model_id == definition.model_id or entry.definition.resource_group != group:
+                continue
+            with entry.condition:
+                state = entry.state
+                ref_count = entry.ref_count
+            if state == ModelState.LOADED and ref_count == 0:
+                self.unload(model_id)
+                continue
+            if state in {ModelState.LOADING, ModelState.LOADED, ModelState.UNLOADING}:
+                current = self._entries[definition.model_id]
+                message = f"Resource group {group} is in use by {model_id}"
+                with current.condition:
+                    current.state = ModelState.FAILED
+                    current.error = message
+                    current.condition.notify_all()
+                raise ModelResourceError(message)
+
     def _entry(self, model_id: str) -> _ModelEntry:
         with self._lock:
             try:
@@ -288,14 +322,27 @@ class ModelResourceManager:
             pass
 
 
-def _call_with_timeout(callback: Callable[[], Any], timeout: float) -> Any:
+def _call_with_timeout(
+    callback: Callable[[], Any],
+    timeout: float,
+    *,
+    late_cleanup: Callable[[Any], None] | None = None,
+) -> Any:
     result: list[Any] = []
     error: list[BaseException] = []
     completed = threading.Event()
+    timed_out = threading.Event()
 
     def run() -> None:
         try:
-            result.append(callback())
+            value = callback()
+            if timed_out.is_set() and late_cleanup is not None:
+                try:
+                    late_cleanup(value)
+                except Exception:
+                    pass
+            else:
+                result.append(value)
         except BaseException as exc:  # propagated in the caller thread
             error.append(exc)
         finally:
@@ -304,6 +351,7 @@ def _call_with_timeout(callback: Callable[[], Any], timeout: float) -> Any:
     thread = threading.Thread(target=run, name="model-loader", daemon=True)
     thread.start()
     if not completed.wait(max(0.01, timeout)):
+        timed_out.set()
         raise ModelResourceError("Model loading timed out")
     if error:
         raise error[0]

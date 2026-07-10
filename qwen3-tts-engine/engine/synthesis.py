@@ -45,20 +45,17 @@ class Synthesizer:
         if output_path is None:
             output_path = Path(tempfile.mktemp(suffix=".wav"))
 
-        model = self._manager.get_model()
-        if model is None:
-            raise RuntimeError("No model loaded")
-
         lang = normalize_language(language)
-        with self._synthesis_lock:
-            audios, sr = model.generate_custom_voice(
-                text=text,
-                speaker=speaker,
-                language=lang,
-                instruct=instruct,
-                non_streaming_mode=True,
-                **kwargs,
-            )
+        with self._manager.lease() as model:
+            with self._synthesis_lock:
+                audios, sr = model.generate_custom_voice(
+                    text=text,
+                    speaker=speaker,
+                    language=lang,
+                    instruct=instruct,
+                    non_streaming_mode=True,
+                    **kwargs,
+                )
         if not audios:
             raise RuntimeError("Synthesis returned empty audio")
 
@@ -79,22 +76,19 @@ class Synthesizer:
         if output_path is None:
             output_path = Path(tempfile.mktemp(suffix=".wav"))
 
-        model = self._manager.get_model()
-        if model is None:
-            raise RuntimeError("No model loaded")
-
         lang = normalize_language(language)
-        with self._synthesis_lock:
-            audios, sr = model.generate_voice_clone(
-                text=text,
-                language=lang,
-                ref_audio=ref_audio,
-                ref_text=ref_text,
-                x_vector_only_mode=x_vector_only_mode,
-                voice_clone_prompt=voice_clone_prompt,
-                non_streaming_mode=True,
-                **kwargs,
-            )
+        with self._manager.lease() as model:
+            with self._synthesis_lock:
+                audios, sr = model.generate_voice_clone(
+                    text=text,
+                    language=lang,
+                    ref_audio=ref_audio,
+                    ref_text=ref_text,
+                    x_vector_only_mode=x_vector_only_mode,
+                    voice_clone_prompt=voice_clone_prompt,
+                    non_streaming_mode=True,
+                    **kwargs,
+                )
         if not audios:
             raise RuntimeError("Voice clone returned empty audio")
 
@@ -112,19 +106,16 @@ class Synthesizer:
         if output_path is None:
             output_path = Path(tempfile.mktemp(suffix=".wav"))
 
-        model = self._manager.get_model()
-        if model is None:
-            raise RuntimeError("No model loaded")
-
         lang = normalize_language(language)
-        with self._synthesis_lock:
-            audios, sr = model.generate_voice_design(
-                text=text,
-                instruct=instruct,
-                language=lang,
-                non_streaming_mode=True,
-                **kwargs,
-            )
+        with self._manager.lease() as model:
+            with self._synthesis_lock:
+                audios, sr = model.generate_voice_design(
+                    text=text,
+                    instruct=instruct,
+                    language=lang,
+                    non_streaming_mode=True,
+                    **kwargs,
+                )
         if not audios:
             raise RuntimeError("Voice design returned empty audio")
 
@@ -137,15 +128,13 @@ class Synthesizer:
         ref_text: Optional[str] = None,
         x_vector_only_mode: bool = False,
     ) -> list:
-        model = self._manager.get_model()
-        if model is None:
-            raise RuntimeError("No model loaded")
-        with self._synthesis_lock:
-            return model.create_voice_clone_prompt(
-                ref_audio=ref_audio,
-                ref_text=ref_text,
-                x_vector_only_mode=x_vector_only_mode,
-            )
+        with self._manager.lease() as model:
+            with self._synthesis_lock:
+                return model.create_voice_clone_prompt(
+                    ref_audio=ref_audio,
+                    ref_text=ref_text,
+                    x_vector_only_mode=x_vector_only_mode,
+                )
 
     def synthesize_segments(
         self,

@@ -23,6 +23,7 @@ class RuntimeMonitor:
         idle_interval: float = 10.0,
         max_samples: int = 300,
         sampler: Callable[..., RuntimeSnapshot] = collect_runtime_snapshot,
+        sample_observer: Callable[[RuntimeSnapshot], None] | None = None,
     ) -> None:
         self.workspace = Path(workspace)
         self.active_task_checker = active_task_checker or (lambda: False)
@@ -32,6 +33,7 @@ class RuntimeMonitor:
         self.idle_interval = max(self.active_interval, float(idle_interval))
         self._samples: Deque[RuntimeSnapshot] = deque(maxlen=max(2, int(max_samples)))
         self._sampler = sampler
+        self._sample_observer = sample_observer
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -64,6 +66,11 @@ class RuntimeMonitor:
         )
         with self._lock:
             self._samples.append(sample)
+        if self._sample_observer:
+            try:
+                self._sample_observer(sample)
+            except Exception:
+                pass
         return sample
 
     def latest(self) -> RuntimeSnapshot | None:

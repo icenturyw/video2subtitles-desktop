@@ -364,6 +364,10 @@ class TranslationConfig:
     concurrency: int = 8
     quality_mode: Literal["fast", "quality"] = "fast"
     output_format: Literal["json", "compact"] = "compact"
+    # auto: strict JSON batch first, then split/retry bad items;
+    # strict_json_batch: force id-mapped JSON output;
+    # single_segment: safest mode, one request per subtitle segment.
+    batch_mode: Literal["auto", "strict_json_batch", "single_segment"] = "auto"
     stream: bool = False
 
     def to_dict(self) -> Dict[str, Any]:

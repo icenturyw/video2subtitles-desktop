@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -85,6 +86,7 @@ class ModelManager:
         self._tokenizer = None
         self._lock = threading.Lock()
         self._load_lock = threading.Lock()
+        self._active_leases = 0
 
     @property
     def loaded_model_id(self) -> Optional[str]:
@@ -128,7 +130,9 @@ class ModelManager:
         with self._load_lock:
             if self._model is not None and self._model_id == model_id:
                 return True, "Model already loaded"
-            self._unload_model()
+            unloaded, unload_message = self._unload_model()
+            if not unloaded:
+                return False, unload_message
 
             if device is None:
                 from engine.device import get_optimal_device
@@ -185,6 +189,9 @@ class ModelManager:
             return self._unload_model()
 
     def _unload_model(self) -> Tuple[bool, str]:
+        with self._lock:
+            if self._active_leases > 0:
+                return False, f"Model is in use by {self._active_leases} active lease(s)"
         if self._model is None:
             return True, "No model loaded"
 
@@ -215,6 +222,24 @@ class ModelManager:
 
     def get_tokenizer(self):
         return self._tokenizer
+
+    @property
+    def active_leases(self) -> int:
+        with self._lock:
+            return self._active_leases
+
+    @contextmanager
+    def lease(self):
+        with self._lock:
+            if self._model is None:
+                raise RuntimeError("No model loaded")
+            self._active_leases += 1
+            model = self._model
+        try:
+            yield model
+        finally:
+            with self._lock:
+                self._active_leases = max(0, self._active_leases - 1)
 
 
 def _has_flash_attn() -> bool:

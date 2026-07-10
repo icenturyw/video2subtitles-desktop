@@ -72,7 +72,7 @@ class RuntimeCapabilities:
         command_timeout: float = 3.0,
     ) -> "RuntimeCapabilities":
         root = Path(workspace).expanduser().resolve()
-        disk = shutil.disk_usage(root if root.exists() else root.parent)
+        disk = shutil.disk_usage(_existing_path(root))
         memory_total = _memory_values()[1]
         monitor = gpu_monitor or create_gpu_monitor(command_timeout)
         gpus = tuple(monitor.sample())
@@ -145,7 +145,7 @@ def collect_runtime_snapshot(
     loaded_models: Iterable[dict] = (),
 ) -> RuntimeSnapshot:
     root = Path(workspace).expanduser().resolve()
-    disk = shutil.disk_usage(root if root.exists() else root.parent)
+    disk = shutil.disk_usage(_existing_path(root))
     used, total, percent = _memory_values()
     cpu = float(psutil.cpu_percent(interval=None)) if psutil is not None else 0.0
     monitor = gpu_monitor or create_gpu_monitor()
@@ -160,3 +160,10 @@ def collect_runtime_snapshot(
         gpus=tuple(monitor.sample()),
         loaded_models=tuple(dict(model) for model in loaded_models),
     )
+
+
+def _existing_path(path: Path) -> Path:
+    candidate = path
+    while not candidate.exists() and candidate != candidate.parent:
+        candidate = candidate.parent
+    return candidate

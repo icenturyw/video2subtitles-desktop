@@ -210,6 +210,11 @@ def reconstruct_split_words(
     into ``"scali"`` / ``"ng"`` across two segments with a ~20 ms gap.  This
     function detects such splits and joins the text, reusing the first
     segment's start time and the second's end time.
+
+    It also rejoins numbers that the captioner split across two segments, e.g.
+    ``"have about $17,"`` / ``"000."`` -> ``"have about $17,000."``.  Without
+    this, the orphan fragments (``"000."``) translate to punctuation-only
+    output that trips the target-language quality gate and aborts dubbing.
     """
     if len(subtitles) < 2:
         return list(subtitles)
@@ -224,6 +229,39 @@ def reconstruct_split_words(
         sp = text.find(" ")
         return (text[:sp], text[sp:]) if sp >= 0 else (text, "")
 
+    _NUMBER_LAST_TOKEN_RE = re.compile(r"[\$€£¥]?\d[\d,]*,\s*$")
+    _NUMBER_NEXT_LEAD_RE = re.compile(r"^\s*\d")
+    _SENTENCE_END_RE = re.compile(r"[.!?。！？…][\'\")\]\}】》]*\s*$")
+    _WORD_TAIL_FRAGMENT_RE = re.compile(
+        r"^(?:[a-z]{1,2}|s|es|ed|er|ers|ing|tion|sion|ment|ness|ity|lysis|ysis|able|ible|ally|ly)[.!?,;:]*$",
+        re.IGNORECASE,
+    )
+
+    def _is_word_tail_fragment(text: str) -> bool:
+        value = normalize_subtitle_text(text).strip()
+        if " " in value or not value:
+            return False
+        letters = re.sub(r"[^A-Za-z]+", "", value)
+        return bool(letters) and len(letters) <= 6 and bool(_WORD_TAIL_FRAGMENT_RE.fullmatch(value))
+
+    def _should_merge_tail_fragment(prev_text: str, curr_text: str, gap: float) -> bool:
+        if gap < 0 or gap > 0.5:
+            return False
+        if not prev_text or not curr_text or not _is_word_tail_fragment(curr_text):
+            return False
+        # Merge tails like anal + ysis. even when the gap is larger than the
+        # strict word-split threshold used for normal captions.  Require the
+        # previous caption not to be a finished sentence to avoid gluing full
+        # independent captions together.
+        return not bool(_SENTENCE_END_RE.search(prev_text))
+
+    def _is_number_split(prev_text: str, next_text: str) -> bool:
+        if not (prev_text and next_text):
+            return False
+        return bool(_NUMBER_LAST_TOKEN_RE.search(prev_text)) and bool(
+            _NUMBER_NEXT_LEAD_RE.match(next_text)
+        )
+
     i = 0
     while i < len(items):
         curr = dict(items[i])
@@ -232,19 +270,23 @@ def reconstruct_split_words(
         # Backward merge: if this segment is a standalone lowercase fragment
         # (no spaces, short) and the previous result ends with a lowercase
         # letter at a tight gap, merge backward.
-        if (
-            result
-            and " " not in curr_text
-            and curr_text
-            and curr_text[0].islower()
-            and len(curr_text) <= 3
-        ):
+        if result and " " not in curr_text and curr_text and curr_text[0].islower():
             prev = result[-1]
             prev_text = str(prev.get("text", "") or "")
             gap = float(curr.get("start", 0) or 0) - float(prev.get("end", 0) or 0)
-            if 0 <= gap <= max_gap_sec and prev_text and prev_text[-1].islower():
+            should_merge_short = (
+                len(curr_text) <= 3
+                and 0 <= gap <= max_gap_sec
+                and prev_text
+                and prev_text[-1].islower()
+            )
+            should_merge_tail = _should_merge_tail_fragment(prev_text, curr_text, gap)
+            if should_merge_short or should_merge_tail:
                 prefix, last_frag = _last_fragment(prev_text)
-                prev["text"] = prefix + last_frag + curr_text
+                separator = ""
+                if should_merge_tail and prefix and not last_frag:
+                    separator = " "
+                prev["text"] = prefix + last_frag + separator + curr_text
                 prev["end"] = max(
                     float(prev.get("end", 0) or 0),
                     float(curr.get("end", 0) or 0),
@@ -252,7 +294,9 @@ def reconstruct_split_words(
                 i += 1
                 continue
 
-        # Forward merge: chain lowercase→lowercase across tight gaps.
+        # Forward merge: chain lowercase→lowercase across tight gaps, and
+        # rejoin numbers split across the caption boundary
+        # (e.g. "$17," + "000." -> "$17,000.").
         while i + 1 < len(items):
             nxt = items[i + 1]
             gap = float(nxt.get("start", 0) or 0) - float(curr.get("end", 0) or 0)
@@ -262,21 +306,54 @@ def reconstruct_split_words(
             next_text = str(nxt.get("text", "") or "")
             if not (curr_text and next_text):
                 break
-            if not (curr_text[-1].islower() and next_text[0].islower()):
+            word_split = curr_text[-1].islower() and next_text[0].islower()
+            num_split = _is_number_split(curr_text, next_text)
+            if not (word_split or num_split):
                 break
-            prefix, last_frag = _last_fragment(curr_text)
-            first_frag, suffix = _first_fragment(next_text)
-            if len(last_frag) > 2 and len(first_frag) > 2:
-                break
-            curr["text"] = prefix + last_frag + first_frag + suffix
+            if word_split:
+                prefix, last_frag = _last_fragment(curr_text)
+                first_frag, suffix = _first_fragment(next_text)
+                # When both fragments are >2 chars they look like complete
+                # words, so we don't merge them.  This protects against
+                # jamming two independent captions together (e.g. "watch"
+                # + "that") which would corrupt both the export and TTS.
+                if len(last_frag) > 2 and len(first_frag) > 2:
+                    break
+                curr["text"] = prefix + last_frag + first_frag + suffix
+                word_fragment_complete = (
+                    len(_last_fragment(curr["text"])[1]) >= 3
+                )
+            else:
+                curr["text"] = curr_text + next_text
+                # Numbers split across captions normally produce exactly two
+                # fragments; stop after a single join so we don't accidentally
+                # glue a separate caption like "12,000." onto "got in at 5,".
+                word_fragment_complete = True
             curr["end"] = max(
                 float(curr.get("end", 0) or 0),
                 float(nxt.get("end", 0) or 0),
             )
             i += 1
-            _, joined = _last_fragment(curr["text"])
-            if len(joined) >= 3:
-                break
+            if not word_fragment_complete:
+                continue
+            # The word fragment looks complete, but the next item might still be
+            # a number-continuation of this caption (e.g. after merging
+            # "...gonna have" + "to ... $17," the tail "$17," should still
+            # rejoin the following "000." caption). Keep chaining in that case.
+            if i + 1 < len(items):
+                nxt2 = items[i + 1]
+                gap2 = float(nxt2.get("start", 0) or 0) - float(
+                    curr.get("end", 0) or 0
+                )
+                if (
+                    0 <= gap2 <= max_gap_sec
+                    and _is_number_split(
+                        str(curr.get("text", "") or ""),
+                        str(nxt2.get("text", "") or ""),
+                    )
+                ):
+                    continue
+            break
         result.append(curr)
         i += 1
     return result

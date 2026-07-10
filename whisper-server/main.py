@@ -40,13 +40,16 @@ for directory in (TEMP_DIR, CACHE_DIR, RAW_DIR):
 
 from subtitle_utils import (  # noqa: E402
     find_repeated_subtitle_runs,
+    normalize_subtitle_text,
     normalize_subtitle_timeline,
+    reconstruct_split_words,
 )
 
 API_AUTH_KEY = os.environ.get("API_AUTH_KEY", "")
-MODEL_LOCK = threading.Lock()
+MODEL_LOCK = threading.RLock()
 MODEL = None
 MODEL_KEY = None
+MODEL_ACTIVE_LEASES = 0
 TASKS: Dict[str, Dict[str, Any]] = {}
 TASK_LOCK = threading.Lock()
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".flv", ".avi"}
@@ -54,6 +57,8 @@ AUDIO_EXTS = {".mp3", ".m4a", ".opus", ".wav", ".aac", ".ogg"}
 MEDIA_EXTS = VIDEO_EXTS | AUDIO_EXTS
 SUPPORTED_DOWNLOAD_MODES = {"video", "transcribe_only", "audio"}
 SUPPORTED_DOWNLOAD_QUALITIES = {"best", "720p", "480p"}
+SUPPORTED_YOUTUBE_CAPTION_POLICIES = {"auto", "youtube", "whisper"}
+CAPTION_PIPELINE_VERSION = 2
 
 
 class TaskCancelled(RuntimeError):
@@ -72,6 +77,14 @@ class TranscribeRequest(BaseModel):
     download_mode: str = "video"
     download_quality: str = "best"
     keep_video: bool = True
+    youtube_caption_policy: str = "auto"
+    youtube_caption_resegment: bool = True
+
+
+class LoadModelRequest(BaseModel):
+    model_id: str = "base"
+    device: Optional[str] = None
+    compute_type: Optional[str] = None
 
 
 app = FastAPI(title="Video2Subtitles Local Whisper Service", version="1.0.0")
@@ -115,6 +128,43 @@ def _clean_download_mode(mode: str) -> str:
 def _clean_download_quality(quality: str) -> str:
     quality = (quality or "best").strip()
     return quality if quality in SUPPORTED_DOWNLOAD_QUALITIES else "best"
+
+
+def _clean_youtube_caption_policy(value: Optional[str] = None) -> str:
+    """Normalize the YouTube caption source policy.
+
+    auto: use YouTube captions when they can be repaired into good segments,
+          otherwise fall back to local Whisper.
+    youtube: force YouTube captions and keep repaired segments even if quality
+             checks are not ideal.
+    whisper: skip YouTube captions entirely.
+    """
+    raw = value if value is not None else os.environ.get("V2S_YOUTUBE_CAPTION_POLICY", "auto")
+    policy = str(raw or "auto").strip().lower().replace("-", "_")
+    aliases = {
+        "yt": "youtube",
+        "youtube_only": "youtube",
+        "force_youtube": "youtube",
+        "local": "whisper",
+        "local_whisper": "whisper",
+        "whisper_only": "whisper",
+        "force_whisper": "whisper",
+    }
+    policy = aliases.get(policy, policy)
+    return policy if policy in SUPPORTED_YOUTUBE_CAPTION_POLICIES else "auto"
+
+
+def _as_bool(value: Any, default: bool = True) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on", "y"}:
+        return True
+    if text in {"0", "false", "no", "off", "n"}:
+        return False
+    return default
 
 
 def _video_format_selector(quality: str) -> str:
@@ -477,20 +527,294 @@ def _parse_youtube_vtt(text: str) -> list[dict[str, Any]]:
     return subtitles
 
 
-def _fetch_youtube_captions(video_url: str, language: str, task_id: str) -> tuple[list[dict[str, Any]], str]:
+def _select_caption_track_with_kind(info: dict[str, Any], language: str) -> tuple[Optional[dict[str, Any]], str, str]:
+    candidates = _caption_language_candidates(language)
+    if not candidates:
+        return None, "", ""
+    for bucket_name, kind in (("subtitles", "manual"), ("automatic_captions", "automatic")):
+        bucket = info.get(bucket_name) or {}
+        for lang in candidates:
+            tracks = bucket.get(lang)
+            if not tracks:
+                continue
+            for ext in ("json3", "vtt"):
+                for track in tracks:
+                    if track.get("ext") == ext and track.get("url"):
+                        return track, lang, kind
+            for track in tracks:
+                if track.get("url"):
+                    return track, lang, kind
+    return None, "", ""
+
+
+_LATIN_OR_DIGIT_RE = re.compile(r"[A-Za-z0-9]$")
+_LATIN_OR_DIGIT_START_RE = re.compile(r"^[A-Za-z0-9]")
+_SENTENCE_END_RE = re.compile(r'[.!?。！？…]+[\)\]】》”’"\']*$')
+_CJK_NO_SPACE_RE = re.compile(r"[\u4e00-\u9fff\u3040-\u30ff]")
+_SEMANTIC_TEXT_RE = re.compile(r"[\w\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]", re.UNICODE)
+_TRAILING_LATIN_FRAGMENT_RE = re.compile(r"[A-Za-z]{2,8}$")
+_LEADING_LATIN_FRAGMENT_RE = re.compile(r"^[A-Za-z]{1,4}(?:\b|[^A-Za-z])")
+
+
+def _has_cjk_no_space_char(text: str) -> bool:
+    return bool(_CJK_NO_SPACE_RE.search(text or ""))
+
+
+def _join_caption_text(left: str, right: str) -> str:
+    left = normalize_subtitle_text(left)
+    right = normalize_subtitle_text(right)
+    if not left:
+        return right
+    if not right:
+        return left
+    last = left[-1]
+    first = right[0]
+    if last == "-" and _LATIN_OR_DIGIT_START_RE.match(first):
+        return left[:-1] + right
+    if first in ",.!?;:%)]}，。！？；：、…" or last in "([{《“‘\"":
+        return left + right
+    if _has_cjk_no_space_char(last) or _has_cjk_no_space_char(first):
+        return left + right
+    if _LATIN_OR_DIGIT_RE.search(last) and _LATIN_OR_DIGIT_START_RE.match(first):
+        return left + " " + right
+    return left + " " + right
+
+
+def _semantic_len(text: str) -> int:
+    return len(_SEMANTIC_TEXT_RE.findall(text or ""))
+
+
+def _raw_split_word_boundary_count(subtitles: list[dict[str, Any]], *, max_gap_sec: float = 0.45) -> int:
+    count = 0
+    for prev, curr in zip(subtitles, subtitles[1:]):
+        prev_text = normalize_subtitle_text(prev.get("text", ""))
+        curr_text = normalize_subtitle_text(curr.get("text", ""))
+        if not prev_text or not curr_text:
+            continue
+        gap = float(curr.get("start", 0) or 0) - float(prev.get("end", 0) or 0)
+        if gap < -0.05 or gap > max_gap_sec:
+            continue
+        prev_fragment = _TRAILING_LATIN_FRAGMENT_RE.search(prev_text)
+        curr_fragment = _LEADING_LATIN_FRAGMENT_RE.search(curr_text)
+        if not (prev_fragment and curr_fragment):
+            continue
+        # A likely broken word boundary: previous line ends with a lower-case
+        # fragment and the next line starts with a small lower-case fragment.
+        # Normal sentence breaks usually start with upper-case words or follow
+        # punctuation, so this catches cases like "scali" / "ng into" without
+        # flagging every short YouTube caption.
+        if prev_text[-1].islower() and curr_text[0].islower() and not _SENTENCE_END_RE.search(prev_text):
+            first = re.match(r"^[A-Za-z]+", curr_text)
+            if first and len(first.group(0)) <= 4:
+                count += 1
+    return count
+
+
+def _resegment_youtube_captions(
+    subtitles: list[dict[str, Any]],
+    *,
+    max_pause_sec: float = 0.75,
+    max_duration_sec: float = 7.5,
+) -> list[dict[str, Any]]:
+    """Merge YouTube display captions into semantic chunks suitable for translation/TTS."""
+    items = normalize_subtitle_timeline(subtitles, min_gap=0.0, min_duration=0.05)
+    if len(items) < 2:
+        return items
+
+    all_text = "".join(str(item.get("text", "")) for item in items)
+    # Chinese/Japanese should be shorter on screen; Latin/Korean can tolerate
+    # more characters because spaces carry word boundaries.
+    cjk_mode = _has_cjk_no_space_char(all_text)
+    soft_max_chars = 46 if cjk_mode else 92
+    hard_max_chars = 64 if cjk_mode else 125
+    min_chars = 10 if cjk_mode else 22
+
+    result: list[dict[str, Any]] = []
+    current: Optional[dict[str, Any]] = None
+
+    def flush() -> None:
+        nonlocal current
+        if not current:
+            return
+        text = normalize_subtitle_text(current.get("text", ""))
+        if text:
+            item = dict(current)
+            item["text"] = text
+            result.append(item)
+        current = None
+
+    for item in items:
+        text = normalize_subtitle_text(item.get("text", ""))
+        if not text:
+            continue
+        start = float(item.get("start", 0) or 0)
+        end = max(start + 0.05, float(item.get("end", start) or start))
+        if current is None:
+            current = {"start": start, "end": end, "text": text}
+            continue
+
+        current_text = normalize_subtitle_text(current.get("text", ""))
+        current_end = float(current.get("end", start) or start)
+        gap = max(0.0, start - current_end)
+        merged_text = _join_caption_text(current_text, text)
+        merged_duration = max(end, current_end) - float(current.get("start", start) or start)
+        current_len = _semantic_len(current_text)
+        merged_len = _semantic_len(merged_text)
+
+        should_flush = False
+        if gap >= max_pause_sec and current_len >= min_chars:
+            should_flush = True
+        if _SENTENCE_END_RE.search(current_text) and current_len >= min_chars:
+            should_flush = True
+        if merged_len > hard_max_chars:
+            should_flush = True
+        if merged_duration > max_duration_sec and current_len >= min_chars:
+            should_flush = True
+        if current_len >= soft_max_chars and (gap >= 0.25 or _SENTENCE_END_RE.search(current_text)):
+            should_flush = True
+
+        if should_flush:
+            flush()
+            current = {"start": start, "end": end, "text": text}
+        else:
+            current["end"] = max(end, current_end)
+            current["text"] = merged_text
+    flush()
+
+    # Tiny leftovers at the end of a sentence usually belong to the previous
+    # segment; merge them back unless there is a real pause.
+    merged: list[dict[str, Any]] = []
+    for item in result:
+        text = normalize_subtitle_text(item.get("text", ""))
+        if (
+            merged
+            and _semantic_len(text) < min_chars
+            and float(item.get("start", 0) or 0) - float(merged[-1].get("end", 0) or 0) <= max_pause_sec
+        ):
+            merged[-1]["text"] = _join_caption_text(str(merged[-1].get("text", "")), text)
+            merged[-1]["end"] = max(float(merged[-1].get("end", 0) or 0), float(item.get("end", 0) or 0))
+        else:
+            merged.append(dict(item))
+    return normalize_subtitle_timeline(merged, min_gap=0.02, min_duration=0.12)
+
+
+def _assess_youtube_caption_quality(
+    raw_subtitles: list[dict[str, Any]],
+    processed_subtitles: list[dict[str, Any]],
+    *,
+    track_kind: str = "",
+) -> dict[str, Any]:
+    raw_count = len(raw_subtitles)
+    processed_count = len(processed_subtitles)
+    raw_split_words = _raw_split_word_boundary_count(raw_subtitles)
+    score = 100.0
+    issues: list[str] = []
+    warnings: list[str] = []
+
+    if not processed_subtitles:
+        return {
+            "score": 0.0,
+            "usable": False,
+            "issues": ["没有可用字幕文本"],
+            "warnings": [],
+            "raw_count": raw_count,
+            "processed_count": processed_count,
+            "raw_split_word_boundaries": raw_split_words,
+        }
+
+    durations = [
+        max(0.0, float(item.get("end", 0) or 0) - float(item.get("start", 0) or 0))
+        for item in processed_subtitles
+    ]
+    lengths = [_semantic_len(str(item.get("text", ""))) for item in processed_subtitles]
+    short_items = sum(1 for duration, length in zip(durations, lengths) if duration < 0.55 or length <= 2)
+    short_ratio = short_items / max(1, processed_count)
+    avg_duration = sum(durations) / max(1, processed_count)
+    avg_chars = sum(lengths) / max(1, processed_count)
+    sentence_ends = sum(1 for item in processed_subtitles if _SENTENCE_END_RE.search(str(item.get("text", "")).strip()))
+    sentence_end_ratio = sentence_ends / max(1, processed_count)
+    overlaps = 0
+    for prev, curr in zip(processed_subtitles, processed_subtitles[1:]):
+        if float(prev.get("end", 0) or 0) > float(curr.get("start", 0) or 0) + 0.05:
+            overlaps += 1
+    overlap_ratio = overlaps / max(1, processed_count - 1)
+    repeated_runs = find_repeated_subtitle_runs(processed_subtitles)
+
+    if raw_split_words:
+        warnings.append(f"检测到 {raw_split_words} 处疑似 YouTube 断词边界，已尝试修复")
+        score -= min(12.0, raw_split_words * 1.5)
+    if short_ratio > 0.35:
+        issues.append("字幕切段仍过碎")
+        score -= 28.0
+    elif short_ratio > 0.22:
+        warnings.append("字幕短片段偏多")
+        score -= 12.0
+    if avg_duration < 0.9 and processed_count >= 8:
+        issues.append("平均字幕时长过短")
+        score -= 20.0
+    if avg_chars < 5 and processed_count >= 8:
+        issues.append("平均字幕文本过短")
+        score -= 20.0
+    if overlap_ratio > 0.08:
+        issues.append("字幕时间轴存在明显重叠")
+        score -= 18.0
+    if repeated_runs:
+        issues.append("存在连续重复字幕")
+        score -= 25.0
+    if track_kind == "automatic" and raw_count >= 20 and sentence_end_ratio < 0.03:
+        warnings.append("YouTube 自动字幕标点较少，已按停顿和长度重分段")
+        score -= 6.0
+
+    threshold = 42.0 if track_kind == "manual" else 55.0
+    score = round(max(0.0, min(100.0, score)), 1)
+    return {
+        "score": score,
+        "usable": score >= threshold and not any(issue in issues for issue in ("字幕切段仍过碎", "平均字幕时长过短")),
+        "issues": issues,
+        "warnings": warnings,
+        "raw_count": raw_count,
+        "processed_count": processed_count,
+        "raw_split_word_boundaries": raw_split_words,
+        "short_ratio": round(short_ratio, 3),
+        "avg_duration": round(avg_duration, 3),
+        "avg_chars": round(avg_chars, 2),
+        "sentence_end_ratio": round(sentence_end_ratio, 3),
+        "overlap_ratio": round(overlap_ratio, 3),
+        "track_kind": track_kind or "unknown",
+    }
+
+
+def _prepare_youtube_captions(
+    subtitles: list[dict[str, Any]],
+    *,
+    track_kind: str = "",
+    resegment: bool = True,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    raw = normalize_subtitle_timeline(subtitles, min_gap=0.0, min_duration=0.05)
+    repaired = reconstruct_split_words(raw, max_gap_sec=0.35)
+    repaired = normalize_subtitle_timeline(repaired, min_gap=0.0, min_duration=0.05)
+    processed = _resegment_youtube_captions(repaired) if resegment else repaired
+    processed = normalize_subtitle_timeline(processed, min_gap=0.02, min_duration=0.12)
+    quality = _assess_youtube_caption_quality(raw, processed, track_kind=track_kind)
+    quality["resegmented"] = bool(resegment)
+    return processed, quality
+
+
+def _fetch_youtube_captions_with_metadata(video_url: str, language: str, task_id: str) -> dict[str, Any]:
     if not _is_youtube_url(video_url):
-        return [], ""
+        return {"subtitles": [], "language": "", "track_kind": ""}
     import urllib.request
     import yt_dlp
 
     _update_task(task_id, "downloading", 6, "正在检查 YouTube 字幕...")
     with yt_dlp.YoutubeDL(_youtube_info_options()) as ydl:
         info = ydl.extract_info(video_url, download=False)
-    track, caption_lang = _select_caption_track(info, language)
+    track, caption_lang, track_kind = _select_caption_track_with_kind(info, language)
     if not track:
-        return [], ""
+        return {"subtitles": [], "language": "", "track_kind": ""}
 
-    _update_task(task_id, "downloading", 10, f"正在下载 YouTube 字幕 ({caption_lang})...")
+    kind_label = "人工字幕" if track_kind == "manual" else "自动字幕"
+    _update_task(task_id, "downloading", 10, f"正在下载 YouTube {kind_label} ({caption_lang})...")
     req = urllib.request.Request(
         track["url"],
         headers={
@@ -509,7 +833,17 @@ def _fetch_youtube_captions(video_url: str, language: str, task_id: str) -> tupl
         subtitles = _parse_youtube_json3(json.loads(raw))
     else:
         subtitles = _parse_youtube_vtt(raw)
-    return subtitles, caption_lang if subtitles else ""
+    return {
+        "subtitles": subtitles,
+        "language": caption_lang if subtitles else "",
+        "track_kind": track_kind if subtitles else "",
+    }
+
+
+def _fetch_youtube_captions(video_url: str, language: str, task_id: str) -> tuple[list[dict[str, Any]], str]:
+    """Backward-compatible wrapper used by older tests and integrations."""
+    payload = _fetch_youtube_captions_with_metadata(video_url, language, task_id)
+    return payload.get("subtitles", []), payload.get("language", "")
 
 
 def _download_audio(video_url: str, task_id: str) -> Path:
@@ -654,6 +988,8 @@ def _get_model():
 def _unload_model() -> bool:
     global MODEL, MODEL_KEY
     with MODEL_LOCK:
+        if MODEL_ACTIVE_LEASES > 0:
+            return False
         had_model = MODEL is not None
         MODEL = None
         MODEL_KEY = None
@@ -672,32 +1008,118 @@ def _unload_model() -> bool:
     return had_model
 
 
+def _acquire_model_lease():
+    global MODEL_ACTIVE_LEASES
+    with MODEL_LOCK:
+        model = _get_model()
+        MODEL_ACTIVE_LEASES += 1
+        return model
+
+
+def _release_model_lease() -> bool:
+    global MODEL_ACTIVE_LEASES
+    with MODEL_LOCK:
+        if MODEL_ACTIVE_LEASES <= 0:
+            return False
+        MODEL_ACTIVE_LEASES -= 1
+        return True
+
+
 def _split_text(text: str, max_len: int = 32) -> list[str]:
-    text = text.strip()
-    if len(text) <= max_len:
+    """Split one Whisper segment into readable subtitle chunks.
+
+    Faster-Whisper already emits phrase-level segments.  The old implementation
+    then sliced any long segment at a fixed 32-character boundary.  That creates
+    subtitles such as ``everythin`` / ``g`` and ``tra`` / ``ding`` because the
+    cut ignores word boundaries.  Keep CJK captions reasonably short, but for
+    space-separated languages prefer semantic word wrapping and only hard-split
+    a token when a single token is longer than the allowed line length.
+    """
+    text = normalize_subtitle_text(text)
+    if not text:
+        return []
+
+    cjk_mode = _has_cjk_no_space_char(text)
+    effective_max = max(18, int(max_len or 32)) if cjk_mode else max(80, int(max_len or 32))
+    if len(text) <= effective_max:
         return [text]
-    parts = re.split(r"([。！？；.!?;，,、])", text)
-    chunks: list[str] = []
+
+    # First split at real sentence/phrase punctuation.  For Latin text we avoid
+    # treating commas as mandatory boundaries because it over-fragments spoken
+    # English; the word wrapper below can still wrap long comma phrases safely.
+    punct_pattern = r"([。！？；，、])" if cjk_mode else r"([.!?;]+)"
+    parts = re.split(punct_pattern, text)
+    phrases: list[str] = []
     current = ""
     for i in range(0, len(parts), 2):
         piece = parts[i]
         if i + 1 < len(parts):
             piece += parts[i + 1]
-        if len(current) + len(piece) > max_len and current:
-            chunks.append(current.strip())
+        piece = piece.strip()
+        if not piece:
+            continue
+        candidate = (current + " " + piece).strip() if current and not cjk_mode else (current + piece).strip()
+        if current and len(candidate) > effective_max:
+            phrases.append(current.strip())
             current = piece
         else:
-            current += piece
+            current = candidate
     if current.strip():
-        chunks.append(current.strip())
+        phrases.append(current.strip())
+
+    def wrap_latin_words(chunk: str) -> list[str]:
+        words = re.findall(r"\S+", chunk)
+        if not words:
+            return []
+        wrapped: list[str] = []
+        current_line = ""
+        for word in words:
+            if len(word) > effective_max:
+                if current_line:
+                    wrapped.append(current_line.strip())
+                    current_line = ""
+                # Last resort for pathological tokens such as very long URLs.
+                for start in range(0, len(word), effective_max):
+                    part = word[start:start + effective_max].strip()
+                    if part:
+                        wrapped.append(part)
+                continue
+            candidate = f"{current_line} {word}".strip() if current_line else word
+            if len(candidate) <= effective_max:
+                current_line = candidate
+            else:
+                if current_line:
+                    wrapped.append(current_line.strip())
+                current_line = word
+        if current_line:
+            wrapped.append(current_line.strip())
+        return wrapped
+
+    def wrap_cjk_chars(chunk: str) -> list[str]:
+        wrapped: list[str] = []
+        current_line = ""
+        for char in chunk:
+            candidate = current_line + char
+            if len(candidate) <= effective_max:
+                current_line = candidate
+            else:
+                if current_line:
+                    wrapped.append(current_line.strip())
+                current_line = char
+        if current_line.strip():
+            wrapped.append(current_line.strip())
+        return wrapped
+
     final: list[str] = []
-    for chunk in chunks or [text]:
-        while len(chunk) > max_len:
-            final.append(chunk[:max_len].strip())
-            chunk = chunk[max_len:]
-        if chunk.strip():
-            final.append(chunk.strip())
-    return final or [text]
+    for phrase in phrases or [text]:
+        if len(phrase) <= effective_max:
+            final.append(phrase.strip())
+        elif cjk_mode:
+            final.extend(wrap_cjk_chars(phrase))
+        else:
+            final.extend(wrap_latin_words(phrase))
+
+    return [item for item in final if item.strip()] or [text]
 
 
 def _initial_prompt_for_language(language: str) -> Optional[str]:
@@ -717,7 +1139,7 @@ def _initial_prompt_for_language(language: str) -> Optional[str]:
 def _transcribe_file(path: Path, task_id: str, language: str = "auto") -> tuple[list[dict[str, Any]], str]:
     _raise_if_cancelled(task_id)
     _update_task(task_id, "transcribing", 20, "正在加载 Whisper 模型...")
-    model = _get_model()
+    model = _acquire_model_lease()
     _raise_if_cancelled(task_id)
     _update_task(task_id, "transcribing", 30, "正在本地识别...")
 
@@ -734,7 +1156,14 @@ def _transcribe_file(path: Path, task_id: str, language: str = "auto") -> tuple[
     if prompt:
         transcribe_kwargs["initial_prompt"] = prompt
 
-    segments, info = model.transcribe(str(path), **transcribe_kwargs)
+    try:
+        segment_stream, info = model.transcribe(str(path), **transcribe_kwargs)
+        segments = []
+        for segment in segment_stream:
+            _raise_if_cancelled(task_id)
+            segments.append(segment)
+    finally:
+        _release_model_lease()
 
     detected_lang = getattr(info, "language", None) or language or "unknown"
     duration = float(getattr(info, "duration", 0) or 0)
@@ -799,14 +1228,25 @@ def _process_task(
     download_mode: str = "video",
     download_quality: str = "best",
     keep_video: bool = True,
+    youtube_caption_policy: str = "auto",
+    youtube_caption_resegment: bool = True,
 ) -> None:
     try:
         language = _clean_language(language)
         download_mode = _clean_download_mode(download_mode)
         download_quality = _clean_download_quality(download_quality)
+        youtube_caption_policy = _clean_youtube_caption_policy(youtube_caption_policy)
+        youtube_caption_resegment = _as_bool(youtube_caption_resegment, True)
         _raise_if_cancelled(task_id)
         cached = _load_cache(task_id)
-        if cached and cached.get("subtitles"):
+        cache_usable = bool(cached and cached.get("subtitles"))
+        if cache_usable and video_url:
+            cache_usable = (
+                cached.get("caption_pipeline_version") == CAPTION_PIPELINE_VERSION
+                and cached.get("youtube_caption_policy", "auto") == youtube_caption_policy
+                and bool(cached.get("youtube_caption_resegment", True)) == youtube_caption_resegment
+            )
+        if cache_usable and cached and cached.get("subtitles"):
             media_path = None
             if video_url:
                 if download_mode == "audio":
@@ -827,6 +1267,9 @@ def _process_task(
                 media_file=str(media_path) if media_path else cached.get("media_file", ""),
                 download_mode=download_mode,
                 download_quality=download_quality,
+                subtitle_source=cached.get("subtitle_source", "cache"),
+                caption_quality=cached.get("caption_quality", {}),
+                youtube_caption_policy=youtube_caption_policy,
             )
             return
 
@@ -844,23 +1287,56 @@ def _process_task(
 
         subtitles: list[dict[str, Any]] = []
         detected_lang = ""
+        subtitle_source = "whisper"
+        caption_quality: dict[str, Any] = {}
         caption_error: Optional[Exception] = None
-        if video_url:
+
+        use_youtube = bool(video_url) and youtube_caption_policy != "whisper" and _caption_language_candidates(language)
+        if use_youtube:
             try:
                 _raise_if_cancelled(task_id)
-                subtitles, detected_lang = _fetch_youtube_captions(video_url, language, task_id)
+                caption_payload = _fetch_youtube_captions_with_metadata(video_url, language, task_id)
+                raw_captions = caption_payload.get("subtitles", [])
+                if raw_captions:
+                    _update_task(task_id, "downloading", 12, "正在修复 YouTube 字幕分段...")
+                    prepared, caption_quality = _prepare_youtube_captions(
+                        raw_captions,
+                        track_kind=str(caption_payload.get("track_kind", "") or ""),
+                        resegment=youtube_caption_resegment,
+                    )
+                    if caption_quality.get("usable") or youtube_caption_policy == "youtube":
+                        subtitles = prepared
+                        detected_lang = str(caption_payload.get("language", "") or language)
+                        subtitle_source = f"youtube_{caption_quality.get('track_kind', 'unknown')}"
+                    else:
+                        warnings = "; ".join(caption_quality.get("issues") or caption_quality.get("warnings") or [])
+                        _update_task(
+                            task_id,
+                            "downloading",
+                            14,
+                            f"YouTube 字幕质量较差，自动改用本地 Whisper...{(' ' + warnings) if warnings else ''}",
+                            caption_quality=caption_quality,
+                        )
+                elif youtube_caption_policy == "youtube":
+                    raise RuntimeError(f"未找到 YouTube {language} 字幕")
             except Exception as exc:
                 if isinstance(exc, TaskCancelled):
                     raise
                 caption_error = exc
                 subtitles, detected_lang = [], ""
+                if youtube_caption_policy == "youtube":
+                    raise RuntimeError(f"YouTube {language} 字幕不可用: {exc}") from exc
+                _update_task(task_id, "downloading", 14, "YouTube 字幕不可用，自动改用本地 Whisper...")
+
         if not subtitles:
-            if caption_error is not None and _caption_language_candidates(language):
-                raise RuntimeError(
-                    f"YouTube {language} 字幕下载失败，未回退为其他语言字幕: {caption_error}"
-                ) from caption_error
             _raise_if_cancelled(task_id)
             subtitles, detected_lang = _transcribe_file(media_path, task_id, language)
+            subtitle_source = "whisper"
+            if caption_error is not None:
+                caption_quality = {
+                    **caption_quality,
+                    "youtube_caption_error": str(caption_error)[:500],
+                }
         _raise_if_cancelled(task_id)
         if not subtitles:
             raise RuntimeError("未识别到有效语音内容")
@@ -876,6 +1352,11 @@ def _process_task(
             "media_file": str(media_path),
             "download_mode": download_mode,
             "download_quality": download_quality,
+            "subtitle_source": subtitle_source,
+            "caption_quality": caption_quality,
+            "caption_pipeline_version": CAPTION_PIPELINE_VERSION,
+            "youtube_caption_policy": youtube_caption_policy,
+            "youtube_caption_resegment": youtube_caption_resegment,
             "updated_at": _now(),
         }
         _save_cache(task_id, result)
@@ -891,6 +1372,11 @@ def _process_task(
             media_file=str(media_path),
             download_mode=download_mode,
             download_quality=download_quality,
+            subtitle_source=subtitle_source,
+            caption_quality=caption_quality,
+            caption_pipeline_version=CAPTION_PIPELINE_VERSION,
+            youtube_caption_policy=youtube_caption_policy,
+            youtube_caption_resegment=youtube_caption_resegment,
         )
         if video_url:
             _cleanup_transcribe_only_media(media_path, video_url, task_id, download_mode, keep_video)
@@ -911,10 +1397,15 @@ def _start_background(
     download_mode: str = "video",
     download_quality: str = "best",
     keep_video: bool = True,
+    youtube_caption_policy: str = "auto",
+    youtube_caption_resegment: bool = True,
 ) -> None:
     thread = threading.Thread(
         target=_process_task,
-        args=(task_id, source_path, video_url, language, download_mode, download_quality, keep_video),
+        args=(
+            task_id, source_path, video_url, language, download_mode,
+            download_quality, keep_video, youtube_caption_policy, youtube_caption_resegment,
+        ),
         daemon=True,
     )
     thread.start()
@@ -933,15 +1424,46 @@ def health():
         "device": device,
         "compute_type": compute_type,
         "model_loaded": MODEL is not None,
+        "model_active_leases": MODEL_ACTIVE_LEASES,
         "download_modes": sorted(SUPPORTED_DOWNLOAD_MODES),
+        "youtube_caption_policies": sorted(SUPPORTED_YOUTUBE_CAPTION_POLICIES),
+        "caption_pipeline_version": CAPTION_PIPELINE_VERSION,
     }
 
 
 @app.post("/model/unload")
 @app.post("/models/unload")
 def unload_model(auth: str = Depends(verify_api_key)):
+    with MODEL_LOCK:
+        if MODEL_ACTIVE_LEASES > 0:
+            raise HTTPException(
+                status_code=409,
+                detail={"error_code": "MODEL_IN_USE", "active_leases": MODEL_ACTIVE_LEASES},
+            )
     had_model = _unload_model()
     return {"status": "unloaded", "had_model": had_model}
+
+
+@app.post("/models/load")
+def load_model(request: LoadModelRequest, auth: str = Depends(verify_api_key)):
+    """Warm the configured model so lifecycle leases can be acquired explicitly."""
+    model_id = str(request.model_id or "base").strip()
+    if not model_id:
+        raise HTTPException(status_code=400, detail="model_id is required")
+    if Path(model_id).is_absolute():
+        os.environ["WHISPER_MODEL_PATH"] = model_id
+    else:
+        os.environ.pop("WHISPER_MODEL_PATH", None)
+        os.environ["MODEL_SIZE"] = model_id
+    if request.device:
+        os.environ["DEVICE"] = str(request.device)
+    if request.compute_type:
+        os.environ["COMPUTE_TYPE"] = str(request.compute_type)
+    try:
+        _get_model()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"status": "loaded", "model_id": model_id}
 
 
 @app.post("/transcribe")
@@ -949,13 +1471,20 @@ def transcribe(request: TranscribeRequest, auth: str = Depends(verify_api_key)):
     if not request.video_url:
         raise HTTPException(status_code=400, detail="video_url is required")
     language = _clean_language(request.language)
-    task_id = _task_id_from_url(request.video_url, language)
-    existing = _get_task(task_id)
-    if existing and existing.get("status") in {"pending", "downloading", "transcribing", "completed"}:
-        return existing
     download_mode = _clean_download_mode(request.download_mode)
     download_quality = _clean_download_quality(request.download_quality)
     keep_video = bool(request.keep_video) or download_mode == "video"
+    youtube_caption_policy = _clean_youtube_caption_policy(request.youtube_caption_policy)
+    youtube_caption_resegment = _as_bool(request.youtube_caption_resegment, True)
+    task_id = _task_id_from_url(request.video_url, language)
+    existing = _get_task(task_id)
+    if existing and existing.get("status") in {"pending", "downloading", "transcribing", "completed"}:
+        same_caption_options = (
+            existing.get("youtube_caption_policy", "auto") == youtube_caption_policy
+            and bool(existing.get("youtube_caption_resegment", True)) == youtube_caption_resegment
+        )
+        if same_caption_options:
+            return existing
     _update_task(
         task_id,
         "pending",
@@ -965,8 +1494,13 @@ def transcribe(request: TranscribeRequest, auth: str = Depends(verify_api_key)):
         subtitles=[],
         download_mode=download_mode,
         download_quality=download_quality,
+        youtube_caption_policy=youtube_caption_policy,
+        youtube_caption_resegment=youtube_caption_resegment,
     )
-    _start_background(task_id, None, request.video_url, language, download_mode, download_quality, keep_video)
+    _start_background(
+        task_id, None, request.video_url, language, download_mode,
+        download_quality, keep_video, youtube_caption_policy, youtube_caption_resegment,
+    )
     return {"task_id": task_id, "status": "pending"}
 
 

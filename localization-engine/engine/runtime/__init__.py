@@ -9,6 +9,7 @@ from .model_resources import (
     ModelResourcePolicy,
     ModelState,
 )
+from .local_models import local_translation_definition, qwen3_tts_definition, whisper_definition
 from .monitor import RuntimeMonitor
 from .preflight import PreflightChecker, PreflightIssue, PreflightResult
 
@@ -31,4 +32,7 @@ __all__ = [
     "RuntimeSnapshot",
     "collect_runtime_snapshot",
     "create_gpu_monitor",
+    "local_translation_definition",
+    "qwen3_tts_definition",
+    "whisper_definition",
 ]

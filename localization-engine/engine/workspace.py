@@ -10,7 +10,9 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
+
+from engine.errors import WorkspaceError
 
 logger = logging.getLogger("engine.workspace")
 
@@ -19,6 +21,121 @@ _ENGINE_DIR = Path(__file__).resolve().parent.parent  # localization-engine/
 _PROJECT_ROOT = _ENGINE_DIR.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
+
+
+PathLike = Union[str, os.PathLike]
+MANAGED_DIRECTORIES = ("input", "cache", "output", "logs")
+
+
+class WorkspaceManager:
+    """Own and validate all paths used by one isolated task workspace.
+
+    ``allowed_root`` can be supplied by the service (or through
+    ``V2S_WORKSPACE_ROOT``) to prevent callers from selecting a workspace
+    outside the configured storage tree.  Independently of that outer guard,
+    every path returned by :meth:`resolve` is checked against the task's own
+    workspace, including resolved symlink targets.
+    """
+
+    def __init__(
+        self,
+        workspace_dir: PathLike,
+        *,
+        allowed_root: Optional[PathLike] = None,
+        create: bool = False,
+    ) -> None:
+        if not workspace_dir:
+            raise WorkspaceError("workspace_dir is required")
+
+        configured_root = allowed_root or os.environ.get("V2S_WORKSPACE_ROOT")
+        self._allowed_root = (
+            Path(configured_root).expanduser().resolve()
+            if configured_root
+            else None
+        )
+        workspace = Path(workspace_dir).expanduser().resolve()
+        if self._allowed_root is not None and not self._is_within(
+            self._allowed_root, workspace
+        ):
+            raise WorkspaceError(
+                f"Workspace is outside allowed root: {workspace}",
+                error_code="WORKSPACE_OUTSIDE_ROOT",
+            )
+
+        if create:
+            workspace.mkdir(parents=True, exist_ok=True)
+        if not workspace.exists():
+            raise WorkspaceError(f"Workspace directory does not exist: {workspace}")
+        if not workspace.is_dir():
+            raise WorkspaceError(f"Workspace path is not a directory: {workspace}")
+        self._root = workspace
+
+    @staticmethod
+    def _is_within(base: Path, target: Path) -> bool:
+        try:
+            target.relative_to(base)
+            return True
+        except (ValueError, OSError):
+            return False
+
+    @property
+    def root(self) -> Path:
+        return self._root
+
+    @property
+    def allowed_root(self) -> Optional[Path]:
+        return self._allowed_root
+
+    def ensure(self) -> "WorkspaceManager":
+        for directory in MANAGED_DIRECTORIES:
+            self.resolve(directory).mkdir(parents=True, exist_ok=True)
+        return self
+
+    def resolve(self, *parts: PathLike, must_exist: bool = False) -> Path:
+        if not parts:
+            return self._root
+        relative = Path(*[os.fspath(part) for part in parts])
+        if relative.is_absolute():
+            raise WorkspaceError(
+                f"Absolute paths are not allowed inside a workspace: {relative}",
+                error_code="WORKSPACE_PATH_ESCAPE",
+            )
+        target = (self._root / relative).resolve()
+        if not self._is_within(self._root, target):
+            raise WorkspaceError(
+                f"Path escapes workspace: {relative}",
+                error_code="WORKSPACE_PATH_ESCAPE",
+            )
+        if must_exist and not target.exists():
+            raise WorkspaceError(
+                f"Workspace path does not exist: {target}",
+                error_code="WORKSPACE_PATH_NOT_FOUND",
+            )
+        return target
+
+    def path(self, area: str, *parts: PathLike, must_exist: bool = False) -> Path:
+        if area not in MANAGED_DIRECTORIES:
+            raise WorkspaceError(
+                f"Unknown workspace area: {area}",
+                error_code="WORKSPACE_AREA_INVALID",
+            )
+        return self.resolve(area, *parts, must_exist=must_exist)
+
+    @property
+    def input_dir(self) -> Path:
+        return self.path("input")
+
+    @property
+    def cache_dir(self) -> Path:
+        return self.path("cache")
+
+    @property
+    def output_dir(self) -> Path:
+        return self.path("output")
+
+    @property
+    def logs_dir(self) -> Path:
+        return self.path("logs")
 
 
 def resolve_workspace(workspace_dir: str) -> Path:
@@ -33,19 +150,12 @@ def resolve_workspace(workspace_dir: str) -> Path:
     Raises:
         ValueError: If the path is invalid or not a directory.
     """
-    if not workspace_dir:
-        raise ValueError("workspace_dir is required")
-    ws = Path(workspace_dir).resolve()
-    if not ws.exists():
-        raise ValueError(f"Workspace directory does not exist: {ws}")
-    if not ws.is_dir():
-        raise ValueError(f"Workspace path is not a directory: {ws}")
-    return ws
+    return WorkspaceManager(workspace_dir).root
 
 
 def ensure_log_dir(workspace_dir: Path) -> Path:
     """Ensure the logs subdirectory exists."""
-    log_dir = Path(workspace_dir) / "logs"
+    log_dir = WorkspaceManager(workspace_dir).logs_dir
     log_dir.mkdir(parents=True, exist_ok=True)
     return log_dir
 
@@ -53,7 +163,14 @@ def ensure_log_dir(workspace_dir: Path) -> Path:
 def get_log_path(workspace_dir: Path, name: str = "localization.log") -> Path:
     """Get the path for a log file within the workspace."""
     log_dir = ensure_log_dir(workspace_dir)
-    return log_dir / name
+    manager = WorkspaceManager(workspace_dir)
+    path = manager.resolve("logs", name)
+    if path.parent != log_dir:
+        raise WorkspaceError(
+            f"Log filename must not contain directories: {name}",
+            error_code="WORKSPACE_PATH_ESCAPE",
+        )
+    return path
 
 
 def get_source_subtitle(workspace_dir: Path) -> Optional[Path]:
