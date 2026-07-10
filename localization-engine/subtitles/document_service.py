@@ -163,13 +163,20 @@ class SubtitleDocumentService:
                 )
             except ConcurrentUpdateError as exc:
                 raise SubtitleVersionConflictError(str(exc)) from exc
-            self._promote_document(
+            current_artifact = self._promote_document(
                 manager,
                 saved,
                 f"subtitles/current_v{saved.version}.json",
                 kind="current_subtitle",
                 supersede=True,
             )
+            current_path = (manager.layout.root / str(current_artifact["path"])).resolve()
+            record = self.repository.get(document.task_id)
+            if record is not None:
+                request_payload = dict(record.request_payload or {})
+                request_payload["current_subtitle_path"] = str(current_path)
+                request_payload["current_subtitle_version"] = saved.version
+                self.repository.update(document.task_id, request_payload=request_payload)
             draft_path = manager.resolve("work", "subtitles/draft.json")
             draft_path.unlink(missing_ok=True)
             invalidated = manager.invalidate_stages(self.DOWNSTREAM_STAGES) if invalidate_downstream else 0
