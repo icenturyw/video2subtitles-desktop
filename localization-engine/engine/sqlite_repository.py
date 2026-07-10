@@ -408,6 +408,20 @@ class SQLiteTaskRepository(TaskRepository):
                 conn.execute("UPDATE tasks SET updated_at = ?, version = version + 1 WHERE job_id = ?", (utc_now(), job_id))
             return cursor.rowcount
 
+    def supersede_artifacts(self, job_id: str, kind: str) -> int:
+        """Mark older artifacts of one logical kind as non-current."""
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                "UPDATE task_artifacts SET is_current = 0 WHERE task_id = ? AND kind = ? AND is_current = 1",
+                (job_id, kind),
+            )
+            if cursor.rowcount:
+                conn.execute(
+                    "UPDATE tasks SET updated_at = ?, version = version + 1 WHERE job_id = ?",
+                    (utc_now(), job_id),
+                )
+            return cursor.rowcount
+
     def add_event(
         self,
         job_id: str,
