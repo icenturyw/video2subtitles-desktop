@@ -39,6 +39,7 @@ from tts.sapi_tts import SapiTTSProvider
 from tts.base import TTSAuthError
 from tts.openai_compatible_tts import OpenAICompatibleTTSProvider
 from tts.volcengine_tts import VolcengineDoubaoTTSProvider
+from tts.fish_audio_tts import FishAudioTTSProvider
 
 
 # ---------------------------------------------------------------------------
@@ -628,6 +629,66 @@ class TestOpenAICompatibleTTSProvider:
                 )
 
 
+class TestFishAudioTTSProvider:
+    @patch("tts.fish_audio_tts._get_audio_duration", return_value=1.25)
+    @patch("tts.fish_audio_tts.urllib.request.urlopen")
+    def test_synthesize_posts_v1_tts_with_model_header(
+        self, mock_urlopen, mock_duration, tmp_path
+    ):
+        captured = {}
+        audio_bytes = b"mp3-audio-bytes"
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return audio_bytes
+
+        def fake_urlopen(req, timeout=0):
+            captured["timeout"] = timeout
+            captured["url"] = req.full_url
+            captured["payload"] = json.loads(req.data.decode("utf-8"))
+            headers = {}
+            headers.update(getattr(req, "headers", {}))
+            headers.update(getattr(req, "unredirected_hdrs", {}))
+            captured["headers"] = {str(k).lower(): v for k, v in headers.items()}
+            return FakeResponse()
+
+        mock_urlopen.side_effect = fake_urlopen
+        provider = FishAudioTTSProvider()
+        out_path = tmp_path / "out.mp3"
+
+        result = provider.synthesize(
+            "hello",
+            "zh-CN",
+            "auto",
+            out_path,
+            {
+                "fishApiBase": "https://api.fish.audio/v1/",
+                "fishApiKey": "fish-key",
+                "fishModel": "s2.1-pro-free",
+                "fishFormat": "mp3",
+                "fishSampleRate": 24000,
+                "timeout": 15,
+            },
+        )
+
+        assert captured["url"] == "https://api.fish.audio/v1/tts"
+        assert captured["timeout"] == 15
+        assert captured["headers"]["authorization"] == "Bearer fish-key"
+        assert captured["headers"]["model"] == "s2.1-pro-free"
+        assert captured["payload"]["text"] == "hello"
+        assert captured["payload"]["format"] == "mp3"
+        assert captured["payload"]["sample_rate"] == 24000
+        assert "reference_id" not in captured["payload"]
+        assert out_path.read_bytes() == audio_bytes
+        assert result.duration_seconds == 1.25
+
+
 # ---------------------------------------------------------------------------
 # Engine modules run in a subprocess to avoid namespace conflicts
 # ---------------------------------------------------------------------------
@@ -704,6 +765,22 @@ def test_model_manager_speakers():
     assert "Vivian" in speakers
     assert "Serena" in speakers
     assert "Uncle_Fu" in speakers
+
+
+def test_model_manager_lease_blocks_unload():
+    from engine.model_manager import ModelManager
+    manager = ModelManager()
+    manager._model = object()
+    manager._model_id = "test-model"
+    manager._tokenizer = None
+    with manager.lease():
+        ok, message = manager.unload_model()
+        assert ok is False
+        assert "in use" in message
+        assert manager.active_leases == 1
+    assert manager.active_leases == 0
+    manager._model = None
+    manager._model_id = None
 
 
 def test_voice_clone_module():

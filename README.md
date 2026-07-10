@@ -684,3 +684,6 @@ video_2_subtitles/
 ## 许可 / License
 
 MIT
+## Phase 3：交互体验与本地资源智能管理
+
+当前版本已加入运行能力/资源监控、任务 Preflight、本地模型 lease、TTS 试听与语音预设、字幕草稿/修订/时间轴编辑、下游产物失效重生成，以及任务运行详情和安全错误指导。架构、migration、API、测试结果与人工验收步骤见 [Phase 3 说明](docs/phase3-interaction-resource-management.md)。
