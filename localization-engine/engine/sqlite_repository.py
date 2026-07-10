@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import sqlite3
 import threading
@@ -9,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence
 
 from engine.repository import TaskPage, TaskQuery, TaskRecord, TaskRepository, utc_now
+from engine.stages import STAGE_BY_NAME
 
 
 SCHEMA_VERSION = 1
@@ -288,7 +290,7 @@ class SQLiteTaskRepository(TaskRepository):
             return self.get(job_id)
         updates["updated_at"] = utc_now()
         with self.transaction() as conn:
-            current = conn.execute("SELECT version FROM tasks WHERE job_id = ?", (job_id,)).fetchone()
+            current = conn.execute("SELECT * FROM tasks WHERE job_id = ?", (job_id,)).fetchone()
             if current is None:
                 return None
             version = int(current["version"] if expected_version is None else expected_version)
@@ -299,6 +301,7 @@ class SQLiteTaskRepository(TaskRepository):
             )
             if cursor.rowcount != 1:
                 raise ConcurrentUpdateError(f"Task {job_id} version changed from {version}")
+            self._track_stage_transition(conn, current, updates)
             row = conn.execute("SELECT * FROM tasks WHERE job_id = ?", (job_id,)).fetchone()
             return self._row_to_record(row, self._artifact_rows(conn, job_id))
 
@@ -360,19 +363,37 @@ class SQLiteTaskRepository(TaskRepository):
             task = db.execute("SELECT current_stage FROM tasks WHERE job_id = ?", (job_id,)).fetchone()
             if task is None:
                 raise RepositoryError(f"Task not found: {job_id}")
+            resolved_stage_run_id = stage_run_id
+            if resolved_stage_run_id is None:
+                active = db.execute(
+                    "SELECT id FROM task_stage_runs WHERE task_id = ? AND status = 'running' ORDER BY id DESC LIMIT 1",
+                    (job_id,),
+                ).fetchone()
+                resolved_stage_run_id = int(active["id"]) if active else None
             cursor = db.execute(
                 """INSERT INTO task_artifacts(
                     task_id, stage_run_id, stage, kind, path, language, size_bytes,
                     checksum, metadata, is_current, created_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    job_id, stage_run_id, str(artifact.get("stage") or task["current_stage"]),
+                    job_id, resolved_stage_run_id, str(artifact.get("stage") or task["current_stage"]),
                     str(artifact.get("kind") or "unknown"), str(artifact.get("path") or ""),
                     str(artifact.get("language") or ""), int(artifact.get("size_bytes") or 0),
                     str(artifact.get("checksum") or artifact.get("sha256") or ""),
                     self._json_dump(artifact.get("metadata") or {}), int(bool(is_current)), utc_now(),
                 ),
             )
+            if resolved_stage_run_id is not None:
+                run = db.execute(
+                    "SELECT output_artifacts FROM task_stage_runs WHERE id = ?",
+                    (resolved_stage_run_id,),
+                ).fetchone()
+                output_ids = self._json_load(run["output_artifacts"], []) if run else []
+                output_ids.append(int(cursor.lastrowid))
+                db.execute(
+                    "UPDATE task_stage_runs SET output_artifacts = ? WHERE id = ?",
+                    (self._json_dump(output_ids), resolved_stage_run_id),
+                )
             db.execute("UPDATE tasks SET updated_at = ?, version = version + 1 WHERE job_id = ?", (utc_now(), job_id))
             return int(cursor.lastrowid)
         if conn is not None:
@@ -450,6 +471,148 @@ class SQLiteTaskRepository(TaskRepository):
                     "id": row["id"], "event_type": row["event_type"],
                     "message": row["message"], "payload": self._json_load(row["payload"], {}),
                     "created_at": row["created_at"],
+                }
+                for row in rows
+            ]
+
+    def _stage_fingerprints(
+        self, conn: sqlite3.Connection, job_id: str, stage: str
+    ) -> tuple[str, str]:
+        task = conn.execute(
+            "SELECT request_payload FROM tasks WHERE job_id = ?", (job_id,)
+        ).fetchone()
+        request = self._json_load(task["request_payload"], {}) if task else {}
+        config_keys = STAGE_BY_NAME.get(stage).config_keys if stage in STAGE_BY_NAME else ()
+        config = {key: request.get(key) for key in config_keys}
+        config_fingerprint = hashlib.sha256(
+            self._json_dump(config).encode("utf-8")
+        ).hexdigest()
+        inputs = [
+            {"kind": row["kind"], "path": row["path"], "checksum": row["checksum"]}
+            for row in conn.execute(
+                "SELECT kind, path, checksum FROM task_artifacts WHERE task_id = ? AND is_current = 1 AND stage != ? ORDER BY id",
+                (job_id, stage),
+            )
+        ]
+        input_fingerprint = hashlib.sha256(
+            self._json_dump({"config": config, "artifacts": inputs}).encode("utf-8")
+        ).hexdigest()
+        return input_fingerprint, config_fingerprint
+
+    def _begin_stage_run_tx(self, conn: sqlite3.Connection, job_id: str, stage: str) -> int:
+        active = conn.execute(
+            "SELECT id FROM task_stage_runs WHERE task_id = ? AND status = 'running' ORDER BY id DESC LIMIT 1",
+            (job_id,),
+        ).fetchone()
+        if active:
+            return int(active["id"])
+        attempt = int(conn.execute(
+            "SELECT COALESCE(MAX(attempt), 0) + 1 FROM task_stage_runs WHERE task_id = ? AND stage = ?",
+            (job_id, stage),
+        ).fetchone()[0])
+        input_fingerprint, config_fingerprint = self._stage_fingerprints(conn, job_id, stage)
+        cursor = conn.execute(
+            """INSERT INTO task_stage_runs(
+                task_id, stage, attempt, status, started_at,
+                input_fingerprint, config_fingerprint, output_artifacts
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, '[]')""",
+            (job_id, stage, attempt, utc_now(), input_fingerprint, config_fingerprint),
+        )
+        return int(cursor.lastrowid)
+
+    def _finish_active_run_tx(
+        self,
+        conn: sqlite3.Connection,
+        job_id: str,
+        status: str,
+        *,
+        error_code: Optional[str] = None,
+        error_detail: Optional[str] = None,
+    ) -> Optional[int]:
+        active = conn.execute(
+            "SELECT id FROM task_stage_runs WHERE task_id = ? AND status = 'running' ORDER BY id DESC LIMIT 1",
+            (job_id,),
+        ).fetchone()
+        if not active:
+            return None
+        conn.execute(
+            "UPDATE task_stage_runs SET status = ?, finished_at = ?, error_code = ?, error_detail = ? WHERE id = ?",
+            (status, utc_now(), error_code, error_detail, active["id"]),
+        )
+        return int(active["id"])
+
+    def _track_stage_transition(
+        self, conn: sqlite3.Connection, current: sqlite3.Row, updates: Dict[str, Any]
+    ) -> None:
+        job_id = current["job_id"]
+        old_status = current["status"]
+        old_stage = current["current_stage"]
+        new_status = str(updates.get("status", old_status))
+        new_stage = str(updates.get("current_stage", old_stage))
+        if old_status == "running" and new_stage != old_stage:
+            terminal = "cancelled" if new_status == "cancelled" else "completed"
+            self._finish_active_run_tx(conn, job_id, terminal)
+        if new_status == "running" and new_stage in STAGE_BY_NAME:
+            self._begin_stage_run_tx(conn, job_id, new_stage)
+        elif new_status in {"error", "failed"}:
+            self._finish_active_run_tx(
+                conn, job_id, "failed",
+                error_code=updates.get("error_code"),
+                error_detail=updates.get("error_detail") or updates.get("message"),
+            )
+        elif new_status in {"cancelled", "interrupted", "paused"}:
+            self._finish_active_run_tx(
+                conn, job_id, "interrupted" if new_status in {"interrupted", "paused"} else "cancelled",
+                error_code=updates.get("error_code"),
+                error_detail=updates.get("error_detail") or updates.get("message"),
+            )
+        elif new_status == "completed":
+            self._finish_active_run_tx(conn, job_id, "completed")
+
+    def begin_stage_run(self, job_id: str, stage: str) -> int:
+        if stage not in STAGE_BY_NAME:
+            raise ValueError(f"Unknown pipeline stage: {stage}")
+        with self.transaction() as conn:
+            run_id = self._begin_stage_run_tx(conn, job_id, stage)
+            conn.execute(
+                "UPDATE tasks SET status = 'running', current_stage = ?, updated_at = ?, version = version + 1 WHERE job_id = ?",
+                (stage, utc_now(), job_id),
+            )
+            return run_id
+
+    def finish_stage_run(
+        self,
+        run_id: int,
+        status: str,
+        *,
+        error_code: Optional[str] = None,
+        error_detail: Optional[str] = None,
+    ) -> None:
+        if status not in {"completed", "failed", "cancelled", "interrupted"}:
+            raise ValueError(f"Invalid stage run status: {status}")
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                """UPDATE task_stage_runs SET status = ?, finished_at = ?,
+                   error_code = ?, error_detail = ? WHERE id = ? AND status = 'running'""",
+                (status, utc_now(), error_code, error_detail, run_id),
+            )
+            if cursor.rowcount != 1:
+                raise RepositoryError(f"Stage run is not active: {run_id}")
+
+    def list_stage_runs(self, job_id: str) -> List[Dict[str, Any]]:
+        with self.transaction(immediate=False) as conn:
+            rows = conn.execute(
+                "SELECT * FROM task_stage_runs WHERE task_id = ? ORDER BY id", (job_id,)
+            )
+            return [
+                {
+                    "id": row["id"], "stage": row["stage"], "attempt": row["attempt"],
+                    "status": row["status"], "started_at": row["started_at"],
+                    "finished_at": row["finished_at"], "error_code": row["error_code"],
+                    "error_detail": row["error_detail"],
+                    "input_fingerprint": row["input_fingerprint"],
+                    "config_fingerprint": row["config_fingerprint"],
+                    "output_artifacts": self._json_load(row["output_artifacts"], []),
                 }
                 for row in rows
             ]
