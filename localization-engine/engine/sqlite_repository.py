@@ -665,6 +665,42 @@ class SQLiteTaskRepository(TaskRepository):
             ).fetchone()
             return str(row["run_lock_token"]) if row and row["run_lock_token"] else None
 
+    def recover_interrupted(self) -> int:
+        """Atomically pause tasks left in-flight by a previous process."""
+        with self.transaction() as conn:
+            rows = conn.execute(
+                "SELECT job_id, current_stage FROM tasks WHERE status IN ('running', 'pending')"
+            ).fetchall()
+            for row in rows:
+                job_id = row["job_id"]
+                self._finish_active_run_tx(
+                    conn,
+                    job_id,
+                    "interrupted",
+                    error_code="PROCESS_INTERRUPTED",
+                    error_detail="Application stopped before the pipeline stage completed",
+                )
+                conn.execute(
+                    """UPDATE tasks SET status = 'interrupted',
+                       message = ?, error_code = 'PROCESS_INTERRUPTED',
+                       error_detail = ?, updated_at = ?, version = version + 1,
+                       run_lock_token = NULL, run_lock_at = NULL
+                       WHERE job_id = ?""",
+                    (
+                        "Previous process ended unexpectedly; retry the current stage to continue",
+                        "Application stopped before the pipeline stage completed",
+                        utc_now(), job_id,
+                    ),
+                )
+                self.add_event(
+                    job_id,
+                    "PROCESS_INTERRUPTED",
+                    f"Recovered interrupted stage {row['current_stage']}",
+                    {"stage": row["current_stage"], "recovery": "startup"},
+                    conn=conn,
+                )
+            return len(rows)
+
     def pragma_settings(self) -> Dict[str, Any]:
         """Expose effective settings for diagnostics and tests."""
         conn = self._connect()

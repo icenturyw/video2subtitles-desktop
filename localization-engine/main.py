@@ -87,8 +87,10 @@ async def lifespan(application: FastAPI):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     repository = SQLiteTaskRepository(DATA_DIR)
     migration = migrate_tasks_json(repository)
+    recovered = repository.recover_interrupted()
     _state["task_store"] = repository
     _state["json_migration"] = migration
+    _state["recovered_tasks"] = recovered
     _state["progress"] = ProgressTracker()
     _state["cancellation"] = CancellationRegistry()
     logger.info(
@@ -484,6 +486,20 @@ def retry_failed_stage(job_id: str):
 @app.post("/jobs/{job_id}/rerun")
 def rerun_job(job_id: str):
     return retry_job(job_id, RetryRequest(from_stage="all"))
+
+
+@app.post("/jobs/{job_id}/resume")
+def resume_job(job_id: str):
+    """Continue an interrupted task by safely rerunning its current stage."""
+    rec = _store().get(job_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    if rec.status not in {"interrupted", "paused"}:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Job is {rec.status}; only interrupted tasks can be resumed",
+        )
+    return retry_job(job_id, RetryRequest(from_stage=rec.stage))
 
 
 @app.get("/jobs/{job_id}/logs", response_model=LogResponse)
