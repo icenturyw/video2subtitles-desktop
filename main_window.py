@@ -8,11 +8,12 @@ from pathlib import Path
 
 from PyQt5.QtCore import (
     Qt, QObject, QThread, pyqtSignal, QTimer, QSize, QRectF,
-    QPropertyAnimation, QEasingCurve, pyqtProperty, QKeySequence,
+    QPropertyAnimation, QEasingCurve, pyqtProperty,
 )
 from PyQt5.QtGui import (
     QFont, QColor, QPalette, QIcon, QPixmap, QPainter, QPen,
-    QLinearGradient, QBrush, QCursor, QTextCursor, QFontDatabase
+    QLinearGradient, QBrush, QCursor, QTextCursor, QFontDatabase,
+    QKeySequence,
 )
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -38,9 +39,21 @@ from subtitle_utils import (
     sanitize_filename,
 )
 from localization_client import LocalizationClient
-from client_settings import get_effective_settings
+from client_settings import get_effective_settings, save_settings
 from process_utils import hidden_subprocess_kwargs
+from output_layout import resolve_existing_layout
 from ui.localization_dialog import LocalizationDialog, localization_runtime_config
+from ui.runtime_dashboard import RuntimeDashboardDialog
+from ui.subtitle_timeline_dialog import SubtitleTimelineDialog
+from ui.tts_preview_dialog import TTSPreviewDialog
+from ui.task_runtime_dialog import TaskRuntimeDialog
+from core.task_state import (
+    build_task_display,
+    normalize_task_stage,
+    normalize_task_status,
+    stage_to_ui_text,
+    status_to_ui_text,
+)
 
 
 THEME = {
@@ -140,6 +153,23 @@ def apply_theme(app):
         QPushButton#btn_icon:hover {{
             background-color: {THEME["bg_hover"]};
             border-color: {THEME["accent"]};
+        }}
+        QPushButton#btn_caption_source {{
+            background-color: {THEME["bg_light"]};
+            color: {THEME["text_primary"]};
+            border: 1px solid {THEME["border"]};
+            text-align: left;
+            padding: 8px 14px;
+            font-weight: 700;
+        }}
+        QPushButton#btn_caption_source:hover {{
+            background-color: {THEME["bg_hover"]};
+            border-color: {THEME["accent"]};
+        }}
+        QPushButton#btn_caption_source:checked {{
+            background-color: {THEME["accent_dark"]};
+            color: white;
+            border-color: {THEME["accent_hover"]};
         }}
         QListWidget {{
             background-color: {THEME["bg_medium"]};
@@ -366,8 +396,11 @@ class VideoItemWidget(QWidget):
         self.is_url = is_url
         self.title = title
         self.status = "pending"
+        self.stage = ""
         self.progress = 0
         self.message = ""
+        self.error_code = ""
+        self.error_detail = ""
         self.subtitles = None
         self._setup_ui()
 
@@ -424,6 +457,12 @@ class VideoItemWidget(QWidget):
         status_layout.addStretch()
         info_layout.addLayout(status_layout)
 
+        self.message_label = QLabel("")
+        self.message_label.setWordWrap(False)
+        self.message_label.setStyleSheet(f"font-size: 11px; color: {THEME['text_secondary']};")
+        self.message_label.setVisible(False)
+        info_layout.addWidget(self.message_label)
+
         layout.addLayout(info_layout, 1)
 
         progress_layout = QVBoxLayout()
@@ -447,79 +486,88 @@ class VideoItemWidget(QWidget):
         self.update_status("pending")
 
     def update_icon(self):
-        if self.is_url:
-            status_icons = {
-                "pending": "🔗",
-                "queued": "⏳",
-                "downloading": "⬇️",
-                "processing": "🔄",
-                "completed": "✅",
-                "error": "❌",
-                "cancelled": "⏹",
-                "cached": "📦",
-            }
-        else:
-            status_icons = {
-                "pending": "🎬",
-                "queued": "⏳",
-                "downloading": "⬇️",
-                "processing": "🔄",
-                "completed": "✅",
-                "error": "❌",
-                "cancelled": "⏹",
-                "cached": "📦",
-            }
-        self.icon_label.setText(status_icons.get(self.status, "🔗" if self.is_url else "🎬"))
+        display = build_task_display(
+            self.status,
+            self.stage,
+            self.progress,
+            self.message,
+            self.error_code,
+            self.error_detail,
+            is_url=self.is_url,
+        )
+        self.icon_label.setText(str(display["icon"]))
 
-    def update_status(self, status, progress=0, message=""):
-        self.status = status
-        self.progress = progress
+    def update_status(
+        self,
+        status,
+        progress=0,
+        message="",
+        stage="",
+        error_code="",
+        error_detail="",
+    ):
+        self.status = normalize_task_status(status)
+        self.stage = normalize_task_stage(stage, status=status)
+        try:
+            self.progress = max(0, min(100, int(float(progress))))
+        except (TypeError, ValueError):
+            self.progress = 0
         if message:
-            self.message = message
+            self.message = str(message)
+        if error_code:
+            self.error_code = str(error_code)
+        elif self.status != "failed":
+            self.error_code = ""
+        if error_detail:
+            self.error_detail = str(error_detail)
+        elif self.status != "failed":
+            self.error_detail = ""
 
-        status_colors = {
-            "pending": THEME["text_muted"],
-            "queued": THEME["info"],
-            "downloading": THEME["warning"],
-            "processing": THEME["accent"],
-            "completed": THEME["success"],
-            "error": THEME["error"],
-            "cancelled": THEME["text_muted"],
-            "cached": THEME["warning"],
-        }
-        status_texts = {
-            "pending": "等待处理",
-            "queued": "排队中",
-            "downloading": "下载中",
-            "processing": "处理中",
-            "completed": "已完成",
-            "error": "失败",
-            "cancelled": "已取消",
-            "cached": "从缓存加载",
-        }
+        display = build_task_display(
+            self.status,
+            self.stage,
+            self.progress,
+            self.message,
+            self.error_code,
+            self.error_detail,
+            is_url=self.is_url,
+        )
+        color = THEME.get(str(display["color_key"]), THEME["text_muted"])
+        self.status_label.setText(str(display["title"]))
+        self.status_label.setStyleSheet(f"font-size: 11px; color: {color}; font-weight: 600;")
 
-        color = status_colors.get(status, THEME["text_muted"])
-        text = message or status_texts.get(status, status)
+        subtitle = str(display.get("subtitle") or "")
+        if subtitle:
+            self.message_label.setText(subtitle)
+            self.message_label.setToolTip(self.error_detail or self.message or subtitle)
+            self.message_label.setVisible(True)
+        else:
+            self.message_label.clear()
+            self.message_label.setVisible(False)
 
-        self.status_label.setText(text)
-        self.status_label.setStyleSheet(f"font-size: 11px; color: {color}; font-weight: 500;")
-
-        self.progress_bar.setValue(int(progress))
-        self.pct_label.setText(f"{int(progress)}%")
+        self.progress_bar.setValue(int(display["progress"]))
+        self.pct_label.setText(str(display["progress_text"]))
 
         self.update_icon()
 
-        if status == "completed":
+        if self.status == "completed":
             self.progress_bar.setStyleSheet(f"""
                 QProgressBar::chunk {{
                     background-color: {THEME["success"]};
                     border-radius: 4px;
                 }}
             """)
-        elif status == "error":
+        elif self.status == "failed":
             self.progress_bar.setStyleSheet(f"""
                 QProgressBar::chunk {{
                     background-color: {THEME["error"]};
+                    border-radius: 4px;
+                }}
+            """)
+        elif self.status == "interrupted":
+            self.progress_bar.setStyleSheet(f"""
+                QProgressBar::chunk {{
+                    background-color: {THEME["warning"]};
                     border-radius: 4px;
                 }}
             """)
@@ -1269,7 +1317,8 @@ class ChatGPTPackageWorker(QThread):
                 return
 
             self._emit_progress("正在准备 ChatGPT 包目录...", 8)
-            package_dir = self.output_dir / "chatgpt_package"
+            layout = resolve_existing_layout(self.output_dir, create_dirs=True)
+            package_dir = layout.chatgpt_package_dir
             frames_dir = package_dir / "frames"
             package_dir.mkdir(parents=True, exist_ok=True)
             frames_dir.mkdir(parents=True, exist_ok=True)
@@ -1401,10 +1450,11 @@ class ChatGPTPackageWorker(QThread):
 
 
 class LocalizationWorker(QThread):
-    progress_updated = pyqtSignal(str, int, str, str)
+    progress_updated = pyqtSignal(str, int, str, str, str)  # file_path, progress, message, status, stage
     job_started = pyqtSignal(str, str)
     task_completed = pyqtSignal(str, str)
-    task_error = pyqtSignal(str, str, str, str)  # file_path, error_code, message, error_detail
+    task_error = pyqtSignal(str, str, str, str, str)  # file_path, error_code, message, error_detail, stage
+    preflight_confirmation = pyqtSignal(object)
 
     def __init__(self, file_path, srt_path, source_video, config, output_dir,
                  retry_job_id="", retry_from_stage=""):
@@ -1428,8 +1478,8 @@ class LocalizationWorker(QThread):
                 daemon=True,
             ).start()
 
-    def _emit_error(self, code: str = "", message: str = "", detail: str = ""):
-        self.task_error.emit(self.file_path, str(code or ""), str(message or ""), str(detail or ""))
+    def _emit_error(self, code: str = "", message: str = "", detail: str = "", stage: str = "error"):
+        self.task_error.emit(self.file_path, str(code or ""), str(message or ""), str(detail or ""), str(stage or "error"))
 
     def _resolve_output_srt(self, workspace: Path, final: dict) -> Path | None:
         target_lang = str(self.config.get("target_language", "zh-CN") or "zh-CN")
@@ -1481,18 +1531,64 @@ class LocalizationWorker(QThread):
 
         return None
 
+    def _cleanup_workspace(self, workspace: Path, layout, success: bool):
+        """Copy useful logs out of .work and apply the configured cleanup policy."""
+        import shutil
+
+        try:
+            logs_dir = workspace / "logs"
+            if logs_dir.exists():
+                layout.logs_dir.mkdir(parents=True, exist_ok=True)
+                for item in logs_dir.iterdir():
+                    if item.is_file():
+                        try:
+                            shutil.copy2(str(item), str(layout.logs_dir / item.name))
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+        if not success:
+            return
+        try:
+            policy = str(get_effective_settings().get("output_cleanup_policy", "tidy") or "tidy").strip().lower()
+        except Exception:
+            policy = "tidy"
+        if policy == "keep_all":
+            return
+        if policy == "minimal":
+            try:
+                shutil.rmtree(str(workspace), ignore_errors=True)
+            except Exception:
+                pass
+            return
+        # tidy: keep checkpoints/logs/translation/audio roots, remove noisy temp chunks.
+        for relative in ("temp", "audio_chunks", "audio/chunks"):
+            try:
+                shutil.rmtree(str(workspace / relative), ignore_errors=True)
+            except Exception:
+                pass
+        for pattern in ("*.partial", "*.tmp", "*.temp"):
+            try:
+                for item in workspace.rglob(pattern):
+                    if item.is_file():
+                        item.unlink(missing_ok=True)
+            except Exception:
+                pass
+
     def run(self):
         try:
-            self.progress_updated.emit(self.file_path, 0, "准备本地化工作空间...", "processing")
+            self.progress_updated.emit(self.file_path, 0, "准备本地化工作空间...", "running", "prepare")
             if self._cancelled:
                 return
 
-            workspace = self.srt_path.parent / "localization_workspace"
+            layout = resolve_existing_layout(self.srt_path, create_dirs=True)
+            workspace = layout.work_dir
             for d in ["source", "subtitles", "translation", "rendered", "audio", "audio/tts", "checkpoints", "logs", "temp"]:
                 (workspace / d).mkdir(parents=True, exist_ok=True)
 
             if self._job_id and self._retry_from_stage:
-                self.progress_updated.emit(self.file_path, 5, "连接本地化引擎...", "processing")
+                self.progress_updated.emit(self.file_path, 5, "连接本地化引擎...", "running", "prepare")
                 if not self._client.health_check():
                     self._emit_error(message="本地化引擎未启动，请先启动服务")
                     return
@@ -1500,7 +1596,7 @@ class LocalizationWorker(QThread):
                     self._client.cancel_job(self._job_id)
                     return
 
-                self.progress_updated.emit(self.file_path, 10, "提交阶段重试任务...", "processing")
+                self.progress_updated.emit(self.file_path, 10, "提交阶段重试任务...", "running", self._retry_from_stage or "prepare")
                 result = self._client.retry_job(self._job_id, self._retry_from_stage)
                 if "error" in result:
                     if not self._cancelled:
@@ -1509,8 +1605,8 @@ class LocalizationWorker(QThread):
                 self.job_started.emit(self.file_path, self._job_id)
                 final = self._client.wait_for_result(
                     self._job_id,
-                    progress_callback=lambda p, m, s: self.progress_updated.emit(
-                        self.file_path, int(p), str(m or ""), str(s or "processing")
+                    progress_callback=lambda p, m, s, st="": self.progress_updated.emit(
+                        self.file_path, int(p), str(m or ""), str(s or "running"), str(st or self._retry_from_stage or "")
                     ),
                     poll_interval=1.0,
                     cancel_checker=lambda: self._cancelled,
@@ -1538,22 +1634,22 @@ class LocalizationWorker(QThread):
             if self._cancelled:
                 return
 
-            self.progress_updated.emit(self.file_path, 5, "连接本地化引擎...", "processing")
+            self.progress_updated.emit(self.file_path, 5, "连接本地化引擎...", "running", "prepare")
             if not self._client.health_check():
                 self._emit_error(message="本地化引擎未启动，请先启动服务")
                 return
             if self._cancelled:
                 return
 
-            self.progress_updated.emit(self.file_path, 8, "释放 Whisper 显存，准备翻译/配音...", "processing")
+            self.progress_updated.emit(self.file_path, 8, "释放 Whisper 显存，准备翻译/配音...", "running", "prepare")
             try:
                 WhisperApiClient().unload_model()
             except Exception:
                 pass
 
-            self.progress_updated.emit(self.file_path, 10, "提交翻译任务...", "processing")
+            self.progress_updated.emit(self.file_path, 10, "提交翻译任务...", "running", "translate")
             cfg = self.config
-            result = self._client.create_job(
+            create_kwargs = dict(
                 workspace_dir=str(workspace),
                 source_video=str(raw_video),
                 source_subtitle=str(source_sub),
@@ -1575,6 +1671,27 @@ class LocalizationWorker(QThread):
                 tts_preset_id=cfg.get("tts_preset_id", ""),
                 tts_preset_name=cfg.get("tts_preset_name", ""),
             )
+            result = self._client.create_job(**create_kwargs)
+
+            if result.get("error_code") == "PREFLIGHT_CONFIRMATION_REQUIRED":
+                confirmation = {
+                    "event": threading.Event(),
+                    "accepted": False,
+                    "preflight": result.get("preflight") or {},
+                }
+                self.preflight_confirmation.emit(confirmation)
+                confirmation["event"].wait(300)
+                if self._cancelled or not confirmation.get("accepted"):
+                    self._emit_error(
+                        code="PREFLIGHT_CONFIRMATION_REQUIRED",
+                        message="用户未确认 Preflight 警告，任务未启动",
+                        stage="prepare",
+                    )
+                    return
+                result = self._client.create_job(
+                    **create_kwargs,
+                    confirm_preflight_warnings=True,
+                )
 
             if "error" in result:
                 if not self._cancelled:
@@ -1591,8 +1708,8 @@ class LocalizationWorker(QThread):
                 self._client.cancel_job(self._job_id)
                 return
 
-            def on_progress(p, m, s):
-                self.progress_updated.emit(self.file_path, int(p), str(m or ""), str(s or "processing"))
+            def on_progress(p, m, s, stage=""):
+                self.progress_updated.emit(self.file_path, int(p), str(m or ""), str(s or "running"), str(stage or ""))
 
             final = self._client.wait_for_result(
                 self._job_id,
@@ -1616,19 +1733,35 @@ class LocalizationWorker(QThread):
         if status == "completed":
             output_srt = self._resolve_output_srt(workspace, final)
             if output_srt and output_srt.exists():
-                dst = self.srt_path.parent / f"{self.srt_path.stem}_translated.srt"
+                layout = resolve_existing_layout(self.srt_path, create_dirs=True)
+                target_lang = str(self.config.get("target_language", "zh-CN") or "zh-CN")
+                safe_lang = re.sub(r"[^A-Za-z0-9_.-]", "_", target_lang) or "translated"
+                dst = layout.subtitles_dir / f"{self.srt_path.stem}_{safe_lang}_translated.srt"
                 shutil.copy2(str(output_srt), str(dst))
+                # Promote rendered media artifacts to the user-facing media/ folder.
+                for rendered in sorted((workspace / "rendered").glob("*")):
+                    if rendered.is_file() and rendered.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v"}:
+                        try:
+                            shutil.copy2(str(rendered), str(layout.media_dir / rendered.name))
+                        except Exception:
+                            pass
+                self._cleanup_workspace(workspace, layout, True)
                 self.task_completed.emit(self.file_path, str(dst))
             else:
+                layout = resolve_existing_layout(self.srt_path, create_dirs=True)
+                self._cleanup_workspace(workspace, layout, True)
                 self.task_completed.emit(self.file_path, "")
         elif status == "cancelled":
             pass
         else:
+            layout = resolve_existing_layout(self.srt_path, create_dirs=True)
+            self._cleanup_workspace(workspace, layout, False)
             self.task_error.emit(
                 self.file_path,
                 final.get("error_code", ""),
                 final.get("message", "处理失败"),
                 final.get("error_detail", ""),
+                final.get("stage", "error"),
             )
 
 
@@ -1645,9 +1778,58 @@ class MainWindow(QMainWindow):
         self._localization_workers = {}
         self.output_dir = Path(WHISPER_SERVER) / "output" if WHISPER_SERVER.exists() else Path.cwd() / "output"
         self.history = HistoryManager(self.output_dir / "history.json")
+        self.history.interrupt_running_tasks()
         self._setup_ui()
         self._refresh_localization_config_from_settings()
         self._check_server()
+
+    def closeEvent(self, event):
+        package_running = bool(self.package_worker and self.package_worker.isRunning())
+        if package_running:
+            QMessageBox.warning(
+                self,
+                "任务正在运行",
+                "ChatGPT 分析包仍在生成中，请等待完成或失败后再关闭窗口。",
+            )
+            event.ignore()
+            return
+
+        active_workers = []
+        if self.worker and self.worker.isRunning():
+            active_workers.append(self.worker)
+        active_workers.extend(
+            worker for worker in self._localization_workers.values()
+            if worker and worker.isRunning()
+        )
+
+        if active_workers:
+            reply = QMessageBox.question(
+                self,
+                "确认退出",
+                "当前仍有任务在运行，退出会取消这些任务。确定要关闭窗口吗？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                event.ignore()
+                return
+
+            self._stopped = True
+            if self.worker and self.worker.isRunning():
+                self.worker.stop()
+                self.worker.wait(5000)
+            for path, data in self.video_items.items():
+                widget = data.get("widget")
+                if widget and widget.status in ("queued", "running", "pending"):
+                    self.history.cancel_task(path, "应用关闭，任务已取消", progress=widget.progress)
+            for worker in list(self._localization_workers.values()):
+                if worker and worker.isRunning():
+                    worker.stop()
+                    worker.wait(5000)
+            self._localization_workers.clear()
+            self._localization_worker = None
+
+        super().closeEvent(event)
 
     def _setup_ui(self):
         self.setWindowTitle("Video2Subtitles - 视频字幕生成")
@@ -1724,6 +1906,20 @@ class MainWindow(QMainWindow):
         self.localize_btn.setCursor(QCursor(Qt.PointingHandCursor))
         self.localize_btn.clicked.connect(self._show_localization_dialog)
         layout.addWidget(self.localize_btn)
+
+        runtime_btn = QPushButton("资源")
+        runtime_btn.setObjectName("btn_secondary")
+        runtime_btn.setFixedHeight(36)
+        runtime_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        runtime_btn.clicked.connect(self._show_runtime_dashboard)
+        layout.addWidget(runtime_btn)
+
+        preview_btn = QPushButton("语音试听")
+        preview_btn.setObjectName("btn_secondary")
+        preview_btn.setFixedHeight(36)
+        preview_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        preview_btn.clicked.connect(self._show_tts_preview)
+        layout.addWidget(preview_btn)
 
         settings_btn = QPushButton("⚙")
         settings_btn.setObjectName("btn_icon")
@@ -1854,6 +2050,15 @@ class MainWindow(QMainWindow):
         step2 = QLabel("② 开始处理")
         step2.setStyleSheet(f"font-size: 14px; font-weight: 800; color: {THEME['accent']};")
         action_layout.addWidget(step2)
+
+        self.source_subtitles_btn = QPushButton()
+        self.source_subtitles_btn.setObjectName("btn_caption_source")
+        self.source_subtitles_btn.setCheckable(True)
+        self.source_subtitles_btn.setFixedHeight(38)
+        self.source_subtitles_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self.source_subtitles_btn.toggled.connect(self._on_source_subtitles_toggled)
+        self._sync_source_subtitles_button_from_settings()
+        action_layout.addWidget(self.source_subtitles_btn)
 
         self.start_btn = QPushButton("▶ 开始生成字幕")
         self.start_btn.setFixedHeight(46)
@@ -2013,32 +2218,33 @@ class MainWindow(QMainWindow):
             entry = self.history.get(p)
             if entry:
                 self.video_items[p]["localization_job_id"] = entry.get("job_id", "")
-                saved_status = entry.get("status", "")
+                saved_status = normalize_task_status(entry.get("status", ""))
+                saved_stage = normalize_task_stage(entry.get("stage", ""), status=entry.get("status", ""))
                 saved_progress = entry.get("progress", 0)
                 saved_message = entry.get("message", "")
                 subs = self.history.get_subtitles(p)
                 if subs:
                     widget.subtitles = subs
-                    out_dir = entry.get("output_dir") or ""
-                    if saved_status == "error":
-                        msg = saved_message or "上次处理出错"
-                        widget.update_status("error", 0, msg[:80])
-                    elif saved_status == "cancelled":
-                        msg = "上次已取消"
-                        widget.update_status("cancelled", 0, msg)
-                    elif saved_status in ("processing", "pending"):
-                        msg = "⚠ 未完成 (可重新处理)"
-                        widget.update_status("interrupted", saved_progress or 0, msg)
-                    else:
-                        msg = f"✅ 已有字幕 ({entry.get('language', '?')})"
-                        if out_dir:
-                            msg += f" · {Path(out_dir).name}"
-                        widget.update_status("completed", 100, msg)
-                elif saved_status == "error":
-                    widget.update_status("error", 0, (saved_message or "上次处理出错")[:80])
-                else:
+                out_dir = entry.get("output_dir") or ""
+                if saved_status == "failed":
+                    widget.update_status(
+                        "failed", saved_progress or 0, saved_message or "上次处理出错",
+                        saved_stage, entry.get("error_code", ""), entry.get("error_detail", "")
+                    )
+                elif saved_status == "cancelled":
+                    widget.update_status("cancelled", saved_progress or 0, saved_message or "上次已取消", saved_stage)
+                elif saved_status in ("pending", "queued", "running", "interrupted"):
+                    widget.update_status("interrupted", saved_progress or 0, saved_message or "上次任务未正常结束，可重新处理", saved_stage)
+                elif saved_status == "completed" and subs:
+                    msg = f"已有字幕 ({entry.get('language', '?')})"
+                    if out_dir:
+                        msg += f" · {Path(out_dir).name}"
+                    widget.update_status("completed", 100, msg, "completed")
+                elif saved_status == "completed":
                     srt_path = entry.get("srt_path") if entry else ""
-                    widget.update_status("completed", 100, f"历史记录 ({Path(srt_path).name})")
+                    widget.update_status("completed", 100, f"历史记录 ({Path(srt_path).name})", "completed")
+                else:
+                    widget.update_status(saved_status, saved_progress or 0, saved_message, saved_stage)
             added += 1
 
         if added > 0:
@@ -2061,11 +2267,61 @@ class MainWindow(QMainWindow):
         self.progress_bar_total.setValue(0)
         self.status_label.setText("就绪 - 添加视频后点击「开始生成字幕」")
 
+    def _sync_source_subtitles_button_from_settings(self):
+        """Refresh the visible source-subtitle toggle from persisted settings."""
+        btn = getattr(self, "source_subtitles_btn", None)
+        if not btn:
+            return
+        try:
+            settings = get_effective_settings()
+            policy = str(settings.get("youtube_caption_policy", "auto") or "auto").strip().lower()
+        except Exception:
+            policy = "auto"
+        checked = policy != "whisper"
+        old_block = btn.blockSignals(True)
+        try:
+            btn.setChecked(checked)
+            self._update_source_subtitles_button_ui(checked, policy)
+        finally:
+            btn.blockSignals(old_block)
+
+    def _update_source_subtitles_button_ui(self, checked, policy=None):
+        btn = getattr(self, "source_subtitles_btn", None)
+        if not btn:
+            return
+        policy = str(policy or ("auto" if checked else "whisper")).strip().lower()
+        if checked:
+            if policy == "youtube":
+                btn.setText("🎞 源字幕：强制使用")
+                btn.setToolTip("在线链接任务会强制使用源视频/YouTube 字幕；如果源字幕质量差，也不会自动回退。")
+            else:
+                btn.setText("🎞 源字幕：优先使用")
+                btn.setToolTip("在线链接任务会优先尝试源视频/YouTube 字幕，并自动修复断词和重分段；质量差时回退本地 Whisper。")
+        else:
+            btn.setText("🎙 源字幕：关闭，本地识别")
+            btn.setToolTip("在线链接任务会跳过源视频/YouTube 字幕，强制下载音视频后用本地 Whisper 重新识别。")
+
+    def _on_source_subtitles_toggled(self, checked):
+        policy = "auto" if checked else "whisper"
+        try:
+            save_settings({
+                "youtube_caption_policy": policy,
+                "youtube_caption_resegment": "true" if checked else get_effective_settings().get("youtube_caption_resegment", "true"),
+            })
+        except Exception as exc:
+            print(f"save source subtitle policy failed: {exc}")
+        self._update_source_subtitles_button_ui(checked, policy)
+        if hasattr(self, "status_label"):
+            if checked:
+                self.status_label.setText("已开启源字幕优先：会自动修复分段，质量差则回退本地 Whisper")
+            else:
+                self.status_label.setText("已关闭源字幕：在线链接将强制使用本地 Whisper 重新识别")
+
     def _retry_failed(self):
         failed = []
         for path, data in self.video_items.items():
             widget = data["widget"]
-            if widget.status == "error":
+            if widget.status in ("error", "failed"):
                 failed.append(path)
                 widget.update_status("pending")
 
@@ -2082,14 +2338,14 @@ class MainWindow(QMainWindow):
             self._refresh_localization_config_from_settings()
             if specific_files is None:
                 pending = [(p, d.get("is_url", False)) for p, d in self.video_items.items()
-                           if d["widget"].status in ("pending", "error")]
+                           if d["widget"].status in ("pending", "error", "failed", "interrupted")]
                 if not pending:
                     QMessageBox.information(self, "提示", "没有待处理的任务")
                     return
                 items = pending
             elif not isinstance(specific_files, (list, tuple)):
                 items = [(p, d.get("is_url", False)) for p, d in self.video_items.items()
-                         if d["widget"].status in ("pending", "error")]
+                         if d["widget"].status in ("pending", "error", "failed", "interrupted")]
                 if not items:
                     return
             else:
@@ -2098,9 +2354,27 @@ class MainWindow(QMainWindow):
             if not items:
                 return
 
-            for p, _ in items:
+            language = "auto"
+            if hasattr(self, "lang_combo"):
+                language_text = self.lang_combo.currentText().strip()
+                language = language_text.split("(", 1)[0].strip() or "auto"
+
+            for p, is_url in items:
                 if p in self.video_items:
-                    self.video_items[p]["widget"].update_status("queued")
+                    widget = self.video_items[p]["widget"]
+                    widget.update_status("queued", 0, "等待处理", "prepare")
+                    title = self.video_items[p].get("title") or getattr(widget, "title", None) or (p if is_url else Path(p).name)
+                    self.history.start_task(
+                        p,
+                        title=title,
+                        source_type="url" if is_url else "local",
+                        mode="subtitle",
+                        source=p,
+                        is_url=is_url,
+                        language=language,
+                        stage="prepare",
+                        message="等待处理",
+                    )
 
             self.start_btn.setEnabled(False)
             self.stop_btn.setEnabled(True)
@@ -2109,11 +2383,9 @@ class MainWindow(QMainWindow):
             self.add_folder_btn.setEnabled(False)
             self.add_url_btn.setEnabled(False)
             self.url_input.setEnabled(False)
+            if hasattr(self, "source_subtitles_btn"):
+                self.source_subtitles_btn.setEnabled(False)
 
-            language = "auto"
-            if hasattr(self, "lang_combo"):
-                language_text = self.lang_combo.currentText().strip()
-                language = language_text.split("(", 1)[0].strip() or "auto"
             self.worker = WorkerThread(items, language=language, service="local")
             self.worker.progress_updated.connect(self._on_progress)
             self.worker.task_completed.connect(self._on_completed)
@@ -2133,6 +2405,8 @@ class MainWindow(QMainWindow):
             self.add_folder_btn.setEnabled(True)
             self.add_url_btn.setEnabled(True)
             self.url_input.setEnabled(True)
+            if hasattr(self, "source_subtitles_btn"):
+                self.source_subtitles_btn.setEnabled(True)
 
     def _stop_processing(self):
         self._stopped = True
@@ -2146,8 +2420,9 @@ class MainWindow(QMainWindow):
         self._localization_worker = None
         for path, data in self.video_items.items():
             widget = data["widget"]
-            if widget.status in ("queued", "downloading", "processing", "pending"):
-                widget.update_status("cancelled", widget.progress, "已取消")
+            if widget.status in ("queued", "downloading", "processing", "running", "pending"):
+                widget.update_status("cancelled", widget.progress, "已取消", "cancelled")
+                self.history.cancel_task(path, "已取消", progress=widget.progress)
         self.stop_btn.setEnabled(False)
         self.skip_btn.setEnabled(False)
         self._on_all_done()
@@ -2156,13 +2431,13 @@ class MainWindow(QMainWindow):
         if self.worker and self.worker.isRunning():
             self.worker.skip_current()
 
-    def _on_progress(self, file_path, progress, message, status):
+    def _on_progress(self, file_path, progress, message, status, stage=""):
         try:
             if self._stopped:
                 return
             if file_path in self.video_items:
-                self.video_items[file_path]["widget"].update_status(status, progress, message)
-                self._save_progress_to_history(file_path, progress, status, message)
+                self.video_items[file_path]["widget"].update_status(status, progress, message, stage)
+                self._save_progress_to_history(file_path, progress, status, message, stage)
         except Exception as e:
             print(f"_on_progress error: {e}")
 
@@ -2172,23 +2447,33 @@ class MainWindow(QMainWindow):
                 return
             if file_path in self.video_items:
                 widget = self.video_items[file_path]["widget"]
-                widget.update_status("completed", 100, f"完成 ({language})")
+                msg = f"完成 ({language})"
+                widget.update_status("completed", 100, msg, "completed")
                 widget.subtitles = subtitles
 
                 srt_path = self._save_output(file_path, subtitles, widget.is_url, language)
                 if srt_path:
                     out_dir_name = srt_path.parent.name
                     msg = f"完成 ({language}) · {out_dir_name}/"
-                    widget.update_status("completed", 100, msg)
-
-                self._save_progress_to_history(file_path, 100, "completed", msg)
+                    widget.update_status("completed", 100, msg, "completed")
+                    self.history.complete_task(
+                        file_path,
+                        message=msg,
+                        language=language,
+                        subtitle_count=len(subtitles) if subtitles else 0,
+                        srt_path=str(srt_path),
+                        output_dir=str(srt_path.parent),
+                    )
+                else:
+                    self._save_progress_to_history(file_path, 100, "completed", msg, "completed")
 
                 idx = self.file_list.row(self.video_items[file_path]["item"])
                 if idx == self.file_list.currentRow():
                     self.subtitle_viewer.show_subtitles(file_path, subtitles, widget.is_url)
 
                 if self._localization_config and self._localization_config.get("is_translate_mode"):
-                    widget.update_status("processing", 50, "开始翻译字幕...")
+                    widget.update_status("running", 50, "开始翻译字幕...", "translate")
+                    self._save_progress_to_history(file_path, 50, "running", "开始翻译字幕...", "translate")
                     self._start_localization(file_path, str(srt_path))
 
             self._update_progress()
@@ -2200,24 +2485,45 @@ class MainWindow(QMainWindow):
             if self._stopped:
                 return
             if file_path and file_path in self.video_items:
-                self.video_items[file_path]["widget"].update_status("error", 0, error_msg[:80])
-                self._save_progress_to_history(file_path, 0, "error", error_msg[:200])
+                self.video_items[file_path]["widget"].update_status("failed", 0, error_msg[:160], "error", "", str(error_msg))
+                self.history.fail_task(file_path, error_detail=str(error_msg), message=str(error_msg)[:500], stage="error", progress=0)
             elif not file_path:
                 QMessageBox.critical(self, "错误", error_msg)
             self._update_progress()
         except Exception as e:
             print(f"Error in _on_error: {e}")
 
-    def _save_progress_to_history(self, file_path, progress, status, message):
+    def _save_progress_to_history(self, file_path, progress, status, message, stage=""):
         try:
             if not self.history.exists(file_path):
-                return
-            entry = self.history.get(file_path)
-            entry["progress"] = progress
-            entry["status"] = status
-            entry["message"] = str(message)[:200]
-            entry["timestamp"] = time.time()
-            self.history.put(file_path, entry)
+                is_url = self.video_items.get(file_path, {}).get("is_url", False) if hasattr(self, "video_items") else False
+                title = self.video_items.get(file_path, {}).get("title", "") if hasattr(self, "video_items") else ""
+                if not title:
+                    title = file_path if is_url else Path(file_path).name
+                self.history.start_task(
+                    file_path,
+                    title=title,
+                    source_type="url" if is_url else "local",
+                    mode="subtitle",
+                    source=file_path,
+                    is_url=is_url,
+                )
+            normalized = normalize_task_status(status)
+            normalized_stage = normalize_task_stage(stage, status=status)
+            if normalized == "completed":
+                self.history.complete_task(file_path, message=str(message or "任务已完成"), stage=normalized_stage or "completed", progress=progress)
+            elif normalized == "failed":
+                self.history.fail_task(file_path, error_detail=str(message or ""), message=str(message or "")[:500], stage=normalized_stage or "error", progress=progress)
+            elif normalized == "cancelled":
+                self.history.cancel_task(file_path, str(message or "任务已取消"), progress=progress, stage=normalized_stage or "cancelled")
+            else:
+                self.history.update_task_progress(
+                    file_path,
+                    normalized,
+                    normalized_stage,
+                    progress,
+                    str(message or ""),
+                )
         except Exception:
             pass
 
@@ -2229,6 +2535,8 @@ class MainWindow(QMainWindow):
             self.add_folder_btn.setEnabled(True)
             self.add_url_btn.setEnabled(True)
             self.url_input.setEnabled(True)
+            if hasattr(self, "source_subtitles_btn"):
+                self.source_subtitles_btn.setEnabled(True)
 
             completed = sum(1 for d in self.video_items.values() if d["widget"].status == "completed")
             failed = sum(1 for d in self.video_items.values() if d["widget"].status == "error")
@@ -2435,20 +2743,28 @@ class MainWindow(QMainWindow):
 
         remove_action = QAction("🗑 移除此项", self)
         remove_action.triggered.connect(lambda: self._remove_file(key))
-        if widget.status in ("queued", "downloading", "processing"):
+        if widget.status in ("queued", "downloading", "processing", "running"):
             stop_action = QAction("停止任务", self)
             stop_action.triggered.connect(lambda: self._stop_task(key))
             menu.addAction(stop_action)
             menu.addSeparator()
         menu.addAction(remove_action)
 
-        if widget.status in ("error", "cancelled"):
-            label = "🔄 重新处理" if widget.status == "cancelled" else "🔄 重试"
+        if widget.status in ("error", "failed", "cancelled", "interrupted"):
+            label = "🔄 重新处理" if widget.status in ("cancelled", "interrupted") else "🔄 重试"
             retry_action = QAction(label, self)
             retry_action.triggered.connect(lambda: self._start_processing(specific_files=[key]))
             menu.addAction(retry_action)
 
-        if widget.status in ("completed", "error", "cancelled") and self._get_localization_job_id(key):
+        if widget.status in ("completed", "error", "failed", "cancelled", "interrupted") and self._get_localization_job_id(key):
+            runtime_detail = QAction("查看任务运行详情", self)
+            runtime_detail.triggered.connect(
+                lambda: TaskRuntimeDialog(self._get_localization_job_id(key), self, LocalizationClient()).exec_()
+            )
+            menu.addAction(runtime_detail)
+            edit_subtitles = QAction("编辑字幕时间轴", self)
+            edit_subtitles.triggered.connect(lambda: self._open_subtitle_timeline(key))
+            menu.addAction(edit_subtitles)
             stage_menu = QMenu("重新生成指定阶段", self)
             stages = [
                 ("翻译及后续", "translate"),
@@ -2508,6 +2824,29 @@ class MainWindow(QMainWindow):
         job_id = data.get("localization_job_id") or self.history.get_job_id(key)
         return str(job_id or "").strip()
 
+    def _show_runtime_dashboard(self):
+        RuntimeDashboardDialog(self, LocalizationClient()).exec_()
+
+    def _show_tts_preview(self):
+        TTSPreviewDialog(self, LocalizationClient()).exec_()
+
+    def _open_subtitle_timeline(self, key):
+        job_id = self._get_localization_job_id(key)
+        if not job_id:
+            QMessageBox.warning(self, "字幕编辑器", "该项目没有可用的本地化任务 ID。")
+            return
+        source_video = key
+        if self.video_items.get(key, {}).get("is_url"):
+            output_dir = self.history.get_output_dir(key)
+            candidate = self._find_output_video(key, output_dir) if output_dir else None
+            source_video = str(candidate) if candidate else ""
+        SubtitleTimelineDialog(
+            job_id,
+            source_video if Path(str(source_video)).is_file() else "",
+            self,
+            LocalizationClient(),
+        ).exec_()
+
     def _get_history_srt_path(self, key):
         entry = self.history.get(key) or {}
         srt_path = entry.get("srt_path") or ""
@@ -2540,7 +2879,8 @@ class MainWindow(QMainWindow):
             retry_job_id=job_id,
             retry_from_stage=stage,
         )
-        self.video_items[key]["widget"].update_status("processing", 0, f"重新生成: {stage}")
+        self.video_items[key]["widget"].update_status("running", 0, f"重新生成: {stage_to_ui_text(stage) or stage}", stage)
+        self.history.update_task_progress(key, "running", stage, 0, f"重新生成: {stage_to_ui_text(stage) or stage}", mode="localization")
         self.stop_btn.setEnabled(True)
         self.skip_btn.setEnabled(True)
         self._attach_localization_worker(key, worker)
@@ -2562,7 +2902,8 @@ class MainWindow(QMainWindow):
             elif self.worker and self.worker.isRunning():
                 self.worker.stop()
         widget = self.video_items[key]["widget"]
-        widget.update_status("cancelled", widget.progress, "已请求停止")
+        widget.update_status("cancelled", widget.progress, "已请求停止", "cancelled")
+        self.history.cancel_task(key, "已请求停止", progress=widget.progress)
         self._update_progress()
         self.status_label.setText("已请求停止任务")
 
@@ -2581,7 +2922,7 @@ class MainWindow(QMainWindow):
             shutil.rmtree(str(Path(out_dir)), ignore_errors=True)
         if key in self.video_items:
             self.video_items[key]["widget"].subtitles = None
-            self.video_items[key]["widget"].update_status("pending", 0, "已删除历史记录")
+            self.video_items[key]["widget"].update_status("pending", 0, "已删除历史记录", "prepare")
         self.status_label.setText("输出和记录已删除")
 
     def _remove_selected(self):
@@ -2869,89 +3210,293 @@ class MainWindow(QMainWindow):
         dialog.setWindowFlags(Qt.Dialog | Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
         dialog.setWindowModality(Qt.WindowModal)
         dialog.setWindowTitle("历史记录")
-        dialog.setMinimumSize(640, 480)
-        dialog.resize(720, 540)
+        dialog.setMinimumSize(860, 520)
+        dialog.resize(980, 620)
         dialog.setStyleSheet(f"""
             QDialog {{ background-color: {THEME["bg_dark"]}; }}
+            QTableWidget {{
+                background-color: {THEME["bg_medium"]};
+                border: 1px solid {THEME["border"]};
+                border-radius: 8px;
+                gridline-color: {THEME["border"]};
+                color: {THEME["text_primary"]};
+                selection-background-color: {THEME["accent_dark"]};
+            }}
+            QHeaderView::section {{
+                background-color: {THEME["bg_light"]};
+                color: {THEME["text_primary"]};
+                border: none;
+                padding: 7px 8px;
+                font-weight: 600;
+            }}
         """)
-        # 构建期间禁用更新，避免逐次触发父窗口重绘
         dialog.setUpdatesEnabled(False)
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(20, 16, 20, 16)
         layout.setSpacing(10)
-        title = QLabel(f"历史记录（共 {len(entries)} 条）")
+
+        normalized_entries = []
+        counts = {"completed": 0, "failed": 0, "running": 0, "interrupted": 0, "cancelled": 0, "queued": 0, "pending": 0, "cached": 0}
+        for key, entry in entries.items():
+            status = normalize_task_status(entry.get("status", ""))
+            if status in counts:
+                counts[status] += 1
+            normalized_entries.append((key, entry, status))
+        running_total = counts["running"] + counts["queued"] + counts["pending"]
+        summary = (
+            f"历史记录（共 {len(entries)} 条）  "
+            f"✅ 已完成 {counts['completed']}  "
+            f"🔄 运行/排队 {running_total}  "
+            f"❌ 失败 {counts['failed']}  "
+            f"⚠️ 中断 {counts['interrupted']}"
+        )
+        title = QLabel(summary)
         title.setStyleSheet(f"font-size: 16px; font-weight: 700; color: {THEME['text_primary']}; padding-bottom: 4px;")
         layout.addWidget(title)
-        list_widget = QListWidget()
-        list_widget.setUpdatesEnabled(False)
-        list_widget.setUniformItemSizes(True)
-        list_widget.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
-        list_widget.setSpacing(6)
-        list_widget.setStyleSheet(f"""
-            QListWidget {{ background: transparent; border: none; }}
-            QListWidget::item {{
-                background-color: {THEME["bg_card"]};
-                border: none;
-                border-radius: 8px;
-                padding: 10px 14px;
-                margin: 1px 0px;
-            }}
-            QListWidget::item:selected {{
-                background-color: {THEME["accent_dark"]};
-            }}
-            QListWidget::item:hover {{
-                background-color: {THEME["bg_hover"]};
-            }}
-        """)
-        for key, entry in sorted(entries.items(), key=lambda x: x[1].get("timestamp", 0), reverse=True):
-            out_dir = entry.get("output_dir") or ""
-            lang = entry.get("language", "?")
-            count = entry.get("subtitle_count", 0)
+
+        filter_layout = QHBoxLayout()
+        history_search = QLineEdit()
+        history_search.setPlaceholderText("搜索标题、来源、消息或错误码")
+        history_search.setClearButtonEnabled(True)
+        history_status = QComboBox()
+        history_status.addItem("全部状态", "")
+        for status_value, status_label in (
+            ("completed", "已完成"), ("running", "运行中"),
+            ("failed", "失败"), ("interrupted", "已中断"),
+            ("cancelled", "已取消"), ("pending", "等待中"),
+        ):
+            history_status.addItem(status_label, status_value)
+        history_page = QSpinBox()
+        history_page.setMinimum(1)
+        history_page.setMaximum(1)
+        history_page.setPrefix("第 ")
+        history_page.setSuffix(" 页")
+        history_page_label = QLabel()
+        history_page_label.setStyleSheet(f"color: {THEME['text_secondary']};")
+        filter_layout.addWidget(history_search, 1)
+        filter_layout.addWidget(history_status)
+        filter_layout.addWidget(history_page)
+        filter_layout.addWidget(history_page_label)
+        layout.addLayout(filter_layout)
+
+        table = QTableWidget()
+        table.setColumnCount(7)
+        table.setHorizontalHeaderLabels(["状态", "标题/来源", "模式", "阶段", "进度", "更新时间", "输出/错误"])
+        table.setRowCount(len(normalized_entries))
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SingleSelection)
+        table.verticalHeader().setVisible(False)
+        table.setAlternatingRowColors(False)
+        table.setSortingEnabled(False)
+        table.horizontalHeader().setStretchLastSection(True)
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
+
+        sorted_entries = sorted(
+            normalized_entries,
+            key=lambda x: x[1].get("updated_at") or x[1].get("timestamp", 0),
+            reverse=True,
+        )
+        row_payloads = []
+        for row, (key, entry, status) in enumerate(sorted_entries):
+            stage = normalize_task_stage(entry.get("stage", ""), status=entry.get("status", ""))
+            progress = int(entry.get("progress", 100 if status == "completed" else 0) or 0)
+            display = build_task_display(
+                status,
+                stage,
+                progress,
+                entry.get("message", ""),
+                entry.get("error_code", ""),
+                entry.get("error_detail", ""),
+                is_url=entry.get("is_url", False),
+            )
             is_url = entry.get("is_url", False)
             name = entry.get("title") or (Path(key).name if not is_url else key)
-            detail = f"{lang} · {count} 条 · {time.strftime('%m-%d %H:%M', time.localtime(entry.get('timestamp', 0)))}"
-            preset_names = [
-                str(entry.get("translation_preset_name", "") or "").strip(),
-                str(entry.get("tts_preset_name", "") or "").strip(),
-            ]
-            preset_detail = " / ".join(p for p in preset_names if p)
-            if preset_detail:
-                detail = f"{detail} · 配置: {preset_detail}"
-            item = QListWidgetItem(f"{name[:120]}\n{detail}")
-            item.setToolTip(key)
-            item.setData(Qt.UserRole, out_dir if out_dir and Path(out_dir).exists() else "")
-            item.setSizeHint(QSize(0, 58))
-            list_widget.addItem(item)
-        layout.addWidget(list_widget)
+            mode_raw = str(entry.get("mode", "subtitle") or "subtitle")
+            mode_map = {
+                "subtitle": "字幕",
+                "localization": "翻译/配音",
+                "translate": "翻译",
+                "dub": "配音",
+            }
+            mode_text = mode_map.get(mode_raw, mode_raw)
+            updated = entry.get("updated_at") or entry.get("timestamp", 0)
+            updated_text = time.strftime("%m-%d %H:%M", time.localtime(updated)) if updated else "-"
+            out_dir = entry.get("output_dir") or ""
+            error_text = ""
+            if status == "failed":
+                code = str(entry.get("error_code", "") or "").strip()
+                msg = str(entry.get("message", "") or entry.get("error_detail", "") or "处理失败")
+                error_text = f"[{code}] {msg}" if code else msg
+            else:
+                error_text = Path(out_dir).name if out_dir else str(entry.get("srt_path", "") or "")
 
-        def open_selected_output(item=None):
-            item = item or list_widget.currentItem()
-            if not item:
+            values = [
+                f"{display['icon']} {display['status_text']}",
+                str(name)[:160],
+                mode_text,
+                str(display.get("stage_text") or "-"),
+                str(display.get("progress_text") or f"{progress}%"),
+                updated_text,
+                str(error_text)[:220],
+            ]
+            payload = {
+                "key": key,
+                "entry": entry,
+                "out_dir": out_dir if out_dir and Path(out_dir).exists() else "",
+                "error_text": error_text,
+            }
+            row_payloads.append(payload)
+            for col, value in enumerate(values):
+                cell = QTableWidgetItem(value)
+                cell.setToolTip(str(error_text if col == 6 else value))
+                if col == 0:
+                    color = THEME.get(str(display["color_key"]), THEME["text_muted"])
+                    cell.setForeground(QBrush(QColor(color)))
+                cell.setData(Qt.UserRole, payload)
+                table.setItem(row, col, cell)
+        table.resizeRowsToContents()
+        layout.addWidget(table, 1)
+
+        history_page_size = 50
+
+        def apply_history_filter(*_args):
+            keyword = history_search.text().strip().casefold()
+            selected_status = str(history_status.currentData() or "")
+            matches = []
+            for row in range(table.rowCount()):
+                item = table.item(row, 0)
+                payload = item.data(Qt.UserRole) if item else {}
+                entry = payload.get("entry") or {}
+                status = normalize_task_status(entry.get("status", ""))
+                haystack = " ".join((
+                    str(payload.get("key", "")), str(entry.get("title", "")),
+                    str(entry.get("source", "")), str(entry.get("message", "")),
+                    str(entry.get("error_code", "")), str(entry.get("error_detail", "")),
+                )).casefold()
+                if selected_status and status != selected_status:
+                    continue
+                if keyword and keyword not in haystack:
+                    continue
+                matches.append(row)
+            pages = max(1, (len(matches) + history_page_size - 1) // history_page_size)
+            history_page.blockSignals(True)
+            history_page.setMaximum(pages)
+            if history_page.value() > pages:
+                history_page.setValue(pages)
+            history_page.blockSignals(False)
+            page = history_page.value()
+            visible = set(matches[(page - 1) * history_page_size:page * history_page_size])
+            for row in range(table.rowCount()):
+                table.setRowHidden(row, row not in visible)
+            history_page_label.setText(f"{len(matches)} 条 / {pages} 页")
+
+        history_search.textChanged.connect(lambda _text: (history_page.setValue(1), apply_history_filter()))
+        history_status.currentIndexChanged.connect(lambda _index: (history_page.setValue(1), apply_history_filter()))
+        history_page.valueChanged.connect(apply_history_filter)
+        apply_history_filter()
+
+        def current_payload():
+            row = table.currentRow()
+            if row < 0:
+                return None
+            item = table.item(row, 0)
+            return item.data(Qt.UserRole) if item else None
+
+        def open_selected_output():
+            payload = current_payload()
+            if not payload:
                 return
-            out_dir = item.data(Qt.UserRole)
+            out_dir = payload.get("out_dir")
             if out_dir:
                 os.startfile(out_dir)
+            else:
+                QMessageBox.information(dialog, "输出目录", "这条记录没有可打开的输出目录。")
 
-        list_widget.itemDoubleClicked.connect(open_selected_output)
+        def copy_selected_error():
+            payload = current_payload()
+            if not payload:
+                return
+            text = payload.get("error_text") or ""
+            if not text:
+                QMessageBox.information(dialog, "错误信息", "这条记录没有错误信息。")
+                return
+            QApplication.clipboard().setText(str(text))
+            self.status_label.setText("已复制历史错误信息")
 
+        def show_selected_error():
+            payload = current_payload()
+            if not payload:
+                return
+            entry = payload.get("entry") or {}
+            text = payload.get("error_text") or entry.get("message") or entry.get("error_detail") or "这条记录没有错误信息。"
+            QMessageBox.information(dialog, "任务详情", str(text)[:5000])
+
+        def on_double_clicked(_row, _col):
+            open_selected_output()
+
+        def show_context_menu(pos):
+            row = table.rowAt(pos.y())
+            if row >= 0:
+                table.selectRow(row)
+            payload = current_payload()
+            if not payload:
+                return
+            menu = QMenu(dialog)
+            open_action = QAction("📂 打开输出目录", dialog)
+            open_action.triggered.connect(open_selected_output)
+            menu.addAction(open_action)
+            detail_action = QAction("查看详情/错误", dialog)
+            detail_action.triggered.connect(show_selected_error)
+            menu.addAction(detail_action)
+            copy_action = QAction("复制错误/详情", dialog)
+            copy_action.triggered.connect(copy_selected_error)
+            menu.addAction(copy_action)
+            menu.exec_(table.viewport().mapToGlobal(pos))
+
+        table.cellDoubleClicked.connect(on_double_clicked)
+        table.setContextMenuPolicy(Qt.CustomContextMenu)
+        table.customContextMenuRequested.connect(show_context_menu)
+
+        btn_layout = QHBoxLayout()
         open_btn = QPushButton("打开输出目录")
         open_btn.setObjectName("btn_secondary")
         open_btn.setFixedHeight(34)
         open_btn.clicked.connect(open_selected_output)
-        layout.addWidget(open_btn)
+        btn_layout.addWidget(open_btn)
+
+        detail_btn = QPushButton("查看详情/错误")
+        detail_btn.setObjectName("btn_secondary")
+        detail_btn.setFixedHeight(34)
+        detail_btn.clicked.connect(show_selected_error)
+        btn_layout.addWidget(detail_btn)
+
+        copy_btn = QPushButton("复制错误/详情")
+        copy_btn.setObjectName("btn_secondary")
+        copy_btn.setFixedHeight(34)
+        copy_btn.clicked.connect(copy_selected_error)
+        btn_layout.addWidget(copy_btn)
+        btn_layout.addStretch()
 
         close_btn = QPushButton("关闭")
         close_btn.setObjectName("btn_secondary")
         close_btn.setFixedHeight(34)
         close_btn.clicked.connect(dialog.accept)
-        layout.addWidget(close_btn)
-        # 居中于主窗口
+        btn_layout.addWidget(close_btn)
+        layout.addLayout(btn_layout)
+
+        if table.rowCount() > 0:
+            table.selectRow(0)
         if self.window():
             qr = dialog.frameGeometry()
             cp = self.window().frameGeometry().center()
             qr.moveCenter(cp)
             dialog.move(qr.topLeft())
-        list_widget.setUpdatesEnabled(True)
         dialog.setUpdatesEnabled(True)
         try:
             dialog.exec_()
@@ -2965,6 +3510,7 @@ class MainWindow(QMainWindow):
                 self.output_dir = dialog.output_dir
                 self.output_dir.mkdir(parents=True, exist_ok=True)
                 self.output_dir_btn.setToolTip(str(self.output_dir))
+            self._sync_source_subtitles_button_from_settings()
 
     def _show_localization_dialog(self):
         dialog = LocalizationDialog(self)
@@ -2992,10 +3538,25 @@ class MainWindow(QMainWindow):
         worker.job_started.connect(self._on_localization_job_started)
         worker.task_completed.connect(self._on_localization_completed)
         worker.task_error.connect(self._on_localization_error)
+        worker.preflight_confirmation.connect(self._confirm_preflight_warnings)
         worker.finished.connect(lambda fp=file_path, w=worker: self._on_localization_worker_finished(fp, w))
         self._localization_workers[file_path] = worker
         self._localization_worker = worker
         worker.start()
+
+    def _confirm_preflight_warnings(self, confirmation):
+        warnings = (confirmation.get("preflight") or {}).get("warnings") or []
+        lines = [f"• [{item.get('code', '')}] {item.get('message', '')}" for item in warnings]
+        message = "任务启动前发现以下警告：\n\n" + "\n".join(lines) + "\n\n是否仍要继续？"
+        answer = QMessageBox.warning(
+            self,
+            "Preflight 警告",
+            message,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        confirmation["accepted"] = answer == QMessageBox.Yes
+        confirmation["event"].set()
 
     def _on_localization_worker_finished(self, file_path, worker):
         if self._localization_workers.get(file_path) is worker:
@@ -3008,20 +3569,19 @@ class MainWindow(QMainWindow):
             return
         self.video_items[file_path]["localization_job_id"] = job_id
         entry = self.history.get(file_path) or {}
-        entry["job_id"] = job_id
-        entry["mode"] = "localization"
+        extra = {"job_id": job_id}
         if self._localization_config:
-            entry["source_language"] = self._localization_config.get(
-                "source_language", entry.get("source_language", "auto")
-            )
-            entry["target_language"] = self._localization_config.get(
-                "target_language", entry.get("target_language", "")
-            )
-            entry["translation_preset_id"] = self._localization_config.get("translation_preset_id", "")
-            entry["translation_preset_name"] = self._localization_config.get("translation_preset_name", "")
-            entry["tts_preset_id"] = self._localization_config.get("tts_preset_id", "")
-            entry["tts_preset_name"] = self._localization_config.get("tts_preset_name", "")
-        self.history.put(file_path, entry)
+            extra.update({
+                "source_language": self._localization_config.get("source_language", entry.get("source_language", "auto")),
+                "target_language": self._localization_config.get("target_language", entry.get("target_language", "")),
+                "translation_preset_id": self._localization_config.get("translation_preset_id", ""),
+                "translation_preset_name": self._localization_config.get("translation_preset_name", ""),
+                "tts_preset_id": self._localization_config.get("tts_preset_id", ""),
+                "tts_preset_name": self._localization_config.get("tts_preset_name", ""),
+            })
+        self.history.update_task_progress(
+            file_path, "running", "translate", 10, "本地化任务已提交", mode="localization", **extra
+        )
 
     def _start_localization(self, file_path, srt_path):
         # Preflight: ensure Qwen3-TTS sidecar is running before launching a dub job
@@ -3050,21 +3610,30 @@ class MainWindow(QMainWindow):
                         "当前使用配音模式 + Qwen3-TTS，但本地服务未运行。\n\n"
                         "请先在 设置 → Qwen3-TTS 管理 中点击「启动服务」后重试。",
                     )
+                    if file_path in self.video_items:
+                        self.video_items[file_path]["widget"].update_status("failed", 0, "Qwen3-TTS 服务未运行", "tts")
+                    self.history.fail_task(file_path, message="Qwen3-TTS 服务未运行", error_detail="当前使用配音模式 + Qwen3-TTS，但本地服务未运行。", stage="tts")
                     return
 
         is_url = self.video_items.get(file_path, {}).get("is_url", False)
         if is_url:
             srt_path_obj = Path(srt_path)
             video_file = None
-            for ext in ['.mp4', '.mkv', '.webm']:
-                candidate = srt_path_obj.with_suffix(ext)
-                if candidate.exists():
-                    video_file = candidate
+            layout = resolve_existing_layout(srt_path_obj)
+            for directory in (layout.source_dir, layout.media_dir, srt_path_obj.parent):
+                if not directory.exists() or not directory.is_dir():
+                    continue
+                for candidate in sorted(directory.iterdir()):
+                    if candidate.is_file() and candidate.suffix.lower() in ['.mp4', '.mkv', '.webm', '.mov', '.m4v'] and "_proxy_" not in candidate.stem:
+                        video_file = candidate
+                        break
+                if video_file:
                     break
             if not video_file:
                 self.video_items[file_path]["widget"].update_status(
-                    "completed", 100, "翻译暂不支持 URL 视频（找不到视频文件）"
+                    "failed", 0, "翻译暂不支持 URL 视频（找不到视频文件）", "prepare"
                 )
+                self.history.fail_task(file_path, message="翻译暂不支持 URL 视频（找不到视频文件）", stage="prepare")
                 self._update_progress()
                 return
             worker = LocalizationWorker(
@@ -3074,7 +3643,8 @@ class MainWindow(QMainWindow):
             self._attach_localization_worker(file_path, worker)
             return
         if not Path(file_path).exists():
-            self.video_items[file_path]["widget"].update_status("error", 0, "源视频文件不存在")
+            self.video_items[file_path]["widget"].update_status("failed", 0, "源视频文件不存在", "prepare")
+            self.history.fail_task(file_path, message="源视频文件不存在", stage="prepare")
             return
 
         worker = LocalizationWorker(
@@ -3083,10 +3653,11 @@ class MainWindow(QMainWindow):
         )
         self._attach_localization_worker(file_path, worker)
 
-    def _on_localization_progress(self, file_path, progress, message, status):
+    def _on_localization_progress(self, file_path, progress, message, status, stage=""):
         if self._stopped or file_path not in self.video_items:
             return
-        self.video_items[file_path]["widget"].update_status(status, progress, message)
+        self.video_items[file_path]["widget"].update_status(status, progress, message, stage)
+        self.history.update_task_progress(file_path, status, stage, progress, message, mode="localization")
 
     def _on_localization_completed(self, file_path, translated_srt):
         if self._stopped:
@@ -3099,24 +3670,44 @@ class MainWindow(QMainWindow):
         if translated_srt and Path(translated_srt).exists():
             subtitles = parse_srt_file(translated_srt)
             widget.subtitles = subtitles
-            widget.update_status("completed", 100, f"翻译完成 ({tgt})")
+            msg = f"翻译完成 ({tgt})"
+            widget.update_status("completed", 100, msg, "completed")
+            self.history.complete_task(
+                file_path,
+                message=msg,
+                stage="completed",
+                progress=100,
+                srt_path=str(translated_srt),
+                subtitle_count=len(subtitles) if subtitles else 0,
+                language=tgt,
+                mode="localization",
+            )
             idx = self.file_list.row(self.video_items[file_path]["item"])
             if idx == self.file_list.currentRow():
                 self.subtitle_viewer.show_subtitles(
                     file_path, subtitles, self.video_items[file_path].get("is_url", False)
                 )
         else:
-            widget.update_status("completed", 100, f"ASR 完成（翻译输出未找到）")
+            msg = "本地化完成（翻译输出未找到）"
+            widget.update_status("completed", 100, msg, "completed")
+            self.history.complete_task(file_path, message=msg, stage="completed", progress=100, mode="localization")
         self._update_progress()
 
-    def _on_localization_error(self, file_path, error_code, error_msg, error_detail):
+    def _on_localization_error(self, file_path, error_code, error_msg, error_detail, stage="error"):
         if self._stopped:
             return
         if file_path in self.video_items:
-            display = error_msg[:80]
-            if error_code:
-                display = f"[{error_code}] {display}"
-            self.video_items[file_path]["widget"].update_status("error", 0, display)
+            display = str(error_msg or "处理失败")[:160]
+            self.video_items[file_path]["widget"].update_status("failed", 0, display, stage, error_code, error_detail)
+            self.history.fail_task(
+                file_path,
+                error_code=error_code,
+                error_detail=error_detail or error_msg,
+                message=error_msg or "处理失败",
+                stage=stage or "error",
+                progress=0,
+                mode="localization",
+            )
             self._update_progress()
 
 
@@ -3185,6 +3776,21 @@ class SettingsDialog(QDialog):
         self.service_combo.addItems(["local (本地 Whisper)", "groq (Groq API)", "openai (OpenAI API)"])
         form2.addRow("识别服务:", self.service_combo)
 
+        self.caption_policy_combo = QComboBox()
+        self.caption_policy_combo.addItem("自动选择：修复 YouTube 字幕，质量差则本地识别", "auto")
+        self.caption_policy_combo.addItem("强制使用 YouTube 字幕", "youtube")
+        self.caption_policy_combo.addItem("强制本地 Whisper 识别", "whisper")
+        current_policy = self.settings.get("youtube_caption_policy", "auto")
+        for i in range(self.caption_policy_combo.count()):
+            if self.caption_policy_combo.itemData(i) == current_policy:
+                self.caption_policy_combo.setCurrentIndex(i)
+                break
+        form2.addRow("YouTube字幕:", self.caption_policy_combo)
+
+        self.caption_resegment_check = QCheckBox("修复断词并按语义重新分段（推荐开启）")
+        self.caption_resegment_check.setChecked(self.settings.get("youtube_caption_resegment", "true") == "true")
+        form2.addRow("智能重分段:", self.caption_resegment_check)
+
         provider_btn = QPushButton("管理翻译 / TTS 服务配置")
         provider_btn.setObjectName("btn_secondary")
         provider_btn.setFixedHeight(34)
@@ -3252,6 +3858,10 @@ class SettingsDialog(QDialog):
             except Exception as e:
                 QMessageBox.warning(self, "目录无效", f"无法创建输出目录:\n{e}")
                 return
+        save_settings({
+            "youtube_caption_policy": self.caption_policy_combo.currentData() or "auto",
+            "youtube_caption_resegment": "true" if self.caption_resegment_check.isChecked() else "false",
+        })
         super().accept()
 
     def _test_connection(self):
