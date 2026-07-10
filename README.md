@@ -137,7 +137,12 @@ python tools/package_source.py --output video2subtitles-source-package.zip
 - **静音边界过滤**：chunk 切分过滤音频首尾边缘静音，避免误判为分句边界。
 - **崩溃日志记录**：`app.py` 启用 `faulthandler` 和线程异常钩子，写入 `.cache/crash.log`。
 - **关闭窗口安全保护**：`main_window.py` 新增 `closeEvent`，ChatGPT 打包中阻止关闭，运行中确认后停止 worker。
-- **新文件**：`localization-engine/tts/fish_audio_tts.py`、`output_layout.py`、`pack_for_chatgpt.bat`。
+- **新文件**：`localization-engine/tts/fish_audio_tts.py`、`output_layout.py`、`pack_for_chatgpt.bat`、`localization-engine/engine/errors.py`、`localization-engine/translation/validator.py`、`localization-engine/tts/registry.py`。
+- **统一错误体系**：新增 `PipelineError` 基类，所有流水线异常统一携带 `error_code`/`stage`/`cause` 并可序列化为 JSON，替代分散的字符串错误处理。
+- **翻译完整性验证器**：新增 `TranslationValidator`（`validator.py`），在翻译批处理后执行结构完整性校验（ID 缺失/多余/重复、空翻译、源文本残留等），验证失败自动拆分批次重试，最坏情况回退逐句翻译。
+- **TTS Provider 重构**：新增 `BaseTTSProvider` ABC 和 `ProviderRegistry` 注册中心，所有 TTS 提供者统一继承基类并支持 `list_voices()`/`close()` 接口，注册表支持别名标准化和线程安全工厂构造。
+- **工作空间隔离**：新增 `WorkspaceManager`（`workspace.py`），管控 `input/cache/output/logs` 四个托管目录，路径逃逸检测、`V2S_WORKSPACE_ROOT` 外部根限制、symlink 解析防护。
+- **翻译文本清洗增强**：`_clean_translation_text` 新增 leaked JSON 对象提取、源文本/翻译列拆分（source<TAB>translation 格式）、翻译标签剥离（"译文:" 等前缀），防止脏数据进入字幕和 TTS。
 - **测试覆盖**：新增/更新 15+ 测试文件，覆盖状态/阶段规范化、v2 manifest source 对象、batch_mode 序列化、输出布局、翻译解析紧凑/fallback、质量检测新增项、断点恢复、YouTube 字幕重分段与质量评估、Fish.audio 请求、自定义 TTS、字幕策略设置。
 
 ### 2026-06 — 字幕样式微调、TTS 时序优化与音频混合改进
