@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 # ---------------------------------------------------------------------------
@@ -38,7 +38,9 @@ from engine.models import (
 )
 from engine.pipeline import start_pipeline
 from engine.progress import ProgressTracker
-from engine.task_store import TaskStore
+from engine.json_migration import migrate_tasks_json
+from engine.repository import TaskQuery, TaskRepository
+from engine.sqlite_repository import SQLiteTaskRepository
 from engine.workspace import get_log_path, read_log_tail, resolve_workspace
 
 RETRY_STAGES = {
@@ -69,7 +71,7 @@ VERSION = "0.1.0"
 _state: dict = {}
 
 
-def _store() -> TaskStore:
+def _store() -> TaskRepository:
     return _state["task_store"]
 
 
@@ -89,7 +91,10 @@ def _cancellation() -> CancellationRegistry:
 async def lifespan(application: FastAPI):
     """Manage startup and shutdown resources."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    _state["task_store"] = TaskStore(DATA_DIR)
+    repository = SQLiteTaskRepository(DATA_DIR)
+    migration = migrate_tasks_json(repository)
+    _state["task_store"] = repository
+    _state["json_migration"] = migration
     _state["progress"] = ProgressTracker()
     _state["cancellation"] = CancellationRegistry()
     logger.info(
@@ -240,7 +245,20 @@ def create_job(req: CreateJobRequest):
         request_payload["style"] = req.style.model_dump()
 
     # Create task record
-    _store().create(job_id, request_payload)
+    existing = _store().get(job_id)
+    if existing is None:
+        _store().create(job_id, request_payload)
+    else:
+        _store().update(
+            job_id,
+            status="pending",
+            stage="prepare",
+            progress=0,
+            message="",
+            error_code=None,
+            error_detail=None,
+            request_payload=request_payload,
+        )
 
     # Register cancellation token and start pipeline
     cancel_token = _cancellation().register(job_id)
@@ -254,6 +272,66 @@ def create_job(req: CreateJobRequest):
 
     rec = _store().get(job_id)
     return _record_to_response(rec)
+
+
+@app.get("/jobs")
+def list_jobs(
+    keyword: str = "",
+    status: str = "",
+    stage: str = "",
+    created_from: str = "",
+    created_to: str = "",
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    sort_by: str = "created_at",
+    sort_order: str = "desc",
+):
+    """Search task history with filters, paging, and safe sorting."""
+    try:
+        result = _store().search(TaskQuery(
+            keyword=keyword,
+            status=status,
+            stage=stage,
+            created_from=created_from,
+            created_to=created_to,
+            page=page,
+            page_size=page_size,
+            sort_by=sort_by,
+            sort_order=sort_order,
+        ))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    items = []
+    for record in result.items:
+        item = record.to_dict()
+        item.pop("request_payload", None)
+        item.pop("current_stage", None)
+        items.append(item)
+    return {
+        "items": items,
+        "total": result.total,
+        "page": result.page,
+        "page_size": result.page_size,
+        "pages": result.pages,
+    }
+
+
+@app.get("/jobs/{job_id}/detail")
+def get_job_detail(job_id: str):
+    """Return task metadata together with immutable execution history."""
+    rec = _store().get(job_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    repository = _store()
+    stage_runs = getattr(repository, "list_stage_runs", lambda _job_id: [])(job_id)
+    artifacts = getattr(repository, "list_artifacts", lambda _job_id, **_kwargs: rec.artifacts)(
+        job_id, current_only=False
+    )
+    events = getattr(repository, "list_events", lambda _job_id: [])(job_id)
+    task = rec.to_dict()
+    task.pop("request_payload", None)
+    task.pop("artifacts", None)
+    return {"task": task, "stage_runs": stage_runs, "artifacts": artifacts, "events": events}
 
 
 @app.get("/jobs/{job_id}", response_model=TaskResultResponse)
