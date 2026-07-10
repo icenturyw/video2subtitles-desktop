@@ -63,25 +63,27 @@ def _register_builtin_providers() -> None:
             supported_output_formats=("mp3", "opus", "aac", "flac", "wav", "pcm"),
             supported_parameters=(
                 "speed", "openai_tts_model", "openai_tts_voice", "openai_tts_format",
-                "openai_tts_base_url", "openai_tts_sample_rate", "instruct", "style",
+                "openai_tts_base_url", "openai_tts_sample_rate", "openai_tts_speed",
+                "instruct", "style",
             ),
         ),
         "volcengine-doubao": TTSCapabilities(
             speed=True, emotion=True, preview_character_limit=1000,
             supported_output_formats=("mp3", "wav", "ogg_opus", "pcm"),
             supported_parameters=(
-                "volcengine_voice", "volcengine_model", "volcengine_format",
+                "volcengine_endpoint", "volcengine_resource_id", "volcengine_voice",
+                "volcengine_model", "volcengine_format",
                 "volcengine_sample_rate", "volcengine_speech_rate",
                 "volcengine_loudness_rate", "volcengine_emotion",
                 "volcengine_emotion_scale", "volcengine_user_uid",
             ),
         ),
         "fish-audio": TTSCapabilities(
-            emotion=True, preview_character_limit=1000,
+            preview_character_limit=1000,
             supported_output_formats=("mp3", "wav", "pcm", "opus"),
             supported_parameters=(
-                "fish_audio_model", "fish_audio_format", "fish_audio_reference_id",
-                "fish_audio_references", "fish_audio_normalize", "fish_audio_latency",
+                "fish_api_base", "fish_model", "fish_format", "fish_sample_rate",
+                "temperature", "top_p",
             ),
         ),
     }
@@ -146,19 +148,14 @@ def list_available_providers() -> list[dict]:
     except ImportError:
         providers.append({"name": "edge-tts", "available": False})
     qwen3_ok = _check_qwen3_healthy()
-    try:
-        import qwen_tts
-        providers.append({
-            "name": "qwen3-tts",
-            "available": qwen3_ok,
-            "service_running": qwen3_ok,
-        })
-    except ImportError:
-        providers.append({
-            "name": "qwen3-tts",
-            "available": False,
-            "service_running": False,
-        })
+    # Qwen lives in its own sidecar. Importing qwen_tts here would load torch,
+    # ONNX Runtime, and GPU-native libraries merely to render provider metadata.
+    providers.append({
+        "name": "qwen3-tts",
+        "available": qwen3_ok,
+        "service_running": qwen3_ok,
+        "local": True,
+    })
     providers.append({
         "name": "sapi",
         "available": __import__("os").name == "nt",

@@ -15,6 +15,8 @@ from typing import Any, Callable
 from tts.base import BaseTTSProvider, TTSCapabilities
 from tts.registry import ProviderRegistry
 
+from engine.runtime import ModelResourceError, ModelResourceManager, qwen3_tts_definition
+
 
 SENSITIVE_MARKERS = ("api_key", "apikey", "secret", "token", "access_key", "credential", "password")
 GENERIC_OPTIONS = {"timeout"}
@@ -44,6 +46,7 @@ class TTSPreviewService:
         *,
         ttl_seconds: float = 3600,
         maximum_timeout_seconds: float = 300,
+        model_resources: ModelResourceManager | None = None,
     ) -> None:
         self.cache_dir = Path(cache_dir).expanduser().resolve()
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -51,6 +54,7 @@ class TTSPreviewService:
         self.provider_factory = provider_factory
         self.ttl_seconds = max(1.0, float(ttl_seconds))
         self.maximum_timeout_seconds = max(1.0, float(maximum_timeout_seconds))
+        self.model_resources = model_resources
         self._cancel: dict[str, threading.Event] = {}
         self._results: dict[str, Path] = {}
         self._lock = threading.RLock()
@@ -91,6 +95,8 @@ class TTSPreviewService:
         cancel_event = threading.Event()
         with self._lock:
             self._cancel[preview_id] = cancel_event
+        model_lease = None
+        completed = None
         try:
             extension = _output_extension(capabilities, filtered)
             key = self.cache_key(cleaned_text, canonical, voice, language, filtered)
@@ -102,6 +108,12 @@ class TTSPreviewService:
                     preview_id, cached_path, _media_type(extension), True,
                     _duration(cached_path),
                 )
+
+            if self.model_resources and canonical == "qwen3-tts":
+                try:
+                    model_lease = self.model_resources.acquire(qwen3_tts_definition(filtered))
+                except ModelResourceError as exc:
+                    raise TTSPreviewError(str(exc), exc.error_code) from exc
 
             work_path = self.cache_dir / f".{preview_id}.{uuid.uuid4().hex}.part.{extension}"
             outcome: list[Any] = []
@@ -147,6 +159,15 @@ class TTSPreviewService:
                 preview_id, cached_path, _media_type(extension), False, duration
             )
         finally:
+            if model_lease is not None:
+                if completed is not None and not completed.is_set():
+                    threading.Thread(
+                        target=lambda: (completed.wait(), model_lease.release()),
+                        name=f"tts-preview-release-{preview_id[:8]}",
+                        daemon=True,
+                    ).start()
+                else:
+                    model_lease.release()
             with self._lock:
                 self._cancel.pop(preview_id, None)
 
@@ -205,9 +226,7 @@ class TTSPreviewService:
         language: str,
         options: dict[str, Any],
     ) -> str:
-        safe_options = {
-            key: value for key, value in options.items() if not _sensitive(key)
-        }
+        safe_options = _scrub_sensitive(options)
         payload = {
             "text": text,
             "provider": provider,
@@ -228,6 +247,18 @@ class TTSPreviewService:
 def _sensitive(key: str) -> bool:
     normalized = str(key).lower().replace("-", "_")
     return any(marker in normalized for marker in SENSITIVE_MARKERS)
+
+
+def _scrub_sensitive(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _scrub_sensitive(item)
+            for key, item in value.items()
+            if not _sensitive(str(key))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_scrub_sensitive(item) for item in value]
+    return value
 
 
 def _clean_preview_id(value: str) -> str:
