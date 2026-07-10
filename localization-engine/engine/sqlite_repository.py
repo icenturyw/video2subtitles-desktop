@@ -215,6 +215,49 @@ class SQLiteTaskRepository(TaskRepository):
             raise DuplicateTaskError(f"Task already exists: {job_id}") from exc
         return rec
 
+    def bulk_import(
+        self,
+        records: Sequence[TaskRecord],
+        *,
+        source: str,
+        source_sha256: str,
+    ) -> tuple[int, int]:
+        """Import legacy records in one transaction, skipping existing ids."""
+        imported = 0
+        skipped = 0
+        with self.transaction() as conn:
+            for rec in records:
+                exists = conn.execute(
+                    "SELECT 1 FROM tasks WHERE job_id = ?", (rec.job_id,)
+                ).fetchone()
+                if exists:
+                    skipped += 1
+                    continue
+                conn.execute(
+                    """INSERT INTO tasks(
+                        job_id, status, current_stage, progress, message,
+                        detected_language, error_code, error_detail, request_payload,
+                        created_at, updated_at, version
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        rec.job_id, rec.status, rec.stage, rec.progress, rec.message,
+                        rec.detected_language, rec.error_code, rec.error_detail,
+                        self._json_dump(rec.request_payload), rec.created_at,
+                        rec.updated_at, rec.version,
+                    ),
+                )
+                for artifact in rec.artifacts:
+                    self.register_artifact(rec.job_id, artifact, conn=conn)
+                self.add_event(
+                    rec.job_id,
+                    "JSON_MIGRATED",
+                    "Imported from legacy tasks.json",
+                    {"source": source, "sha256": source_sha256},
+                    conn=conn,
+                )
+                imported += 1
+        return imported, skipped
+
     def get(self, job_id: str) -> Optional[TaskRecord]:
         with self.transaction(immediate=False) as conn:
             row = conn.execute("SELECT * FROM tasks WHERE job_id = ?", (job_id,)).fetchone()
