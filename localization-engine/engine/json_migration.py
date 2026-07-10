@@ -8,7 +8,7 @@ import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 
 from engine.repository import TaskRecord
 from engine.sqlite_repository import SQLiteTaskRepository

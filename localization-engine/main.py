@@ -11,7 +11,6 @@ from __future__ import annotations
 import logging
 import os
 import shutil
-import sys
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -43,7 +42,7 @@ from engine.repository import TaskQuery, TaskRepository
 from engine.retry import RetryPlanner, RetryPlanningError
 from engine.sqlite_repository import SQLiteTaskRepository
 from engine.stages import STAGE_NAMES
-from engine.workspace import get_log_path, read_log_tail, resolve_workspace
+from engine.workspace import get_log_path, read_log_tail
 
 RETRY_STAGES = set(STAGE_NAMES) | {"failed", "all"}
 

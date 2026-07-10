@@ -272,7 +272,14 @@ class SQLiteTaskRepository(TaskRepository):
             return conn.execute("SELECT 1 FROM tasks WHERE job_id = ?", (job_id,)).fetchone() is not None
 
     def list_all(self) -> List[TaskRecord]:
-        return self.search(TaskQuery(page=1, page_size=100, sort_by="created_at", sort_order="desc")).items
+        with self.transaction(immediate=False) as conn:
+            rows = conn.execute(
+                "SELECT * FROM tasks ORDER BY created_at DESC, job_id ASC"
+            ).fetchall()
+            return [
+                self._row_to_record(row, self._artifact_rows(conn, row["job_id"]))
+                for row in rows
+            ]
 
     def update(self, job_id: str, **kwargs: Any) -> Optional[TaskRecord]:
         expected_version = kwargs.pop("expected_version", None)
@@ -507,10 +514,14 @@ class SQLiteTaskRepository(TaskRepository):
 
     def _begin_stage_run_tx(self, conn: sqlite3.Connection, job_id: str, stage: str) -> int:
         active = conn.execute(
-            "SELECT id FROM task_stage_runs WHERE task_id = ? AND status = 'running' ORDER BY id DESC LIMIT 1",
+            "SELECT id, stage FROM task_stage_runs WHERE task_id = ? AND status = 'running' ORDER BY id DESC LIMIT 1",
             (job_id,),
         ).fetchone()
         if active:
+            if active["stage"] != stage:
+                raise RepositoryError(
+                    f"Task {job_id} already has active stage {active['stage']}"
+                )
             return int(active["id"])
         attempt = int(conn.execute(
             "SELECT COALESCE(MAX(attempt), 0) + 1 FROM task_stage_runs WHERE task_id = ? AND stage = ?",

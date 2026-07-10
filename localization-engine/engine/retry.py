@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from engine.repository import TaskRepository
-from engine.stages import STAGE_BY_NAME, STAGE_NAMES, stage_index, stages_before, stages_from
+from engine.stages import STAGE_BY_NAME, stage_index, stages_before, stages_from
 
 
 RETRYABLE_STATUSES = {"completed", "error", "failed", "cancelled", "interrupted", "paused"}
