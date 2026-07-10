@@ -6,6 +6,7 @@ import hashlib
 import json
 import sqlite3
 import threading
+import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence
 
@@ -13,7 +14,7 @@ from engine.repository import TaskPage, TaskQuery, TaskRecord, TaskRepository, u
 from engine.stages import STAGE_BY_NAME
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SORT_COLUMNS = {
     "job_id": "job_id",
     "status": "status",
@@ -144,6 +145,18 @@ class SQLiteTaskRepository(TaskRepository):
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS voice_presets (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                    provider TEXT NOT NULL,
+                    voice_id TEXT NOT NULL DEFAULT '',
+                    language TEXT NOT NULL DEFAULT '',
+                    parameters_json TEXT NOT NULL DEFAULT '{}',
+                    is_default INTEGER NOT NULL DEFAULT 0 CHECK(is_default IN (0, 1)),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
                 CREATE INDEX IF NOT EXISTS idx_tasks_updated ON tasks(updated_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_tasks_stage ON tasks(current_stage);
@@ -152,11 +165,16 @@ class SQLiteTaskRepository(TaskRepository):
                 CREATE INDEX IF NOT EXISTS idx_artifacts_task ON task_artifacts(task_id, is_current, kind);
                 CREATE INDEX IF NOT EXISTS idx_artifacts_stage_run ON task_artifacts(stage_run_id);
                 CREATE INDEX IF NOT EXISTS idx_events_task ON task_events(task_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_voice_presets_default ON voice_presets(is_default, updated_at DESC);
                 """
             )
             conn.execute(
                 "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
-                (SCHEMA_VERSION, "initial_task_repository", utc_now()),
+                (1, "initial_task_repository", utc_now()),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
+                (2, "voice_presets", utc_now()),
             )
 
     @staticmethod
@@ -723,3 +741,116 @@ class SQLiteTaskRepository(TaskRepository):
             }
         finally:
             conn.close()
+
+    # -- Voice presets -------------------------------------------------
+
+    def create_voice_preset(
+        self,
+        *,
+        name: str,
+        provider: str,
+        voice_id: str = "",
+        language: str = "",
+        parameters: Optional[Dict[str, Any]] = None,
+        is_default: bool = False,
+    ) -> Dict[str, Any]:
+        preset_id = uuid.uuid4().hex
+        now = utc_now()
+        with self.transaction() as conn:
+            if is_default:
+                conn.execute("UPDATE voice_presets SET is_default = 0, updated_at = ? WHERE is_default = 1", (now,))
+            conn.execute(
+                """INSERT INTO voice_presets(
+                    id, name, provider, voice_id, language, parameters_json,
+                    is_default, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    preset_id, _required(name, "name"), _required(provider, "provider"),
+                    str(voice_id or ""), str(language or ""),
+                    self._json_dump(parameters or {}), int(bool(is_default)), now, now,
+                ),
+            )
+            row = conn.execute("SELECT * FROM voice_presets WHERE id = ?", (preset_id,)).fetchone()
+        return self._voice_preset_to_dict(row)
+
+    def get_voice_preset(self, preset_id: str) -> Optional[Dict[str, Any]]:
+        with self.transaction(immediate=False) as conn:
+            row = conn.execute("SELECT * FROM voice_presets WHERE id = ?", (preset_id,)).fetchone()
+            return self._voice_preset_to_dict(row) if row else None
+
+    def list_voice_presets(self) -> List[Dict[str, Any]]:
+        with self.transaction(immediate=False) as conn:
+            rows = conn.execute(
+                "SELECT * FROM voice_presets ORDER BY is_default DESC, name COLLATE NOCASE, updated_at DESC"
+            ).fetchall()
+            return [self._voice_preset_to_dict(row) for row in rows]
+
+    def update_voice_preset(self, preset_id: str, **updates: Any) -> Optional[Dict[str, Any]]:
+        allowed = {"name", "provider", "voice_id", "language", "parameters", "is_default"}
+        unknown = set(updates) - allowed
+        if unknown:
+            raise ValueError(f"Unsupported voice preset fields: {sorted(unknown)}")
+        with self.transaction() as conn:
+            current = conn.execute("SELECT * FROM voice_presets WHERE id = ?", (preset_id,)).fetchone()
+            if not current:
+                return None
+            values = self._voice_preset_to_dict(current)
+            values.update(updates)
+            now = utc_now()
+            if bool(values.get("is_default")):
+                conn.execute(
+                    "UPDATE voice_presets SET is_default = 0, updated_at = ? WHERE id <> ? AND is_default = 1",
+                    (now, preset_id),
+                )
+            conn.execute(
+                """UPDATE voice_presets SET name = ?, provider = ?, voice_id = ?,
+                   language = ?, parameters_json = ?, is_default = ?, updated_at = ?
+                   WHERE id = ?""",
+                (
+                    _required(values.get("name"), "name"),
+                    _required(values.get("provider"), "provider"),
+                    str(values.get("voice_id") or ""), str(values.get("language") or ""),
+                    self._json_dump(values.get("parameters") or {}),
+                    int(bool(values.get("is_default"))), now, preset_id,
+                ),
+            )
+            row = conn.execute("SELECT * FROM voice_presets WHERE id = ?", (preset_id,)).fetchone()
+        return self._voice_preset_to_dict(row)
+
+    def delete_voice_preset(self, preset_id: str) -> bool:
+        with self.transaction() as conn:
+            return conn.execute("DELETE FROM voice_presets WHERE id = ?", (preset_id,)).rowcount == 1
+
+    def set_default_voice_preset(self, preset_id: str) -> Optional[Dict[str, Any]]:
+        with self.transaction() as conn:
+            row = conn.execute("SELECT id FROM voice_presets WHERE id = ?", (preset_id,)).fetchone()
+            if not row:
+                return None
+            now = utc_now()
+            conn.execute("UPDATE voice_presets SET is_default = 0, updated_at = ? WHERE is_default = 1", (now,))
+            conn.execute("UPDATE voice_presets SET is_default = 1, updated_at = ? WHERE id = ?", (now, preset_id))
+            updated = conn.execute("SELECT * FROM voice_presets WHERE id = ?", (preset_id,)).fetchone()
+        return self._voice_preset_to_dict(updated)
+
+    def default_voice_preset(self) -> Optional[Dict[str, Any]]:
+        with self.transaction(immediate=False) as conn:
+            row = conn.execute(
+                "SELECT * FROM voice_presets WHERE is_default = 1 ORDER BY updated_at DESC LIMIT 1"
+            ).fetchone()
+            return self._voice_preset_to_dict(row) if row else None
+
+    def _voice_preset_to_dict(self, row: sqlite3.Row) -> Dict[str, Any]:
+        return {
+            "id": row["id"], "name": row["name"], "provider": row["provider"],
+            "voice_id": row["voice_id"], "language": row["language"],
+            "parameters": self._json_load(row["parameters_json"], {}),
+            "is_default": bool(row["is_default"]),
+            "created_at": row["created_at"], "updated_at": row["updated_at"],
+        }
+
+
+def _required(value: Any, field: str) -> str:
+    cleaned = str(value or "").strip()
+    if not cleaned:
+        raise ValueError(f"{field} is required")
+    return cleaned
