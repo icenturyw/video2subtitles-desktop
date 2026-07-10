@@ -4,7 +4,8 @@ import hashlib
 import logging
 import os
 import time
-from dataclasses import dataclass
+from abc import ABC, abstractmethod
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Protocol
 
@@ -17,6 +18,25 @@ class TTSResult:
     duration_seconds: float
     cached: bool = False
     mode: str = ""
+
+
+@dataclass(frozen=True)
+class TTSCapabilities:
+    voice_list: bool = True
+    speed: bool = False
+    pitch: bool = False
+    emotion: bool = False
+    language: bool = True
+    streaming: bool = False
+    preview_character_limit: int = 300
+    supported_output_formats: tuple[str, ...] = ("wav",)
+    supported_parameters: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict:
+        data = asdict(self)
+        data["supported_output_formats"] = list(self.supported_output_formats)
+        data["supported_parameters"] = list(self.supported_parameters)
+        return data
 
 
 class TTSProvider(Protocol):
@@ -32,6 +52,40 @@ class TTSProvider(Protocol):
 
     def list_voices(self, language: Optional[str] = None) -> List[Dict[str, str]]:
         ...
+
+    def capabilities(self) -> TTSCapabilities:
+        ...
+
+
+class BaseTTSProvider(ABC):
+    """Stable base contract for built-in and third-party TTS providers."""
+
+    supports_concurrency = True
+    tts_capabilities = TTSCapabilities()
+
+    @abstractmethod
+    def synthesize(
+        self,
+        text: str,
+        language: str,
+        voice: str,
+        output_path: Path,
+        options: dict,
+    ) -> TTSResult:
+        """Synthesize one text item into ``output_path``."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def list_voices(self, language: Optional[str] = None) -> List[Dict[str, str]]:
+        """Return provider voice metadata, optionally filtered by language."""
+        raise NotImplementedError
+
+    def close(self) -> None:
+        """Release optional provider resources; default providers are stateless."""
+
+    def capabilities(self) -> TTSCapabilities:
+        return self.tts_capabilities
+
 
 
 class TTSError(Exception):
