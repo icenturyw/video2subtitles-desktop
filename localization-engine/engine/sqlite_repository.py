@@ -456,6 +456,18 @@ class SQLiteTaskRepository(TaskRepository):
                     (self._json_dump(output_ids), resolved_stage_run_id),
                 )
             db.execute("UPDATE tasks SET updated_at = ?, version = version + 1 WHERE job_id = ?", (utc_now(), job_id))
+            db.execute(
+                "INSERT INTO task_events(task_id, event_type, message, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+                (
+                    job_id, "artifact_created", str(artifact.get("kind") or "unknown"),
+                    self._json_dump({
+                        "artifact_id": int(cursor.lastrowid),
+                        "kind": str(artifact.get("kind") or "unknown"),
+                        "stage": str(artifact.get("stage") or task["current_stage"]),
+                    }),
+                    utc_now(),
+                ),
+            )
             return int(cursor.lastrowid)
         if conn is not None:
             return insert(conn)
@@ -488,6 +500,14 @@ class SQLiteTaskRepository(TaskRepository):
             )
             if cursor.rowcount:
                 conn.execute("UPDATE tasks SET updated_at = ?, version = version + 1 WHERE job_id = ?", (utc_now(), job_id))
+                conn.execute(
+                    "INSERT INTO task_events(task_id, event_type, message, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (
+                        job_id, "artifact_invalidated", "Downstream artifacts invalidated",
+                        self._json_dump({"stages": list(stages), "count": int(cursor.rowcount)}),
+                        utc_now(),
+                    ),
+                )
             return cursor.rowcount
 
     def supersede_artifacts(self, job_id: str, kind: str) -> int:

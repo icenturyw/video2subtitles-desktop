@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 
 class ProgressEntry:
@@ -37,9 +37,10 @@ class ProgressEntry:
 class ProgressTracker:
     """Thread-safe progress tracking for concurrent pipeline jobs."""
 
-    def __init__(self):
+    def __init__(self, event_sink: Callable[[str, str, int, str], object] | None = None):
         self._entries: Dict[str, ProgressEntry] = {}
         self._lock = threading.Lock()
+        self._event_sink = event_sink
 
     def update(self, job_id: str, stage: str, progress: int,
                message: str = "") -> None:
@@ -63,6 +64,11 @@ class ProgressTracker:
                 entry.progress = progress
                 entry.message = message
                 entry.updated_at = time.time()
+        if self._event_sink:
+            try:
+                self._event_sink(job_id, stage, progress, message)
+            except Exception:
+                pass
 
     def get(self, job_id: str) -> Optional[ProgressEntry]:
         """Get current progress for a job."""
