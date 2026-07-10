@@ -14,7 +14,7 @@ from engine.repository import TaskPage, TaskQuery, TaskRecord, TaskRepository, u
 from engine.stages import STAGE_BY_NAME
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 SORT_COLUMNS = {
     "job_id": "job_id",
     "status": "status",
@@ -157,6 +157,26 @@ class SQLiteTaskRepository(TaskRepository):
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS subtitle_documents (
+                    id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL UNIQUE REFERENCES tasks(job_id) ON DELETE CASCADE,
+                    current_version INTEGER NOT NULL DEFAULT 0 CHECK(current_version >= 0),
+                    current_revision_id TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS subtitle_revisions (
+                    id TEXT PRIMARY KEY,
+                    document_id TEXT NOT NULL REFERENCES subtitle_documents(id) ON DELETE CASCADE,
+                    version INTEGER NOT NULL CHECK(version >= 0),
+                    base_version INTEGER NOT NULL CHECK(base_version >= 0),
+                    artifact_path TEXT NOT NULL,
+                    checksum TEXT NOT NULL,
+                    is_draft INTEGER NOT NULL DEFAULT 0 CHECK(is_draft IN (0, 1)),
+                    created_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
                 CREATE INDEX IF NOT EXISTS idx_tasks_updated ON tasks(updated_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_tasks_stage ON tasks(current_stage);
@@ -166,6 +186,12 @@ class SQLiteTaskRepository(TaskRepository):
                 CREATE INDEX IF NOT EXISTS idx_artifacts_stage_run ON task_artifacts(stage_run_id);
                 CREATE INDEX IF NOT EXISTS idx_events_task ON task_events(task_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_voice_presets_default ON voice_presets(is_default, updated_at DESC);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_subtitle_revision_version
+                    ON subtitle_revisions(document_id, version) WHERE is_draft = 0;
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_subtitle_draft
+                    ON subtitle_revisions(document_id) WHERE is_draft = 1;
+                CREATE INDEX IF NOT EXISTS idx_subtitle_revision_history
+                    ON subtitle_revisions(document_id, is_draft, version DESC);
                 """
             )
             conn.execute(
@@ -175,6 +201,10 @@ class SQLiteTaskRepository(TaskRepository):
             conn.execute(
                 "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
                 (2, "voice_presets", utc_now()),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
+                (3, "subtitle_documents_and_revisions", utc_now()),
             )
 
     @staticmethod
@@ -846,6 +876,136 @@ class SQLiteTaskRepository(TaskRepository):
             "parameters": self._json_load(row["parameters_json"], {}),
             "is_default": bool(row["is_default"]),
             "created_at": row["created_at"], "updated_at": row["updated_at"],
+        }
+
+    # -- Subtitle documents and immutable revision metadata ------------
+
+    def create_subtitle_document(self, document_id: str, task_id: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self.transaction() as conn:
+            conn.execute(
+                """INSERT OR IGNORE INTO subtitle_documents(
+                    id, task_id, current_version, current_revision_id, created_at, updated_at
+                ) VALUES (?, ?, 0, NULL, ?, ?)""",
+                (document_id, task_id, now, now),
+            )
+            row = conn.execute("SELECT * FROM subtitle_documents WHERE id = ?", (document_id,)).fetchone()
+        if row is None or row["task_id"] != task_id:
+            raise RepositoryError("Subtitle document id belongs to a different task")
+        return self._subtitle_document_to_dict(row)
+
+    def get_subtitle_document(self, document_id: str) -> Optional[Dict[str, Any]]:
+        with self.transaction(immediate=False) as conn:
+            row = conn.execute("SELECT * FROM subtitle_documents WHERE id = ?", (document_id,)).fetchone()
+            return self._subtitle_document_to_dict(row) if row else None
+
+    def get_task_subtitle_document(self, task_id: str) -> Optional[Dict[str, Any]]:
+        with self.transaction(immediate=False) as conn:
+            row = conn.execute("SELECT * FROM subtitle_documents WHERE task_id = ?", (task_id,)).fetchone()
+            return self._subtitle_document_to_dict(row) if row else None
+
+    def save_subtitle_revision_metadata(
+        self,
+        document_id: str,
+        *,
+        base_version: int,
+        artifact_path: str,
+        checksum: str,
+        is_draft: bool,
+    ) -> Dict[str, Any]:
+        revision_id = uuid.uuid4().hex
+        now = utc_now()
+        with self.transaction() as conn:
+            current = conn.execute(
+                "SELECT current_version FROM subtitle_documents WHERE id = ?", (document_id,)
+            ).fetchone()
+            if current is None:
+                raise RepositoryError(f"Subtitle document not found: {document_id}")
+            if int(current["current_version"]) != int(base_version):
+                raise ConcurrentUpdateError(
+                    f"Subtitle version conflict: expected {base_version}, current {current['current_version']}"
+                )
+            if is_draft:
+                conn.execute(
+                    "DELETE FROM subtitle_revisions WHERE document_id = ? AND is_draft = 1",
+                    (document_id,),
+                )
+                version = int(base_version)
+            else:
+                version = int(base_version) + 1
+                updated = conn.execute(
+                    """UPDATE subtitle_documents SET current_version = ?, updated_at = ?
+                       WHERE id = ? AND current_version = ?""",
+                    (version, now, document_id, base_version),
+                )
+                if updated.rowcount != 1:
+                    raise ConcurrentUpdateError("Subtitle version changed while saving")
+            conn.execute(
+                """INSERT INTO subtitle_revisions(
+                    id, document_id, version, base_version, artifact_path,
+                    checksum, is_draft, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    revision_id, document_id, version, base_version,
+                    artifact_path, checksum, int(bool(is_draft)), now,
+                ),
+            )
+            if not is_draft:
+                conn.execute(
+                    "UPDATE subtitle_documents SET current_revision_id = ? WHERE id = ?",
+                    (revision_id, document_id),
+                )
+                conn.execute(
+                    "DELETE FROM subtitle_revisions WHERE document_id = ? AND is_draft = 1",
+                    (document_id,),
+                )
+            row = conn.execute("SELECT * FROM subtitle_revisions WHERE id = ?", (revision_id,)).fetchone()
+        return self._subtitle_revision_to_dict(row)
+
+    def list_subtitle_revisions(self, document_id: str, *, include_draft: bool = False) -> List[Dict[str, Any]]:
+        with self.transaction(immediate=False) as conn:
+            sql = "SELECT * FROM subtitle_revisions WHERE document_id = ?"
+            if not include_draft:
+                sql += " AND is_draft = 0"
+            sql += " ORDER BY is_draft, version DESC, created_at DESC"
+            return [self._subtitle_revision_to_dict(row) for row in conn.execute(sql, (document_id,))]
+
+    def get_subtitle_revision(self, revision_id: str) -> Optional[Dict[str, Any]]:
+        with self.transaction(immediate=False) as conn:
+            row = conn.execute("SELECT * FROM subtitle_revisions WHERE id = ?", (revision_id,)).fetchone()
+            return self._subtitle_revision_to_dict(row) if row else None
+
+    def get_subtitle_draft(self, document_id: str) -> Optional[Dict[str, Any]]:
+        with self.transaction(immediate=False) as conn:
+            row = conn.execute(
+                "SELECT * FROM subtitle_revisions WHERE document_id = ? AND is_draft = 1",
+                (document_id,),
+            ).fetchone()
+            return self._subtitle_revision_to_dict(row) if row else None
+
+    def clear_subtitle_draft(self, document_id: str) -> bool:
+        with self.transaction() as conn:
+            return conn.execute(
+                "DELETE FROM subtitle_revisions WHERE document_id = ? AND is_draft = 1",
+                (document_id,),
+            ).rowcount > 0
+
+    @staticmethod
+    def _subtitle_document_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
+        return {
+            "id": row["id"], "task_id": row["task_id"],
+            "current_version": row["current_version"],
+            "current_revision_id": row["current_revision_id"],
+            "created_at": row["created_at"], "updated_at": row["updated_at"],
+        }
+
+    @staticmethod
+    def _subtitle_revision_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
+        return {
+            "id": row["id"], "document_id": row["document_id"],
+            "version": row["version"], "base_version": row["base_version"],
+            "artifact_path": row["artifact_path"], "checksum": row["checksum"],
+            "is_draft": bool(row["is_draft"]), "created_at": row["created_at"],
         }
 
 
