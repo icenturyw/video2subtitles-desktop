@@ -40,7 +40,7 @@
 - **模型位置可配置** — 本地转录默认使用项目内 `models/` 作为模型目录，也支持指定自定义模型目录
 - **本地 & API 转录** — 可直接使用 `faster-whisper` 本地转录，或连接自定义 Whisper Server
 - **多格式导出** — 导出 SRT、VTT、TXT 字幕格式
-- **ChatGPT 分析包** — 右侧字幕预览区和右键菜单都可生成含代理视频、关键帧和字幕的上传包；生成过程中会显示持续进度浮层，完成/失败后弹窗提醒，并支持打开包目录或复制路径/错误信息
+- **ChatGPT 混合分析包** — 右侧字幕预览区和右键菜单都可生成含代理视频、关键帧和字幕的上传包；关键帧结合字幕语义、场景切换、画面变化与时间覆盖，并通过视觉哈希去重和动态预算控制数量
 - **字幕翻译** — 集成本地化引擎，支持 OpenAI 兼容 API 批量翻译字幕，术语表注入，断点续翻
 - **翻译配置持久化** — 本地化设置中的 API 地址、模型和 Key 会保存到 `.cache/settings.json`，点击 OK 后同步刷新当前进程和本地化引擎运行时配置
 - **双语+样式字幕** — 支持原文、译文、双语 ASS/SSA 字幕，可自定义字体、大小、轮廓、阴影和边距
@@ -154,6 +154,8 @@ python tools/package_source.py --output video2subtitles-source-package.zip
 - **ASS 渲染精度**：渲染阶段强制从当前字幕重新生成 PlayRes 匹配的 ASS 文件，防止旧版/无尺寸的遗留 ASS 导致字幕过大、位置偏移或水平裁剪。
 - **翻译源回退恢复**：翻译完成后新增 recovery pass，对首次翻译失败的 source fallback 字幕单独重试，减少因临时网络抖动造成的「翻译结果不完整」终止。
 - **翻译错误分类**：区分 `InvalidResponseError`（响应格式、可拆分批次重试）和 `TranslationError`（认证/限流/超时等服务端故障，不可恢复），避免 HTTP 502 被误判为格式问题而重复拆分请求。
+- **翻译验证豁免**：`validator.py` 新增语言中立 token 识别（模型名、URL、数字、产品名等），避免把 `Bitcoin`/`GPT-5` 等不该翻译的术语误判为 `SOURCE_TEXT_REMAINS` 导致配音中止。
+- **ChatGPT 混合关键帧**：新增 `chatgpt_keyframes.py`，关键帧提取升级为 `hybrid_semantic_visual` 策略 — 字幕语义段落 + FFmpeg 场景切换 + 画面变化区域检测 + 时间覆盖评分 + 视觉哈希去重，图片预算随视频长度动态增长（最高 120 张），`frames_manifest.json` 记录选择原因和上下文。
 - **测试覆盖**：新增/更新 15+ 测试文件，覆盖状态/阶段规范化、v2 manifest source 对象、batch_mode 序列化、输出布局、翻译解析紧凑/fallback、质量检测新增项、断点恢复、YouTube 字幕重分段与质量评估、Fish.audio 请求、自定义 TTS、字幕策略设置。
 
 ### 2026-06 — 字幕样式微调、TTS 时序优化与音频混合改进
