@@ -143,6 +143,14 @@ python tools/package_source.py --output video2subtitles-source-package.zip
 - **TTS Provider 重构**：新增 `BaseTTSProvider` ABC 和 `ProviderRegistry` 注册中心，所有 TTS 提供者统一继承基类并支持 `list_voices()`/`close()` 接口，注册表支持别名标准化和线程安全工厂构造。
 - **工作空间隔离**：新增 `WorkspaceManager`（`workspace.py`），管控 `input/cache/output/logs` 四个托管目录，路径逃逸检测、`V2S_WORKSPACE_ROOT` 外部根限制、symlink 解析防护。
 - **翻译文本清洗增强**：`_clean_translation_text` 新增 leaked JSON 对象提取、源文本/翻译列拆分（source<TAB>translation 格式）、翻译标签剥离（"译文:" 等前缀），防止脏数据进入字幕和 TTS。
+- **ASS 字幕自动适配**：`subtitle_ass.py` 大幅重构 — PlayRes 分辨率独立化（720p 参考高度 + 视频宽高比），CJK/Latin 感知自动换行，长文本字体自动缩小，双语模式下原文/译文层级间距动态计算防止重叠，安全水平边距防止超框。
+- **视频旋转检测**：`ffmpeg_service.py` 读取视频旋转元数据并交换宽高，确保 ASS PlayRes 与渲染后实际画面匹配。
+- **翻译服务可用性错误**：新增 `ServiceUnavailableError` 异常类型，翻译服务不可达时快速失败并建议重试。
+- **Subtitle 编辑与修订**：新增 subtitle documents 和 immutable revisions，支持编辑命令验证、修订历史和下游产物重新生成。
+- **运行时能力检测**：新增 GPU 能力检测和运行时资源监控，流水线集成预检（preflight checks）、自适应并发控制和本地模型生命周期管理。
+- **SQLite 任务仓库**：新增 `TaskRepository` 抽象层和 SQLite 实现，任务状态持久化、启动时恢复中断任务、阶段级运行历史记录和重试规划。
+- **Pipeline 阶段持久化**：每个流水线阶段的运行记录、产物和检查点独立存储，支持从任意阶段断点恢复。
+- **音色预设持久化**：用户配音音色预设可复用保存，TTS 试听集成能力检测。
 - **测试覆盖**：新增/更新 15+ 测试文件，覆盖状态/阶段规范化、v2 manifest source 对象、batch_mode 序列化、输出布局、翻译解析紧凑/fallback、质量检测新增项、断点恢复、YouTube 字幕重分段与质量评估、Fish.audio 请求、自定义 TTS、字幕策略设置。
 
 ### 2026-06 — 字幕样式微调、TTS 时序优化与音频混合改进
