@@ -151,6 +151,9 @@ python tools/package_source.py --output video2subtitles-source-package.zip
 - **SQLite 任务仓库**：新增 `TaskRepository` 抽象层和 SQLite 实现，任务状态持久化、启动时恢复中断任务、阶段级运行历史记录和重试规划。
 - **Pipeline 阶段持久化**：每个流水线阶段的运行记录、产物和检查点独立存储，支持从任意阶段断点恢复。
 - **音色预设持久化**：用户配音音色预设可复用保存，TTS 试听集成能力检测。
+- **ASS 渲染精度**：渲染阶段强制从当前字幕重新生成 PlayRes 匹配的 ASS 文件，防止旧版/无尺寸的遗留 ASS 导致字幕过大、位置偏移或水平裁剪。
+- **翻译源回退恢复**：翻译完成后新增 recovery pass，对首次翻译失败的 source fallback 字幕单独重试，减少因临时网络抖动造成的「翻译结果不完整」终止。
+- **翻译错误分类**：区分 `InvalidResponseError`（响应格式、可拆分批次重试）和 `TranslationError`（认证/限流/超时等服务端故障，不可恢复），避免 HTTP 502 被误判为格式问题而重复拆分请求。
 - **测试覆盖**：新增/更新 15+ 测试文件，覆盖状态/阶段规范化、v2 manifest source 对象、batch_mode 序列化、输出布局、翻译解析紧凑/fallback、质量检测新增项、断点恢复、YouTube 字幕重分段与质量评估、Fish.audio 请求、自定义 TTS、字幕策略设置。
 
 ### 2026-06 — 字幕样式微调、TTS 时序优化与音频混合改进
